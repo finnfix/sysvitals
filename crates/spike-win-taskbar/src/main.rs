@@ -38,12 +38,16 @@ mod win {
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, GetDC,
-        GetSysColor, ReleaseDC, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
-        CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOWTEXT, DEFAULT_CHARSET, DEFAULT_PITCH,
-        DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, FF_SWISS, FW_NORMAL,
-        HDC, HFONT, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
+        InvalidateRect, ReleaseDC, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
+        CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CALCRECT,
+        DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, FF_SWISS, FW_NORMAL, HDC, HFONT,
+        OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+        REG_VALUE_TYPE,
+    };
     use windows::Win32::UI::HiDpi::{
         GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
@@ -52,8 +56,8 @@ mod win {
         FindWindowW, GetClientRect, GetMessageW, GetWindowRect, KillTimer, MoveWindow,
         PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetLayeredWindowAttributes,
         SetParent, SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, LWA_COLORKEY,
-        MSG, SW_SHOWNOACTIVATE, WM_DESTROY, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW,
-        WS_EX_LAYERED, WS_POPUP,
+        MSG, SW_SHOWNOACTIVATE, WM_DESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
+        WNDCLASSEXW, WS_EX_LAYERED, WS_POPUP,
     };
     /// Static sample line — layout-accurate but not live (see module docs).
     const DEMO_TEXT: &str = "CPU 42%  MEM 68%  U 1.20 M/s  D 34.0 M/s";
@@ -66,10 +70,69 @@ mod win {
     const TIMER_MS: u32 = 1_000;
     /// Horizontal padding around the measured text.
     const PAD_PX: i32 = 12;
+    /// Registry value naming the personalization key that holds the theme flag.
+    const THEME_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+    const THEME_VALUE: &str = "SystemUsesLightTheme";
+    /// Text color on a light taskbar (dark glyphs).
+    const TEXT_DARK: u32 = 0x001A_1A1A;
+    /// Text color on a dark taskbar (light glyphs).
+    const TEXT_LIGHT: u32 = 0x00F2_F2F2;
 
     static WM_TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
     static WIN_W: AtomicI32 = AtomicI32::new(0);
     static WIN_H: AtomicI32 = AtomicI32::new(0);
+    /// Cached `SystemUsesLightTheme` (1 = light taskbar). Refreshed on
+    /// `WM_SETTINGCHANGE` so a live theme switch repaints correctly.
+    static LIGHT_THEME: AtomicU32 = AtomicU32::new(0);
+
+    /// Read the taskbar theme from the documented personalization key.
+    /// Classic `GetSysColor(COLOR_WINDOWTEXT)` is deliberately NOT used: it
+    /// never follows the dark theme, which made black text land on the dark
+    /// taskbar (invisible). Missing value or key = assume dark (safe default
+    /// on modern Windows).
+    unsafe fn refresh_theme() {
+        let key = utf16(THEME_KEY);
+        let value = utf16(THEME_VALUE);
+        let mut hkey = HKEY::default();
+        let opened = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key.as_ptr()),
+            None,
+            KEY_READ,
+            &mut hkey,
+        );
+        if opened.is_err() {
+            LIGHT_THEME.store(0, Ordering::Relaxed);
+            return;
+        }
+        let mut data = [0u8; 4];
+        let mut size = 4u32;
+        let mut kind = REG_VALUE_TYPE::default();
+        let queried = RegQueryValueExW(
+            hkey,
+            PCWSTR(value.as_ptr()),
+            None,
+            Some(&mut kind),
+            Some(data.as_mut_ptr()),
+            Some(&mut size),
+        );
+        let _ = RegCloseKey(hkey);
+        let light = if queried.is_ok() && size >= 4 {
+            u32::from_le_bytes(data)
+        } else {
+            0
+        };
+        LIGHT_THEME.store(light.min(1), Ordering::Relaxed);
+    }
+
+    /// Foreground color matching the current taskbar theme.
+    fn text_color() -> COLORREF {
+        if LIGHT_THEME.load(Ordering::Relaxed) == 1 {
+            COLORREF(TEXT_DARK)
+        } else {
+            COLORREF(TEXT_LIGHT)
+        }
+    }
 
     fn utf16(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -117,6 +180,7 @@ mod win {
         unsafe {
             // Physical pixels everywhere; must precede any window creation.
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            refresh_theme();
 
             let (w, h) = measure();
             WIN_W.store(w, Ordering::Relaxed);
@@ -243,6 +307,12 @@ mod win {
                 reposition(hwnd);
                 LRESULT(0)
             }
+            WM_SETTINGCHANGE => {
+                // Theme flips arrive here; re-read the flag and repaint.
+                refresh_theme();
+                let _ = InvalidateRect(Some(hwnd), None, true);
+                LRESULT(0)
+            }
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
@@ -272,7 +342,7 @@ mod win {
         }
         let font = make_font();
         let old = SelectObject(hdc, font.into());
-        SetTextColor(hdc, COLORREF(GetSysColor(COLOR_WINDOWTEXT)));
+        SetTextColor(hdc, text_color());
         SetBkMode(hdc, TRANSPARENT);
         let mut text = utf16(DEMO_TEXT);
         DrawTextW(
