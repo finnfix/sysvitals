@@ -1,0 +1,17 @@
+[package]
+name = "app-mac"
+description = "macOS display layer: NSStatusItem menu-bar indicator (objc2) plus settings host."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# macOS-only. Build explicitly with `cargo build -p app-mac` on macOS.
+# objc2 / objc2-app-kit / GPUI deps are added with the menu-bar layer so the
+# workspace resolves on Linux/Windows.
+
+[[bin]]
+name = "sysvitals"
+path = "src/main.rs"

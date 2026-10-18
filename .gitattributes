@@ -1,0 +1,10 @@
+# Normalize line endings: the repo is authored on Windows but compiled on
+# Linux/macOS too. Keep LF in the working tree everywhere so `rustfmt` output
+# and git diffs are stable across platforms.
+* text=auto eol=lf
+
+# Binary assets (future icons/screenshots) stay untouched.
+*.png binary
+*.jpg binary
+*.ico binary
+*.icns binary

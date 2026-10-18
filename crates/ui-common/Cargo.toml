@@ -1,0 +1,15 @@
+[package]
+name = "sysvitals-ui-common"
+description = "Cross-platform GPUI settings window and tray shared by app-win and app-mac."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+sysvitals-core = { workspace = true }
+# GPUI / gpui-tray deps are added when the settings layer is built, after
+# re-verifying exact crate versions; kept out now so the workspace resolves
+# without pulling the pre-1.0 GPUI stack onto every host.

@@ -1,0 +1,11 @@
+# Build artifacts are per-host: Windows and Linux builds must never share
+# one target/ directory (different ABI/linker -> constant rebuilds + pollution).
+/target/
+**/target/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

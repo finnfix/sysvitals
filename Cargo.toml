@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/ui-common",
+    "crates/spike-win-taskbar",
+    "crates/app-win",
+    "crates/app-mac",
+]
+
+# Plain `cargo build|test|check` only touches cross-platform crates.
+# Platform crates (app-win / app-mac / spike) are built explicitly with `-p`,
+# so a Linux host never fails on `windows`/`objc2` dependencies.
+default-members = ["crates/core", "crates/ui-common"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/finnfix/sysvitals"
+publish = false
+
+[workspace.dependencies]
+# Single source of truth for versions; crates inherit with `workspace = true`.
+sysinfo = { version = "=0.39.6", default-features = false, features = ["system", "network"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+toml = "=1.1.8"
+anyhow = "=1.0.104"
+thiserror = "=2.0.21"
+directories = "=6.0.0"
+
+# Local crates
+sysvitals-core = { path = "crates/core" }
+
+# Profiles: GPUI-heavy stacks run poorly in a pure debug build, and the
+# sampler must stay cheap. Keep dev optimized enough to be representative.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
