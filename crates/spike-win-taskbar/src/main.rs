@@ -51,8 +51,9 @@ mod win {
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowExW,
         FindWindowW, GetClientRect, GetMessageW, GetWindowRect, KillTimer, MoveWindow,
         PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetLayeredWindowAttributes,
-        SetParent, SetTimer, TranslateMessage, CS_HREDRAW, CS_VREDRAW, LWA_COLORKEY, MSG,
-        WM_DESTROY, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_POPUP,
+        SetParent, SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, LWA_COLORKEY,
+        MSG, SW_SHOWNOACTIVATE, WM_DESTROY, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW,
+        WS_EX_LAYERED, WS_POPUP,
     };
     /// Static sample line — layout-accurate but not live (see module docs).
     const DEMO_TEXT: &str = "CPU 42%  MEM 68%  U 1.20 M/s  D 34.0 M/s";
@@ -162,6 +163,10 @@ mod win {
 
             let _ = SetLayeredWindowAttributes(hwnd, KEY_COLOR, 0, LWA_COLORKEY);
             embed(hwnd);
+            // The window is created without WS_VISIBLE so the off-screen park
+            // never flashes. embed() has now reparented and positioned it, so
+            // show it in place without stealing focus.
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             SetTimer(Some(hwnd), TIMER_ID, TIMER_MS, None);
 
             let mut msg = MSG::default();
