@@ -1,6 +1,6 @@
 [package]
 name = "app-win"
-description = "Windows display layer: taskbar-embedded indicator (Win32 + Direct2D/DirectWrite) plus tray/settings host."
+description = "Windows display layer: topmost taskbar overlay indicator (Win32 layered window + GDI text) plus tray/settings host."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,8 +9,14 @@ repository.workspace = true
 publish.workspace = true
 
 # Windows-only. Build explicitly with `cargo build -p app-win` on a Windows
-# MSVC host. `windows`/`windows-sys`, GPUI and
-# gpui-tray deps land with the display layer so the workspace resolves on Linux/macOS.
+# MSVC host (or via CI). The `windows` dependency is target-gated so the
+# workspace still resolves on Linux/macOS.
+
+[dependencies]
+sysvitals-core = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
 
 [[bin]]
 name = "sysvitals"

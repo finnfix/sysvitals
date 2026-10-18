@@ -15,6 +15,10 @@ version = "0.0.0"
 [[package]]
 name = "app-win"
 version = "0.0.0"
+dependencies = [
+ "sysvitals-core",
+ "windows",
+]
 
 [[package]]
 name = "bitflags"
@@ -185,13 +189,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7523beb55eece201a2356bee0bbca0d1ab466c14c07703b2e0ee6d42cb0c2c"
 dependencies = [
  "serde_core",
-]
-
-[[package]]
-name = "spike-win-taskbar"
-version = "0.0.0"
-dependencies = [
- "windows",
 ]
 
 [[package]]
