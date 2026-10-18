@@ -9,9 +9,11 @@ repository.workspace = true
 publish.workspace = true
 
 # Windows-only. Not in default-members; build explicitly with
-# `cargo build -p spike-win-taskbar` on a Windows MSVC host. `windows`/`windows-sys`
-# deps are added when the spike is implemented so the workspace still
-# resolves on Linux/macOS.
+# `cargo build -p spike-win-taskbar` on a Windows MSVC host. The `windows`
+# dependency is target-gated so the workspace still resolves on Linux/macOS.
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
 
 [[bin]]
 name = "spike-win-taskbar"

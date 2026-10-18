@@ -31,10 +31,24 @@ jobs:
       # Platform-crate compile gate: each platform crate is built only on its
       # own OS runner (MSVC on windows-latest, Xcode on macos-latest). This
       # catches build breakage of the display layers without needing a local
-      # toolchain. The spike crate stays manual per its throwaway lifecycle.
+      # toolchain.
       - name: Build Windows display layer
         if: matrix.os == 'windows-latest'
         run: cargo build --release -p app-win
       - name: Build macOS display layer
         if: matrix.os == 'macos-latest'
         run: cargo build --release -p app-mac
+      # Throwaway taskbar-embedding spike. Built on Windows and uploaded as a
+      # workflow artifact so the desktop acceptance checks (embed, tray
+      # avoidance, explorer-restart self-heal, theme readability) can be run
+      # without a local MSVC/Rust toolchain. Deleted once the spike is done.
+      - name: Build taskbar spike
+        if: matrix.os == 'windows-latest'
+        run: cargo build --release -p spike-win-taskbar
+      - name: Upload spike artifact
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-win-taskbar
+          path: target/release/spike-win-taskbar.exe
+          if-no-files-found: error

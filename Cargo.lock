@@ -190,6 +190,9 @@ dependencies = [
 [[package]]
 name = "spike-win-taskbar"
 version = "0.0.0"
+dependencies = [
+ "windows",
+]
 
 [[package]]
 name = "syn"
