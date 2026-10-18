@@ -28,3 +28,13 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Tests
         run: cargo test
+      # Platform-crate compile gate: each platform crate is built only on its
+      # own OS runner (MSVC on windows-latest, Xcode on macos-latest). This
+      # catches build breakage of the display layers without needing a local
+      # toolchain. The spike crate stays manual per its throwaway lifecycle.
+      - name: Build Windows display layer
+        if: matrix.os == 'windows-latest'
+        run: cargo build --release -p app-win
+      - name: Build macOS display layer
+        if: matrix.os == 'macos-latest'
+        run: cargo build --release -p app-mac
