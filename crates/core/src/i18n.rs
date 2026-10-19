@@ -128,6 +128,8 @@ pub fn t(lang: Language, key: &str) -> &str {
         (Language::Zh, "menu.settings") => "设置",
         (Language::En, "menu.show_history") => "Show history",
         (Language::Zh, "menu.show_history") => "查看走势",
+        (Language::En, "menu.restart") => "Restart",
+        (Language::Zh, "menu.restart") => "重启",
         (Language::En, "menu.quit") => "Quit",
         (Language::Zh, "menu.quit") => "退出",
 

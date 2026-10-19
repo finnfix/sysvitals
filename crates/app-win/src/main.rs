@@ -117,6 +117,7 @@ mod win {
 
     const IDM_SETTINGS: usize = 901;
     const IDM_QUIT: usize = 902;
+    const IDM_RESTART: usize = 903;
 
     // ----------------------------------------------------------------- statics
 
@@ -1012,6 +1013,40 @@ mod win {
         path.rfind(['\\', '/']).map(|i| path[..i].to_string())
     }
 
+    /// Restart the overlay: schedule a delayed relaunch of the current exe
+    /// (after the single-instance mutex is released on exit), then exit.
+    fn restart_self(hwnd: HWND) {
+        let mut buf = [0u16; 1024];
+        let n = unsafe { GetModuleFileNameW(None, &mut buf) };
+        if n == 0 {
+            log_event("WARN", "restart_self: cannot determine exe path");
+            return;
+        }
+        let exe = String::from_utf16_lossy(&buf[..n as usize]);
+        // Delay 2 seconds so this process exits and releases the mutex first.
+        let cmd = format!("/c timeout /t 2 /nobreak >nul & start \"\" \"{}\"", exe);
+        let cmd_w = utf16(&cmd);
+        let verb = utf16("open");
+        let target = utf16("cmd.exe");
+        let params = windows::core::PCWSTR(cmd_w.as_ptr());
+        log_event("INFO", "restart_self: scheduling relaunch and exiting");
+        unsafe {
+            let _ = ShellExecuteW(
+                None,
+                windows::core::PCWSTR(verb.as_ptr()),
+                windows::core::PCWSTR(target.as_ptr()),
+                params,
+                windows::core::PCWSTR::null(),
+                SW_HIDE,
+            );
+        }
+        // Exit the current instance.
+        let _ = KillTimer(Some(hwnd), TIMER_SAMPLE);
+        let _ = KillTimer(Some(hwnd), TIMER_MOVE);
+        let _ = KillTimer(Some(hwnd), TIMER_CONFIG);
+        let _ = DestroyWindow(hwnd);
+    }
+
     // -------------------------------------------------------------------- menu
 
     unsafe fn show_context_menu(hwnd: HWND) {
@@ -1020,12 +1055,19 @@ mod win {
         };
         let lang = config().display.language;
         let settings = utf16(t(lang, "menu.settings"));
+        let restart = utf16(t(lang, "menu.restart"));
         let quit = utf16(t(lang, "menu.quit"));
         let _ = AppendMenuW(
             menu,
             MF_STRING,
             IDM_SETTINGS,
             windows::core::PCWSTR(settings.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_RESTART,
+            windows::core::PCWSTR(restart.as_ptr()),
         );
         let _ = AppendMenuW(
             menu,
@@ -1048,6 +1090,7 @@ mod win {
         let _ = DestroyMenu(menu);
         match choice {
             id if id == IDM_SETTINGS as u32 => launch_settings(),
+            id if id == IDM_RESTART as u32 => restart_self(hwnd),
             id if id == IDM_QUIT as u32 => {
                 let _ = KillTimer(Some(hwnd), TIMER_SAMPLE);
                 let _ = KillTimer(Some(hwnd), TIMER_MOVE);

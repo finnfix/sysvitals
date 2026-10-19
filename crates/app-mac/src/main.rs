@@ -5,9 +5,14 @@
 //! sysvitals-core, formats with the shared format engine, and updates
 //! the status item title.
 //!
+//! Interaction model (matches Windows):
+//! - Single-click: open history trend chart popup
+//! - Double-click: open Activity Monitor (macOS task manager)
+//! - Right-click: context menu (History / Settings / Restart / Quit)
+//!
 //! Architecture: pure objc2 + AppKit for the indicator itself. The GPUI
-//! settings window (app-settings) is launched as a separate process, same
-//! as on Windows. A right-click menu offers Settings and Quit.
+//! settings window (app-settings) and history chart (app-history) are
+//! launched as separate processes, same as on Windows.
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -18,8 +23,8 @@ mod macos {
     use objc2::runtime::AnyObject;
     use objc2::{define_class, msg_send, sel, ClassType, MainThreadOnly};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSMenu, NSMenuItem, NSStatusBar,
-        NSStatusItem, NSVariableStatusItemLength,
+        NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventType, NSMenu, NSMenuItem,
+        NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
     };
     use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimer};
 
@@ -74,7 +79,6 @@ mod macos {
 
         // Build the display text from the formatted row.
         let text = if row.items.is_empty() {
-            // Dual-row or fallback: join lines.
             row.lines
                 .iter()
                 .map(|l| {
@@ -100,8 +104,7 @@ mod macos {
         });
     }
 
-    /// Directory containing the running executable, used to locate the
-    /// sibling GPUI settings binary.
+    /// Directory containing the running executable.
     fn exe_dir() -> Option<std::path::PathBuf> {
         std::env::current_exe()
             .ok()?
@@ -133,16 +136,110 @@ mod macos {
         let _ = std::process::Command::new(history).spawn();
     }
 
-    // Menu action handler. A tiny NSObject subclass so NSMenuItem can target
-    // it with a selector; the responder chain alone only covers `terminate:`.
+    /// Open Activity Monitor (macOS equivalent of Task Manager).
+    fn open_activity_monitor() {
+        let _ = std::process::Command::new("open")
+            .args(["-a", "Activity Monitor"])
+            .spawn();
+    }
+
+    /// Restart: schedule a delayed relaunch, then exit.
+    fn restart_self() {
+        let Some(exe) = std::env::current_exe().ok() else {
+            return;
+        };
+        let exe_str = exe.to_string_lossy().to_string();
+        // Use a background shell that waits 2 seconds then relaunches.
+        let _ = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("sleep 2 && open '{}'", exe_str))
+            .spawn();
+        // Exit current instance.
+        let app = NSApplication::sharedApplication();
+        app.terminate(None);
+    }
+
+    /// Show the context menu at the status item position.
+    fn show_context_menu() {
+        STATUS_ITEM.with(|si| {
+            let si_borrow = si.borrow();
+            let Some(item) = si_borrow.as_ref() else {
+                return;
+            };
+            let Some(button) = item.button() else {
+                return;
+            };
+
+            let menu = NSMenu::new();
+
+            let history_title = NSString::from_str("Show History");
+            let history_item = NSMenuItem::new();
+            history_item.setTitle(&history_title);
+            history_item.setAction(Some(sel!(showHistory:)));
+            menu.addItem(&history_item);
+
+            let settings_title = NSString::from_str("Settings…");
+            let settings_item = NSMenuItem::new();
+            settings_item.setTitle(&settings_title);
+            settings_item.setAction(Some(sel!(showSettings:)));
+            menu.addItem(&settings_item);
+
+            let restart_title = NSString::from_str("Restart");
+            let restart_item = NSMenuItem::new();
+            restart_item.setTitle(&restart_title);
+            restart_item.setAction(Some(sel!(restartApp:)));
+            menu.addItem(&restart_item);
+
+            menu.addItem(&NSMenuItem::separatorItem());
+
+            let quit_title = NSString::from_str("Quit SysVitals");
+            let quit_item = NSMenuItem::new();
+            quit_item.setTitle(&quit_title);
+            quit_item.setAction(Some(sel!(terminate:)));
+            menu.addItem(&quit_item);
+
+            // Pop up the menu at the button's position.
+            item.setMenu(Some(&menu));
+            button.performClick(None);
+            item.setMenu(None);
+        });
+    }
+
+    // Action handler for button clicks and menu items.
     define_class!(
         // SAFETY: NSObject has no subclassing requirements; no Drop impl.
         #[unsafe(super(NSObject))]
         #[thread_kind = MainThreadOnly]
-        #[name = "SysVitalsMenuHandler"]
-        struct MenuHandler;
+        #[name = "SysVitalsActionHandler"]
+        struct ActionHandler;
 
-        impl MenuHandler {
+        impl ActionHandler {
+            /// Called when the status item button is clicked.
+            /// Distinguishes single-click, double-click, and right-click
+            /// using NSEvent.currentEvent.
+            #[unsafe(method(buttonClicked:))]
+            fn button_clicked(&self, _sender: Option<&AnyObject>) {
+                let event = NSEvent::currentEvent();
+                let Some(event) = event else {
+                    // Fallback: treat as single click.
+                    launch_history();
+                    return;
+                };
+
+                match event.r#type() {
+                    NSEventType::RightMouseUp | NSEventType::RightMouseDown => {
+                        show_context_menu();
+                    }
+                    _ => {
+                        if event.clickCount() >= 2 {
+                            open_activity_monitor();
+                        } else {
+                            launch_history();
+                        }
+                    }
+                }
+            }
+
             #[unsafe(method(showSettings:))]
             fn show_settings(&self, _sender: Option<&AnyObject>) {
                 launch_settings();
@@ -152,12 +249,17 @@ mod macos {
             fn show_history(&self, _sender: Option<&AnyObject>) {
                 launch_history();
             }
+
+            #[unsafe(method(restartApp:))]
+            fn restart_app(&self, _sender: Option<&AnyObject>) {
+                restart_self();
+            }
         }
 
-        unsafe impl NSObjectProtocol for MenuHandler {}
+        unsafe impl NSObjectProtocol for ActionHandler {}
     );
 
-    impl MenuHandler {
+    impl ActionHandler {
         fn new() -> Retained<Self> {
             let this = Self::alloc();
             unsafe { msg_send![super(this), init] }
@@ -179,37 +281,16 @@ mod macos {
             button.setTitle(&title);
         }
 
-        // Menu action handler (kept alive for the process lifetime).
-        let handler = MenuHandler::new();
+        // Action handler (kept alive for the process lifetime).
+        let handler = ActionHandler::new();
 
-        // Build right-click menu: History, Settings, separator, Quit.
-        let menu = NSMenu::new();
+        // Wire button action (handles single/double/right click).
+        if let Some(button) = status_item.button() {
+            button.setTarget(Some(&handler));
+            button.setAction(Some(sel!(buttonClicked:)));
+        }
 
-        let history_title = NSString::from_str("Show History");
-        let history_item = NSMenuItem::new();
-        history_item.setTitle(&history_title);
-        history_item.setTarget(Some(&handler));
-        history_item.setAction(Some(sel!(showHistory:)));
-        menu.addItem(&history_item);
-
-        let settings_title = NSString::from_str("Settings…");
-        let settings_item = NSMenuItem::new();
-        settings_item.setTitle(&settings_title);
-        settings_item.setTarget(Some(&handler));
-        settings_item.setAction(Some(sel!(showSettings:)));
-        menu.addItem(&settings_item);
-
-        menu.addItem(&NSMenuItem::separatorItem());
-
-        let quit_title = NSString::from_str("Quit SysVitals");
-        let quit_item = NSMenuItem::new();
-        quit_item.setTitle(&quit_title);
-        quit_item.setAction(Some(sel!(terminate:)));
-        menu.addItem(&quit_item);
-
-        status_item.setMenu(Some(&menu));
-
-        // Keep the handler alive as long as the menu references it.
+        // Keep the handler alive.
         std::mem::forget(handler);
 
         // Store the status item for the tick callback.
