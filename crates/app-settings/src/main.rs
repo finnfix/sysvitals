@@ -190,11 +190,11 @@ impl Render for SettingsView {
             .child(cycle_row(
                 "Language",
                 self.lang_label().to_string(),
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this: &mut Self, _, _, cx| {
                     this.lang_idx = (this.lang_idx + Language::ALL.len() - 1) % Language::ALL.len();
                     cx.notify();
                 }),
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this: &mut Self, _, _, cx| {
                     this.lang_idx = (this.lang_idx + 1) % Language::ALL.len();
                     cx.notify();
                 }),
@@ -202,12 +202,12 @@ impl Render for SettingsView {
             .child(cycle_row(
                 "Sample interval",
                 self.interval_label(),
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this: &mut Self, _, _, cx| {
                     this.interval_idx = (this.interval_idx + ALLOWED_INTERVAL_MS.len() - 1)
                         % ALLOWED_INTERVAL_MS.len();
                     cx.notify();
                 }),
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this: &mut Self, _, _, cx| {
                     this.interval_idx = (this.interval_idx + 1) % ALLOWED_INTERVAL_MS.len();
                     cx.notify();
                 }),
@@ -215,11 +215,11 @@ impl Render for SettingsView {
             .child(cycle_row(
                 "Theme",
                 self.theme_label().to_string(),
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this: &mut Self, _, _, cx| {
                     this.theme_idx = (this.theme_idx + 2) % 3;
                     cx.notify();
                 }),
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this: &mut Self, _, _, cx| {
                     this.theme_idx = (this.theme_idx + 1) % 3;
                     cx.notify();
                 }),
@@ -273,12 +273,12 @@ impl Render for SettingsView {
             .child(cycle_row(
                 "Item spacing",
                 self.spacing_label(),
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this: &mut Self, _, _, cx| {
                     this.spacing_idx = (this.spacing_idx + ALLOWED_ITEM_SPACING_PX.len() - 1)
                         % ALLOWED_ITEM_SPACING_PX.len();
                     cx.notify();
                 }),
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this: &mut Self, _, _, cx| {
                     this.spacing_idx = (this.spacing_idx + 1) % ALLOWED_ITEM_SPACING_PX.len();
                     cx.notify();
                 }),
@@ -289,12 +289,12 @@ impl Render for SettingsView {
             .child(cycle_row(
                 "Left margin",
                 self.margin_label(),
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this: &mut Self, _, _, cx| {
                     this.margin_idx = (this.margin_idx + ALLOWED_LEFT_MARGIN_PX.len() - 1)
                         % ALLOWED_LEFT_MARGIN_PX.len();
                     cx.notify();
                 }),
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this: &mut Self, _, _, cx| {
                     this.margin_idx = (this.margin_idx + 1) % ALLOWED_LEFT_MARGIN_PX.len();
                     cx.notify();
                 }),
