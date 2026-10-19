@@ -94,6 +94,12 @@ pub fn t(lang: Language, key: &str) -> &str {
         (Language::Zh, "anchor.left") => "最左侧（仅 Win11 居中时）",
         (Language::En, "settings.auto_start") => "Start on login",
         (Language::Zh, "settings.auto_start") => "开机自启",
+        (Language::En, "settings.apply") => "Apply",
+        (Language::Zh, "settings.apply") => "应用",
+        (Language::En, "settings.ok") => "OK",
+        (Language::Zh, "settings.ok") => "确定",
+        (Language::En, "settings.cancel") => "Cancel",
+        (Language::Zh, "settings.cancel") => "取消",
 
         (Language::En, "chart.title") => "History",
         (Language::Zh, "chart.title") => "历史走势",

@@ -33,13 +33,15 @@ mod win {
 
     use sysvitals_core::format::FormattedRow;
     use sysvitals_core::{format_frame, t, Config, Language, NetSelection, Sampler, Theme};
-    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, GetDC,
-        GetSysColor, InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-        CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, DEFAULT_CHARSET, DEFAULT_PITCH,
-        DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_SWISS,
-        FW_SEMIBOLD, HDC, HFONT, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
+        CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC,
+        DeleteObject, DrawTextW, GetDC, GetSysColor, ReleaseDC, SelectObject, SetBkMode,
+        SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER,
+        BI_RGB, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, DEFAULT_CHARSET, DEFAULT_PITCH,
+        DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+        DT_SINGLELINE, DT_VCENTER, FF_SWISS, FW_REGULAR, FW_SEMIBOLD, HFONT, OUT_DEFAULT_PRECIS,
+        TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Registry::{
@@ -50,24 +52,23 @@ mod win {
         GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-    use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
+    use windows::Win32::UI::Shell::{
+        SHAppBarMessage, ShellExecuteW, ABM_GETTASKBARPOS, APPBARDATA,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-        DispatchMessageW, EnumChildWindows, FindWindowExW, FindWindowW, GetClientRect,
-        GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW, KillTimer,
-        MoveWindow, PostQuitMessage, RegisterClassExW, SendMessageW, SetLayeredWindowAttributes,
-        SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, BS_AUTOCHECKBOX,
-        BS_DEFPUSHBUTTON, CBS_DROPDOWNLIST, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, HWND_TOPMOST,
-        LWA_COLORKEY, MF_STRING, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW,
-        SW_SHOWNOACTIVATE, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_STYLE, WM_CLOSE,
-        WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_PAINT, WM_RBUTTONUP, WM_SETTINGCHANGE,
-        WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-        WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+        DispatchMessageW, EnumChildWindows, FindWindowExW, FindWindowW, GetCursorPos,
+        GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW, KillTimer, MoveWindow,
+        PostQuitMessage, RegisterClassExW, SendMessageW, SetTimer, SetWindowTextW, ShowWindow,
+        TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON,
+        CBS_DROPDOWNLIST, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, HWND_TOPMOST,
+        MF_STRING, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW,
+        SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
+        WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK,
+        WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD,
+        WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
     };
 
-    /// Color keyed out so the taskbar material shows through the background.
-    /// Never used as the text color, so no collision.
-    const KEY_COLOR: COLORREF = COLORREF(0x0002_0202); // ~ (2,2,0) in BGR
     /// Gap between the widget's edge and its anchor (tray left / taskbar left).
     const TRAY_GAP_PX: i32 = 8;
     const TIMER_SAMPLE: usize = 0x515;
@@ -79,10 +80,6 @@ mod win {
     const THEME_VALUE: &str = "SystemUsesLightTheme";
     const TASKBAR_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced";
     const TASKBAR_VALUE: &str = "TaskbarAl";
-    /// Glyph colors matching the taskbar clock: pure white on the dark
-    /// taskbar, pure black on the light one.
-    const TEXT_DARK_THEME: u32 = 0x00FF_FFFF;
-    const TEXT_LIGHT_THEME: u32 = 0x0000_0000;
 
     const IDM_SETTINGS: usize = 901;
     const IDM_QUIT: usize = 902;
@@ -90,6 +87,7 @@ mod win {
     // generation, so the dialog uses its own stable ids).
     const CMD_OK: i32 = 1;
     const CMD_CANCEL: i32 = 2;
+    const CMD_APPLY: i32 = 3;
     // Settings dialog control ids.
     const IDC_LANG: i32 = 101;
     const IDC_INTERVAL: i32 = 102;
@@ -108,6 +106,9 @@ mod win {
     /// Cached `SystemUsesLightTheme` (1 = light taskbar). Refreshed on
     /// `WM_SETTINGCHANGE` so a live theme switch repaints correctly.
     static LIGHT_THEME: AtomicU32 = AtomicU32::new(0);
+    /// Glyph weight follows the taskbar theme, like the clock: semibold on
+    /// the dark taskbar, regular on the light one.
+    static TEXT_WEIGHT: AtomicI32 = AtomicI32::new(600);
     static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();
     static OVERLAY: AtomicUsize = AtomicUsize::new(0);
     static SETTINGS_OPEN: AtomicBool = AtomicBool::new(false);
@@ -196,6 +197,14 @@ mod win {
             hkcu_dword(THEME_KEY, THEME_VALUE).unwrap_or(0).min(1),
             Ordering::Relaxed,
         );
+        // Glyph weight follows the taskbar theme like the clock: semibold on
+        // the dark taskbar, regular on the light one.
+        let weight = if LIGHT_THEME.load(Ordering::Relaxed) == 1 {
+            FW_REGULAR.0 as i32
+        } else {
+            FW_SEMIBOLD.0 as i32
+        };
+        TEXT_WEIGHT.store(weight, Ordering::Relaxed);
     }
 
     /// Win11 with centered taskbar icons: the only case where the far-left
@@ -205,25 +214,23 @@ mod win {
         hkcu_dword(TASKBAR_KEY, TASKBAR_VALUE) == Some(1)
     }
 
-    /// Foreground color matching the effective theme (config override wins
-    /// over the system flag).
-    fn text_color() -> COLORREF {
-        let light = match config().display.theme {
+    /// Whether the effective theme is light (config override wins over the
+    /// system flag).
+    fn theme_is_light() -> bool {
+        match config().display.theme {
             Theme::Auto => LIGHT_THEME.load(Ordering::Relaxed) == 1,
             Theme::Light => true,
             Theme::Dark => false,
-        };
-        if light {
-            COLORREF(TEXT_LIGHT_THEME)
-        } else {
-            COLORREF(TEXT_DARK_THEME)
         }
     }
 
-    /// Segoe UI at the system caption size, semibold like the taskbar clock.
-    /// Negative height = character height (em box), matching how system
-    /// metrics express font size.
-    unsafe fn make_font() -> HFONT {
+    /// Segoe UI at the system caption size with the theme-dependent weight
+    /// (semibold on the dark taskbar, regular on the light one, matching the
+    /// clock). Negative height = character height (em box), matching how
+    /// system metrics express font size. Antialiased (not ClearType) quality:
+    /// the glyphs are composited per-pixel-alpha over the taskbar, where
+    /// ClearType's subpixel color fringing would show as artifacts.
+    unsafe fn make_font_weighted(weight: i32) -> HFONT {
         let dpi = GetDpiForSystem();
         let face = utf16("Segoe UI");
         CreateFontW(
@@ -231,17 +238,21 @@ mod win {
             0,
             0,
             0,
-            FW_SEMIBOLD.0 as i32,
+            weight,
             0,
             0,
             0,
             DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
+            ANTIALIASED_QUALITY,
             (DEFAULT_PITCH.0 | FF_SWISS.0) as u32,
             windows::core::PCWSTR(face.as_ptr()),
         )
+    }
+
+    unsafe fn make_font() -> HFONT {
+        make_font_weighted(TEXT_WEIGHT.load(Ordering::Relaxed))
     }
 
     /// True when the foreground window covers the whole primary screen, i.e.
@@ -407,40 +418,144 @@ mod win {
         let row = format_frame(&snapshot, &cfg);
         resize_to_content(hwnd, &row);
         LAST_ROW.with(|l| *l.borrow_mut() = Some(row));
-        let _ = InvalidateRect(Some(hwnd), None, true);
+        render_layered(hwnd);
     }
 
-    unsafe fn paint_text(hwnd: HWND, hdc: HDC) {
-        let mut rc = RECT::default();
-        if GetClientRect(hwnd, &mut rc).is_err() {
+    /// Render the cached row into a 32bpp premultiplied-alpha DIB and blit it
+    /// onto the layered window with `UpdateLayeredWindow`.
+    ///
+    /// Unlike color-key transparency (which makes the background click-through
+    /// along with its pixels), per-pixel alpha keeps every pixel of the
+    /// indicator rectangle hit-testable: the background is drawn at a tiny but
+    /// non-zero alpha so the whole widget area accepts right-click for the
+    /// context menu and double-click for Task Manager, while remaining
+    /// effectively invisible over the taskbar material.
+    unsafe fn render_layered(hwnd: HWND) {
+        let mut win_rc = RECT::default();
+        if GetWindowRect(hwnd, &mut win_rc).is_err() {
+            return;
+        }
+        let w = win_rc.right - win_rc.left;
+        let h = win_rc.bottom - win_rc.top;
+        if w <= 0 || h <= 0 {
             return;
         }
         let Some(row) = LAST_ROW.with(|l| l.borrow().clone()) else {
             return;
         };
+
+        let screen_dc = GetDC(None);
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = w;
+        // Negative height = top-down rows, matching how we draw.
+        bmi.bmiHeader.biHeight = -h;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB.0;
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let Ok(bmp) = CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+        else {
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(None, screen_dc);
+            return;
+        };
+
+        let old_bmp = SelectObject(mem_dc, bmp.into());
         let font = make_font();
-        let old = SelectObject(hdc, font.into());
-        SetTextColor(hdc, text_color());
-        SetBkMode(hdc, TRANSPARENT);
-        let line_h = (rc.bottom - rc.top) / row.lines.len().max(1) as i32;
+        let old_font = SelectObject(mem_dc, font.into());
+        SetBkMode(mem_dc, TRANSPARENT);
+        // Glyphs are drawn in white so the red channel doubles as a coverage
+        // mask; the final color is applied per-pixel below from the theme.
+        SetTextColor(mem_dc, COLORREF(0x00FF_FFFF));
+
+        // Fill the surface with a black pixel at a minimal (but non-zero)
+        // alpha. Red channel = 0 here, so any red above comes only from the
+        // glyphs. The tiny alpha keeps the whole rectangle hit-testable while
+        // remaining invisible over the taskbar material.
+        let px = bits as *mut u32;
+        let n = (w * h) as usize;
+        for i in 0..n {
+            *px.add(i) = 0x0100_0000; // ARGB: alpha=1, rgb=black
+        }
+
+        let line_h = h / row.lines.len().max(1) as i32;
+        // Dual-row uses left-aligned columns (CPU over MEM, U over D) so the
+        // two columns read as aligned pairs; single-row stays centered.
+        let dual = row.lines.len() > 1;
         for (i, line) in row.lines.iter().enumerate() {
             let text = row_text(line);
             let mut line_rc = RECT {
-                left: rc.left,
-                top: rc.top + i as i32 * line_h,
-                right: rc.right,
-                bottom: rc.top + (i as i32 + 1) * line_h,
+                left: if dual { PAD_PX } else { 0 },
+                top: i as i32 * line_h,
+                right: if dual { w - PAD_PX } else { w },
+                bottom: (i as i32 + 1) * line_h,
             };
             let mut buf = utf16(&text);
             DrawTextW(
-                hdc,
+                mem_dc,
                 &mut buf,
                 &mut line_rc,
-                DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                if dual {
+                    DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX
+                } else {
+                    DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX
+                },
             );
         }
-        SelectObject(hdc, old);
+
+        // Fold the white coverage mask into premultiplied alpha using the
+        // theme's glyph color. Background pixels (coverage 0) keep their
+        // alpha-1 black so the rectangle stays clickable but invisible.
+        let (tr, tg, tb) = if theme_is_light() {
+            (0u32, 0u32, 0u32)
+        } else {
+            (255u32, 255u32, 255u32)
+        };
+        for i in 0..n {
+            let cov = *px.add(i) & 0xFF; // red channel = glyph coverage
+            if cov > 0 {
+                let a = cov;
+                let r = (tr * a) / 255;
+                let g = (tg * a) / 255;
+                let b = (tb * a) / 255;
+                *px.add(i) = (a << 24) | (r << 16) | (g << 8) | b;
+            }
+        }
+
+        SelectObject(mem_dc, old_font);
         let _ = DeleteObject(font.into());
+
+        let src_pt = POINT { x: 0, y: 0 };
+        let size = SIZE { cx: w, cy: h };
+        let dst_pt = POINT {
+            x: win_rc.left,
+            y: win_rc.top,
+        };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let _ = UpdateLayeredWindow(
+            hwnd,
+            None,
+            Some(&dst_pt),
+            Some(&size),
+            Some(mem_dc),
+            Some(&src_pt),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+
+        SelectObject(mem_dc, old_bmp);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(mem_dc);
+        let _ = ReleaseDC(None, screen_dc);
     }
 
     // ---------------------------------------------------------------- menu
@@ -839,17 +954,20 @@ mod win {
         );
         y += s(28);
 
+        let apply = control(dlg, "BUTTON", CMD_APPLY, (s(10), y, s(90), s(26)), 0);
+        let apply_text = utf16(t(lang, "settings.apply"));
+        let _ = SetWindowTextW(apply, windows::core::PCWSTR(apply_text.as_ptr()));
         let ok = control(
             dlg,
             "BUTTON",
             CMD_OK,
-            (s(180), y, s(90), s(26)),
+            (s(190), y, s(90), s(26)),
             BS_DEFPUSHBUTTON,
         );
-        let ok_text = utf16("OK");
+        let ok_text = utf16(t(lang, "settings.ok"));
         let _ = SetWindowTextW(ok, windows::core::PCWSTR(ok_text.as_ptr()));
-        let cancel = control(dlg, "BUTTON", CMD_CANCEL, (s(280), y, s(80), s(26)), 0);
-        let cancel_text = utf16("Cancel");
+        let cancel = control(dlg, "BUTTON", CMD_CANCEL, (s(280), y, s(90), s(26)), 0);
+        let cancel_text = utf16(t(lang, "settings.cancel"));
         let _ = SetWindowTextW(cancel, windows::core::PCWSTR(cancel_text.as_ptr()));
 
         // Controls inherit the indicator's Segoe UI instead of the legacy
@@ -887,7 +1005,10 @@ mod win {
         SETTINGS_OPEN.store(false, Ordering::Relaxed);
     }
 
-    unsafe fn apply_settings(hwnd_dialog: HWND) {
+    /// Read the dialog controls back into the config, persist it, and make
+    /// the running indicator reflect it immediately. The dialog stays open so
+    /// the caller decides whether to close it (OK) or keep tweaking (Apply).
+    unsafe fn collect_and_apply_settings() {
         let handles = SETTINGS.with(|s| *s.borrow());
         let mut cfg = config();
         let lang_idx = combo_sel(handles.lang);
@@ -949,8 +1070,6 @@ mod win {
         );
         reposition(overlay);
         sample_now(overlay);
-        let _ = DestroyWindow(hwnd_dialog);
-        SETTINGS_DONE.store(true, Ordering::Relaxed);
     }
 
     unsafe extern "system" fn settings_wndproc(
@@ -963,7 +1082,14 @@ mod win {
             WM_COMMAND => {
                 let id = (wparam.0 & 0xFFFF) as i32;
                 if id == CMD_OK {
-                    apply_settings(hwnd);
+                    collect_and_apply_settings();
+                    let _ = DestroyWindow(hwnd);
+                    SETTINGS_DONE.store(true, Ordering::Relaxed);
+                    return LRESULT(0);
+                }
+                if id == CMD_APPLY {
+                    // Apply in place; keep the dialog open for further tweaks.
+                    collect_and_apply_settings();
                     return LRESULT(0);
                 }
                 if id == CMD_CANCEL {
@@ -1003,21 +1129,29 @@ mod win {
                 }
                 LRESULT(0)
             }
-            WM_PAINT => {
-                let mut ps = PAINTSTRUCT::default();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                paint_text(hwnd, hdc);
-                let _ = EndPaint(hwnd, &ps);
-                LRESULT(0)
-            }
             WM_SETTINGCHANGE => {
                 // Theme flips arrive here; re-read the flag and repaint.
                 refresh_theme();
-                let _ = InvalidateRect(Some(hwnd), None, true);
+                render_layered(hwnd);
                 LRESULT(0)
             }
             WM_DISPLAYCHANGE => {
                 reposition(hwnd);
+                LRESULT(0)
+            }
+            WM_LBUTTONDBLCLK => {
+                // Double-click opens Task Manager, matching the quick-access
+                // convention for status indicators.
+                let verb = utf16("open");
+                let target = utf16("taskmgr.exe");
+                let _ = ShellExecuteW(
+                    None,
+                    windows::core::PCWSTR(verb.as_ptr()),
+                    windows::core::PCWSTR(target.as_ptr()),
+                    windows::core::PCWSTR::null(),
+                    windows::core::PCWSTR::null(),
+                    SW_SHOWNORMAL,
+                );
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
@@ -1043,12 +1177,13 @@ mod win {
             let class_name = utf16("SysVitalsOverlay");
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                style: CS_HREDRAW | CS_VREDRAW,
+                // CS_DBLCLKS so WM_LBUTTONDBLCLK reaches the window proc.
+                style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
                 lpfnWndProc: Some(wndproc),
                 hInstance: hmodule.into(),
-                // Erased backgrounds paint the key color, which the color-key
-                // then makes fully transparent.
-                hbrBackground: CreateSolidBrush(KEY_COLOR),
+                // No background brush: the layered surface is composed entirely
+                // by UpdateLayeredWindow.
+                hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH::default(),
                 lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
                 ..Default::default()
             };
@@ -1075,7 +1210,6 @@ mod win {
             .expect("CreateWindowExW");
             OVERLAY.store(hwnd.0 as usize, Ordering::Relaxed);
 
-            let _ = SetLayeredWindowAttributes(hwnd, KEY_COLOR, 0, LWA_COLORKEY);
             // Topmost so the overlay sits above the taskbar's own content.
             let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
                 hwnd,
