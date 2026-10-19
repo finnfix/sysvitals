@@ -51,6 +51,7 @@ mod win {
         REG_VALUE_TYPE,
     };
     use windows::Win32::System::SystemInformation::GetLocalTime;
+    use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::HiDpi::{
         GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
@@ -1171,7 +1172,7 @@ mod win {
             s(200),
             s(120),
             s(380),
-            s(500),
+            s(560),
             Some(owner),
             None,
             Some(hmodule.into()),
@@ -1740,6 +1741,23 @@ mod win {
 
     pub fn run() {
         unsafe {
+            // Single-instance guard: a named mutex ensures only one overlay
+            // runs per session. A second launch exits immediately instead of
+            // stacking a duplicate indicator on the taskbar.
+            let mutex_name = utf16("Local\\SysVitals_SingleInstance");
+            let _mutex = match CreateMutexW(None, false, windows::core::PCWSTR(mutex_name.as_ptr()))
+            {
+                Ok(h) => {
+                    if windows::Win32::Foundation::GetLastError()
+                        == windows::Win32::Foundation::ERROR_ALREADY_EXISTS
+                    {
+                        return;
+                    }
+                    h
+                }
+                Err(_) => return,
+            };
+
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
             refresh_theme();
             let cfg = config();
