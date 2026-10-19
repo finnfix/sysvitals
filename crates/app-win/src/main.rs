@@ -663,7 +663,7 @@ mod win {
         // offset (scaled by the supersample factor). This is what makes U/D
         // line up vertically.
         let spacing = config().display.item_spacing;
-        let fm = measure_frame(mem_dc, row, spacing);
+        let fm = measure_frame(mem_dc, &row, spacing);
         for (i, line) in row.lines.iter().enumerate() {
             let top = i as i32 * ss_line_h;
             let bottom = (i as i32 + 1) * ss_line_h;
