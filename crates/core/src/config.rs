@@ -381,6 +381,17 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
     Ok(dirs.config_dir().join("config.toml"))
 }
 
+/// Where the history database lives. Windows:
+/// `%APPDATA%\sysvitals\history.db`; macOS:
+/// `~/Library/Application Support/sysvitals/history.db`. SQLite is the single
+/// source of truth for historical data (R12); CSV is export-only.
+pub fn history_path() -> anyhow::Result<PathBuf> {
+    use directories::ProjectDirs;
+    let dirs = ProjectDirs::from("", "", "sysvitals")
+        .ok_or_else(|| anyhow::anyhow!("could not resolve project directories"))?;
+    Ok(dirs.data_dir().join("history.db"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -119,6 +119,10 @@ mod win {
         static SAMPLER: RefCell<Option<Sampler>> = const { RefCell::new(None) };
         static LAST_ROW: RefCell<Option<FormattedRow>> = const { RefCell::new(None) };
         static SETTINGS: RefCell<SettingsHandles> = RefCell::new(SettingsHandles::default());
+        // History store (R12). Lazily opened on the first sample so a missing
+        // data dir never blocks the indicator itself.
+        static STORE: RefCell<Option<sysvitals_core::Store>> = const { RefCell::new(None) };
+        static TICK_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
     #[derive(Default, Clone, Copy)]
@@ -463,10 +467,45 @@ mod win {
             let sampler = guard.get_or_insert_with(|| Sampler::new(NetSelection::Auto));
             sampler.sample(now)
         });
+        // Persist CPU/MEM to the history store (R12). Network rates are
+        // intentionally not stored. A store failure must never break the live
+        // indicator, so errors are swallowed here.
+        record_history(&cfg, now, &snapshot);
         let row = format_frame(&snapshot, &cfg);
         resize_to_content(hwnd, &row);
         LAST_ROW.with(|l| *l.borrow_mut() = Some(row));
         render_layered(hwnd);
+    }
+
+    /// Insert the current CPU/MEM sample into the history database and prune
+    /// rows older than the retention window. Pruning runs once per ~300 ticks
+    /// rather than every tick to keep the steady-state cost near zero.
+    fn record_history(cfg: &Config, now: i64, snapshot: &sysvitals_core::Snapshot) {
+        if !cfg.history.enabled {
+            return;
+        }
+        STORE.with(|s| {
+            let mut guard = s.borrow_mut();
+            if guard.is_none() {
+                if let Ok(path) = sysvitals_core::config::history_path() {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    *guard = sysvitals_core::Store::open(&path).ok();
+                }
+            }
+            if let Some(store) = guard.as_ref() {
+                let _ = store.insert(now, snapshot.cpu_pct, snapshot.mem_pct);
+                let tick = TICK_COUNT.with(|c| {
+                    let v = c.get() + 1;
+                    c.set(v);
+                    v
+                });
+                if tick % 300 == 0 {
+                    let _ = store.prune(now, cfg.history.retention_days);
+                }
+            }
+        });
     }
 
     /// Render the cached row into a 32bpp premultiplied-alpha DIB and blit it

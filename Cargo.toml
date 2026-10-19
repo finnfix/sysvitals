@@ -28,6 +28,9 @@ toml = "=1.1.8"
 anyhow = "=1.0.104"
 thiserror = "=2.0.21"
 directories = "=6.0.0"
+# `bundled` statically embeds SQLite so there is no system-library dependency
+# on Windows/macOS. History storage (R12) is the only consumer.
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
 windows = { version = "=0.62.2", default-features = false, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
