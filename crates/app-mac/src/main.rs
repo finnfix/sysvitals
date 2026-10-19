@@ -5,9 +5,9 @@
 //! sysvitals-core, formats with the shared format engine, and updates
 //! the status item title.
 //!
-//! Architecture: pure objc2 + AppKit (no GPUI for the indicator itself).
-//! The GPUI settings window (app-settings) is launched as a separate
-//! process, same as on Windows.
+//! Architecture: pure objc2 + AppKit for the indicator itself. The GPUI
+//! settings window (app-settings) is launched as a separate process, same
+//! as on Windows. A right-click menu offers Settings and Quit.
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -15,12 +15,13 @@ mod macos {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use objc2::rc::Retained;
-    use objc2::sel;
+    use objc2::runtime::AnyObject;
+    use objc2::{define_class, msg_send, sel, ClassType, MainThreadOnly};
     use objc2_app_kit::{
         NSApplication, NSApplicationActivationPolicy, NSMenu, NSMenuItem, NSStatusBar,
         NSStatusItem, NSVariableStatusItemLength,
     };
-    use objc2_foundation::{NSString, NSTimer};
+    use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimer};
 
     use sysvitals_core::config::config_path;
     use sysvitals_core::format::format_frame;
@@ -99,6 +100,53 @@ mod macos {
         });
     }
 
+    /// Directory containing the running executable, used to locate the
+    /// sibling GPUI settings binary.
+    fn exe_dir() -> Option<std::path::PathBuf> {
+        std::env::current_exe()
+            .ok()?
+            .parent()
+            .map(|p| p.to_path_buf())
+    }
+
+    /// Launch the external GPUI settings process (`SysVitalsSettings`).
+    fn launch_settings() {
+        let Some(dir) = exe_dir() else {
+            return;
+        };
+        let settings = dir.join("SysVitalsSettings");
+        if !settings.exists() {
+            return;
+        }
+        let _ = std::process::Command::new(settings).spawn();
+    }
+
+    // Menu action handler. A tiny NSObject subclass so NSMenuItem can target
+    // it with a selector; the responder chain alone only covers `terminate:`.
+    define_class!(
+        // SAFETY: NSObject has no subclassing requirements; no Drop impl.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "SysVitalsMenuHandler"]
+        struct MenuHandler;
+
+        impl MenuHandler {
+            #[unsafe(method(showSettings:))]
+            fn show_settings(&self, _sender: Option<&AnyObject>) {
+                launch_settings();
+            }
+        }
+
+        unsafe impl NSObjectProtocol for MenuHandler {}
+    );
+
+    impl MenuHandler {
+        fn new() -> Retained<Self> {
+            let this = Self::alloc();
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
     pub fn run() {
         // NSApplication setup — must happen on the main thread.
         let app = NSApplication::sharedApplication();
@@ -114,14 +162,31 @@ mod macos {
             button.setTitle(&title);
         }
 
-        // Build right-click menu.
+        // Menu action handler (kept alive for the process lifetime).
+        let handler = MenuHandler::new();
+
+        // Build right-click menu: Settings, separator, Quit.
         let menu = NSMenu::new();
+
+        let settings_title = NSString::from_str("Settings…");
+        let settings_item = NSMenuItem::new();
+        settings_item.setTitle(&settings_title);
+        settings_item.setTarget(Some(&handler));
+        settings_item.setAction(Some(sel!(showSettings:)));
+        menu.addItem(&settings_item);
+
+        menu.addItem(&NSMenuItem::separatorItem());
+
         let quit_title = NSString::from_str("Quit SysVitals");
         let quit_item = NSMenuItem::new();
         quit_item.setTitle(&quit_title);
         quit_item.setAction(Some(sel!(terminate:)));
         menu.addItem(&quit_item);
+
         status_item.setMenu(Some(&menu));
+
+        // Keep the handler alive as long as the menu references it.
+        std::mem::forget(handler);
 
         // Store the status item for the tick callback.
         STATUS_ITEM.with(|si| *si.borrow_mut() = Some(status_item));
