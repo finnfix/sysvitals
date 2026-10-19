@@ -283,12 +283,14 @@ pub fn format_frame(snapshot: &Snapshot, cfg: &Config) -> FormattedRow {
             ],
         }
     } else {
-        // Single row: all enabled metrics, joined by two spaces.
+        // Single row: all enabled metrics, joined by the configured number of
+        // spaces (default 2).
+        let sep = " ".repeat(cfg.display.item_spacing.max(1) as usize);
         let text = enabled
             .iter()
             .map(|m| join_prefix(prefix_for(*m, cfg), &format_value(*m, snapshot)))
             .collect::<Vec<_>>()
-            .join("  ");
+            .join(&sep);
         FormattedRow {
             lines: vec![Line::single(text)],
         }
@@ -366,6 +368,20 @@ mod tests {
         assert_eq!(
             f.lines[0].render(),
             "CPU 29%  MEM 68%  U 1.20 M/s  D 314 K/s"
+        );
+    }
+
+    #[test]
+    fn single_row_item_spacing_is_configurable() {
+        // Wider spacing joins metrics with more spaces; the default of 2 keeps
+        // the original two-space look.
+        let mut cfg = Config::default();
+        cfg.display.item_spacing = 4;
+        let f = format_frame(&snap(29.0, 68.0, 1024.0, 2048.0), &cfg);
+        assert_eq!(f.lines.len(), 1);
+        assert_eq!(
+            f.lines[0].render(),
+            "CPU 29%    MEM 68%    U 1.00 K/s    D 2.00 K/s"
         );
     }
 

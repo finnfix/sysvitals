@@ -38,10 +38,10 @@ mod win {
         CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC,
         DeleteObject, DrawTextW, GetDC, GetSysColor, ReleaseDC, SelectObject, SetBkMode,
         SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER,
-        BI_RGB, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, DEFAULT_CHARSET, DEFAULT_PITCH,
-        DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-        DT_SINGLELINE, DT_VCENTER, FF_SWISS, FW_REGULAR, FW_SEMIBOLD, HFONT, OUT_DEFAULT_PRECIS,
-        TRANSPARENT,
+        BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE,
+        DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS,
+        DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_SWISS, FW_REGULAR, FW_SEMIBOLD, HFONT,
+        OUT_DEFAULT_PRECIS, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Registry::{
@@ -100,6 +100,7 @@ mod win {
     const IDC_PREFIX_MEM: i32 = 109;
     const IDC_PREFIX_UP: i32 = 110;
     const IDC_PREFIX_DOWN: i32 = 111;
+    const IDC_SPACING: i32 = 112;
 
     static WIN_W: AtomicI32 = AtomicI32::new(0);
     static WIN_H: AtomicI32 = AtomicI32::new(0);
@@ -125,6 +126,7 @@ mod win {
         lang: HWND,
         interval: HWND,
         dual: HWND,
+        spacing: HWND,
         anchor: HWND,
         theme: HWND,
         show_res: HWND,
@@ -230,7 +232,20 @@ mod win {
     /// system metrics express font size. Antialiased (not ClearType) quality:
     /// the glyphs are composited per-pixel-alpha over the taskbar, where
     /// ClearType's subpixel color fringing would show as artifacts.
-    unsafe fn make_font_weighted(weight: i32) -> HFONT {
+    /// Segoe UI at the system caption size with the given weight and font
+    /// quality. Negative height = character height (em box), matching how
+    /// system metrics express font size.
+    ///
+    /// `quality` is the GDI font-quality flag and differs by surface:
+    /// - The taskbar overlay is composited per-pixel-alpha, so it must use
+    ///   grayscale antialiasing (`ANTIALIASED_QUALITY`); ClearType's subpixel
+    ///   color fringing would show as artifacts through the alpha channel.
+    /// - The settings dialog is an opaque window drawn straight to the screen,
+    ///   so it uses `CLEARTYPE_QUALITY` for the crispest LCD rendering.
+    unsafe fn make_font_with(
+        weight: i32,
+        quality: windows::Win32::Graphics::Gdi::FONT_QUALITY,
+    ) -> HFONT {
         let dpi = GetDpiForSystem();
         let face = utf16("Segoe UI");
         CreateFontW(
@@ -245,14 +260,44 @@ mod win {
             DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,
+            quality,
+            (DEFAULT_PITCH.0 | FF_SWISS.0) as u32,
+            windows::core::PCWSTR(face.as_ptr()),
+        )
+    }
+
+    /// Overlay font: grayscale AA (safe under per-pixel-alpha compositing).
+    unsafe fn make_font() -> HFONT {
+        make_font_with(TEXT_WEIGHT.load(Ordering::Relaxed), ANTIALIASED_QUALITY)
+    }
+
+    /// Overlay font at an explicit pixel height. Used to render at a
+    /// supersampled scale (2x) before downsampling, which yields smoother
+    /// glyph edges than native grayscale AA at the small caption size.
+    unsafe fn make_font_at(height_px: i32) -> HFONT {
+        let face = utf16("Segoe UI");
+        CreateFontW(
+            -height_px,
+            0,
+            0,
+            0,
+            TEXT_WEIGHT.load(Ordering::Relaxed),
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
             ANTIALIASED_QUALITY,
             (DEFAULT_PITCH.0 | FF_SWISS.0) as u32,
             windows::core::PCWSTR(face.as_ptr()),
         )
     }
 
-    unsafe fn make_font() -> HFONT {
-        make_font_weighted(TEXT_WEIGHT.load(Ordering::Relaxed))
+    /// Settings-dialog font: ClearType for crisp LCD text on the opaque
+    /// dialog surface.
+    unsafe fn make_dialog_font() -> HFONT {
+        make_font_with(TEXT_WEIGHT.load(Ordering::Relaxed), CLEARTYPE_QUALITY)
     }
 
     /// True when the foreground window covers the whole primary screen, i.e.
@@ -322,7 +367,10 @@ mod win {
         let w = WIN_W.load(Ordering::Relaxed);
         let h = WIN_H.load(Ordering::Relaxed);
         let x = if left_anchor {
-            bar.left + TRAY_GAP_PX
+            // Flush against the taskbar's left edge; only the internal text
+            // padding provides breathing room, so the indicator reads tight to
+            // the edge like the native clock.
+            bar.left
         } else {
             let cls = utf16("Shell_TrayWnd");
             let Ok(tray) = FindWindowW(windows::core::PCWSTR(cls.as_ptr()), None) else {
@@ -430,6 +478,12 @@ mod win {
     /// non-zero alpha so the whole widget area accepts right-click for the
     /// context menu and double-click for Task Manager, while remaining
     /// effectively invisible over the taskbar material.
+    ///
+    /// Glyphs are rendered at 2x supersampled resolution into a scratch
+    /// surface and box-filtered down. The overlay cannot use ClearType (its
+    /// subpixel color fringing corrupts per-pixel-alpha compositing), so
+    /// supersampling is how we get smooth, crisp edges at the small caption
+    /// size.
     unsafe fn render_layered(hwnd: HWND) {
         let mut win_rc = RECT::default();
         if GetWindowRect(hwnd, &mut win_rc).is_err() {
@@ -447,51 +501,51 @@ mod win {
         let screen_dc = GetDC(None);
         let mem_dc = CreateCompatibleDC(Some(screen_dc));
 
-        let mut bmi = BITMAPINFO::default();
-        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = w;
-        // Negative height = top-down rows, matching how we draw.
-        bmi.bmiHeader.biHeight = -h;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB.0;
-        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let Ok(bmp) = CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+        // --- Scratch surface at 2x supersampled scale ---------------------
+        const SS: i32 = 2;
+        let sw = w * SS;
+        let sh = h * SS;
+        let mut ss_bmi = BITMAPINFO::default();
+        ss_bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        ss_bmi.bmiHeader.biWidth = sw;
+        ss_bmi.bmiHeader.biHeight = -sh;
+        ss_bmi.bmiHeader.biPlanes = 1;
+        ss_bmi.bmiHeader.biBitCount = 32;
+        ss_bmi.bmiHeader.biCompression = BI_RGB.0;
+        let mut ss_bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let Ok(ss_bmp) =
+            CreateDIBSection(Some(mem_dc), &ss_bmi, DIB_RGB_COLORS, &mut ss_bits, None, 0)
         else {
             let _ = DeleteDC(mem_dc);
             let _ = ReleaseDC(None, screen_dc);
             return;
         };
-
-        let old_bmp = SelectObject(mem_dc, bmp.into());
-        let font = make_font();
-        let old_font = SelectObject(mem_dc, font.into());
+        let old_ss_bmp = SelectObject(mem_dc, ss_bmp.into());
+        let ss_font = make_font_at(12 * GetDpiForSystem() as i32 / 96 * SS);
+        let old_ss_font = SelectObject(mem_dc, ss_font.into());
         SetBkMode(mem_dc, TRANSPARENT);
         // Glyphs are drawn in white so the red channel doubles as a coverage
         // mask; the final color is applied per-pixel below from the theme.
         SetTextColor(mem_dc, COLORREF(0x00FF_FFFF));
 
-        // Fill the surface with a black pixel at a minimal (but non-zero)
-        // alpha. Red channel = 0 here, so any red above comes only from the
-        // glyphs. The tiny alpha keeps the whole rectangle hit-testable while
-        // remaining invisible over the taskbar material.
-        let px = bits as *mut u32;
-        let n = (w * h) as usize;
-        for i in 0..n {
-            *px.add(i) = 0x0100_0000; // ARGB: alpha=1, rgb=black
+        // Clear the scratch surface to black (coverage 0).
+        let ss_px = ss_bits as *mut u32;
+        let ss_n = (sw * sh) as usize;
+        for i in 0..ss_n {
+            *ss_px.add(i) = 0;
         }
 
-        let line_h = h / row.lines.len().max(1) as i32;
+        let ss_line_h = sh / row.lines.len().max(1) as i32;
         // Dual-row uses left-aligned columns (CPU over MEM, U over D) so the
         // two columns read as aligned pairs; single-row stays centered.
         let dual = row.lines.len() > 1;
         for (i, line) in row.lines.iter().enumerate() {
             let text = row_text(line);
             let mut line_rc = RECT {
-                left: if dual { PAD_PX } else { 0 },
-                top: i as i32 * line_h,
-                right: if dual { w - PAD_PX } else { w },
-                bottom: (i as i32 + 1) * line_h,
+                left: if dual { PAD_PX * SS } else { 0 },
+                top: i as i32 * ss_line_h,
+                right: if dual { sw - PAD_PX * SS } else { sw },
+                bottom: (i as i32 + 1) * ss_line_h,
             };
             let mut buf = utf16(&text);
             DrawTextW(
@@ -506,28 +560,66 @@ mod win {
             );
         }
 
-        // Fold the white coverage mask into premultiplied alpha using the
-        // theme's glyph color. Background pixels (coverage 0) keep their
-        // alpha-1 black so the rectangle stays clickable but invisible.
+        SelectObject(mem_dc, old_ss_font);
+        let _ = DeleteObject(ss_font.into());
+
+        // --- Final surface at window scale, downsampled 2x2 ---------------
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = -h;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB.0;
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let Ok(bmp) = CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+        else {
+            SelectObject(mem_dc, old_ss_bmp);
+            let _ = DeleteObject(ss_bmp.into());
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(None, screen_dc);
+            return;
+        };
+
         let (tr, tg, tb) = if theme_is_light() {
             (0u32, 0u32, 0u32)
         } else {
             (255u32, 255u32, 255u32)
         };
+        let px = bits as *mut u32;
+        let n = (w * h) as usize;
         for i in 0..n {
-            let cov = *px.add(i) & 0xFF; // red channel = glyph coverage
-            if cov > 0 {
-                let a = cov;
-                let r = (tr * a) / 255;
-                let g = (tg * a) / 255;
-                let b = (tb * a) / 255;
-                *px.add(i) = (a << 24) | (r << 16) | (g << 8) | b;
+            // Background: minimal (but non-zero) alpha black so the whole
+            // rectangle stays hit-testable yet invisible over the taskbar.
+            *px.add(i) = 0x0100_0000;
+        }
+        for y in 0..h {
+            for x in 0..w {
+                // Box-filter the 2x2 supersampled block's red channel into a
+                // single coverage value.
+                let mut acc = 0u32;
+                for dy in 0..SS {
+                    for dx in 0..SS {
+                        let sx = x * SS + dx;
+                        let sy = y * SS + dy;
+                        acc += *ss_px.add((sy * sw + sx) as usize) & 0xFF;
+                    }
+                }
+                let cov = acc / (SS * SS) as u32;
+                if cov > 0 {
+                    let a = cov;
+                    let r = (tr * a) / 255;
+                    let g = (tg * a) / 255;
+                    let b = (tb * a) / 255;
+                    *px.add((y * w + x) as usize) = (a << 24) | (r << 16) | (g << 8) | b;
+                }
             }
         }
 
-        SelectObject(mem_dc, old_font);
-        let _ = DeleteObject(font.into());
+        SelectObject(mem_dc, old_ss_bmp);
+        let _ = DeleteObject(ss_bmp.into());
 
+        let old_bmp = SelectObject(mem_dc, bmp.into());
         let src_pt = POINT { x: 0, y: 0 };
         let size = SIZE { cx: w, cy: h };
         let dst_pt = POINT {
@@ -724,7 +816,7 @@ mod win {
             s(200),
             s(120),
             s(380),
-            s(470),
+            s(500),
             Some(owner),
             None,
             Some(hmodule.into()),
@@ -811,6 +903,33 @@ mod win {
                 Some(LPARAM(0)),
             );
         }
+        y += row_h;
+
+        static_at(
+            dlg,
+            s(12),
+            y + s(4),
+            label_w,
+            s(20),
+            t(lang, "settings.item_spacing"),
+        );
+        let spacing_cb = control(
+            dlg,
+            "COMBOBOX",
+            IDC_SPACING,
+            (field_x, y, field_w, s(120)),
+            CBS_DROPDOWNLIST,
+        );
+        for sp in 1..=8u32 {
+            combo_add(spacing_cb, &format!("{sp}"));
+        }
+        let spacing_idx = (cfg.display.item_spacing.clamp(1, 8) - 1) as usize;
+        let _ = SendMessageW(
+            spacing_cb,
+            CB_SETCURSEL,
+            Some(WPARAM(spacing_idx)),
+            Some(LPARAM(0)),
+        );
         y += row_h;
 
         static_at(
@@ -972,8 +1091,10 @@ mod win {
 
         // Controls inherit the indicator's Segoe UI instead of the legacy
         // default dialog font, keeping the settings window visually native
-        // to the rest of the product.
-        let dlg_font = make_font();
+        // to the rest of the product. ClearType quality: the dialog is an
+        // opaque window, so subpixel rendering is crisp here (unlike the
+        // alpha-composited overlay, which must stay grayscale AA).
+        let dlg_font = make_dialog_font();
         let _ = EnumChildWindows(Some(dlg), Some(set_child_font), LPARAM(dlg_font.0 as isize));
 
         SETTINGS.with(|s| {
@@ -981,6 +1102,7 @@ mod win {
                 lang: lang_cb,
                 interval: int_cb,
                 dual,
+                spacing: spacing_cb,
                 anchor: anchor_cb,
                 theme: theme_cb,
                 show_res: res,
@@ -1022,6 +1144,10 @@ mod win {
         cfg.windows.dual_row =
             SendMessageW(handles.dual, BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 as usize
                 == BST_CHECKED;
+        let spacing_idx = combo_sel(handles.spacing);
+        if (0..8).contains(&spacing_idx) {
+            cfg.display.item_spacing = (spacing_idx + 1) as u32;
+        }
         let anchor_idx = combo_sel(handles.anchor);
         cfg.windows.anchor = if anchor_idx == 1 {
             sysvitals_core::Anchor::Left

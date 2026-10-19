@@ -86,6 +86,8 @@ pub fn t(lang: Language, key: &str) -> &str {
         (Language::Zh, "settings.prefix_hint") => "不随语言变化；最多 8 个字符。",
         (Language::En, "settings.dual_row") => "Dual-row layout (Windows)",
         (Language::Zh, "settings.dual_row") => "双行显示（Windows）",
+        (Language::En, "settings.item_spacing") => "Item spacing (spaces)",
+        (Language::Zh, "settings.item_spacing") => "项目间距（空格数）",
         (Language::En, "settings.anchor") => "Taskbar position",
         (Language::Zh, "settings.anchor") => "任务栏位置",
         (Language::En, "anchor.right") => "Left of tray",

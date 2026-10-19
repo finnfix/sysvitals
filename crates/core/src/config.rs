@@ -57,6 +57,9 @@ pub struct DisplayConfig {
     /// config-only change. Anything other than `true` is ignored at format
     /// time; format always divides by 1024.
     pub binary_unit: bool,
+    /// Number of spaces between adjacent metrics on the single-row layout.
+    /// Clamped to [1, 8] by `sanitize`; default 2 matches the original look.
+    pub item_spacing: u32,
     pub prefix: PrefixConfig,
 }
 
@@ -133,6 +136,7 @@ impl Default for DisplayConfig {
             show_network: true,
             theme: Theme::Auto,
             binary_unit: true,
+            item_spacing: 2,
             prefix: PrefixConfig::default(),
         }
     }
@@ -226,6 +230,15 @@ impl Config {
             issues.push(SanitizeIssue {
                 field: "history.retention_days",
                 message: "must be >= 1, reset to 30".to_string(),
+            });
+        }
+
+        if !(1..=8).contains(&self.display.item_spacing) {
+            let old = self.display.item_spacing;
+            self.display.item_spacing = old.clamp(1, 8);
+            issues.push(SanitizeIssue {
+                field: "display.item_spacing",
+                message: format!("clamped to [1,8] (was {old})"),
             });
         }
 
