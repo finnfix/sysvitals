@@ -249,7 +249,7 @@ impl Render for HistoryView {
             .child(h_flex().gap_2().child(range_buttons).child(copy_btn));
 
         // CPU chart (wrapped in a fixed-height container since LineChart fills parent)
-        let cpu_chart = div().h(px(180.)).child(
+        let cpu_chart = div().h(px(200.)).child(
             LineChart::new(cpu_points)
                 .x(|p: &ChartPoint| p.label.clone())
                 .y(|p: &ChartPoint| p.value)
@@ -262,7 +262,7 @@ impl Render for HistoryView {
         );
 
         // MEM chart
-        let mem_chart = div().h(px(180.)).child(
+        let mem_chart = div().h(px(200.)).child(
             LineChart::new(mem_points)
                 .x(|p: &ChartPoint| p.label.clone())
                 .y(|p: &ChartPoint| p.value)
@@ -274,24 +274,47 @@ impl Render for HistoryView {
                 .name(t(lang, "chart.mem").to_string()),
         );
 
+        // Legend row: colored dot + label for each series.
+        let cpu_legend = h_flex()
+            .gap_1()
+            .items_center()
+            .child(div().w(px(8.)).h(px(8.)).rounded(px(4.)).bg(hsla(
+                210.0 / 360.0,
+                0.8,
+                0.55,
+                1.0,
+            )))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().foreground.opacity(0.7))
+                    .child(t(lang, "chart.cpu").to_string()),
+            );
+
+        let mem_legend = h_flex()
+            .gap_1()
+            .items_center()
+            .child(div().w(px(8.)).h(px(8.)).rounded(px(4.)).bg(hsla(
+                150.0 / 360.0,
+                0.7,
+                0.45,
+                1.0,
+            )))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().foreground.opacity(0.7))
+                    .child(t(lang, "chart.mem").to_string()),
+            );
+
         v_flex()
             .size_full()
             .p_4()
-            .gap_2()
+            .gap_3()
             .child(header)
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().foreground.opacity(0.6))
-                    .child(t(lang, "chart.cpu").to_string()),
-            )
+            .child(cpu_legend)
             .child(cpu_chart)
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().foreground.opacity(0.6))
-                    .child(t(lang, "chart.mem").to_string()),
-            )
+            .child(mem_legend)
             .child(mem_chart)
     }
 }
