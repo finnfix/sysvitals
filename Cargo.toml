@@ -5,11 +5,12 @@ members = [
     "crates/ui-common",
     "crates/app-win",
     "crates/app-mac",
+    "crates/app-settings",
 ]
 
 # Plain `cargo build|test|check` only touches cross-platform crates.
-# Platform crates (app-win / app-mac / spike) are built explicitly with `-p`,
-# so a Linux host never fails on `windows`/`objc2` dependencies.
+# Platform crates (app-win / app-mac / app-settings) are built explicitly with
+# `-p`, so a Linux host never fails on `windows`/`objc2`/GPUI dependencies.
 default-members = ["crates/core", "crates/ui-common"]
 
 [workspace.package]
@@ -47,6 +48,10 @@ windows = { version = "=0.62.2", default-features = false, features = [
 
 # Local crates
 sysvitals-core = { path = "crates/core" }
+
+# GPUI Kit: modern cross-platform UI framework for the settings window.
+# Pinned to the exact version; GPUI is pre-1.0 and moves fast.
+gpui-kit = "=0.7.3"
 
 # Profiles: GPUI-heavy stacks run poorly in a pure debug build, and the
 # sampler must stay cheap. Keep dev optimized enough to be representative.

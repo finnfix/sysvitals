@@ -1,0 +1,21 @@
+[package]
+name = "app-settings"
+description = "GPUI-based settings window for SysVitals, launched by the platform overlay."
+version.workspace = true
+edition = "2024"
+rust-version = "1.85"
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Platform-specific: requires a desktop GPU context. Built explicitly with
+# `cargo build -p app-settings` on Windows/macOS (or via CI). Kept out of
+# default-members so headless hosts (Linux CI test job) skip it.
+
+[dependencies]
+sysvitals-core = { workspace = true }
+gpui-kit = { workspace = true }
+
+[[bin]]
+name = "SysVitalsSettings"
+path = "src/main.rs"

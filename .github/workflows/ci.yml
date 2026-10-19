@@ -35,7 +35,10 @@ jobs:
       - name: Build Windows display layer
         if: matrix.os == 'windows-latest'
         run: cargo build --release -p app-win
-      # Portable (green) distribution: a single self-contained exe, no
+      - name: Build GPUI settings window
+        if: matrix.os == 'windows-latest'
+        run: cargo build --release -p app-settings
+      # Portable (green) distribution: overlay exe + settings exe, no
       # installer. Package name: SysVitals-{platform}-{arch}-{version}.zip;
       # the version is read from the workspace Cargo.toml (single source of
       # truth). Windows currently ships x64 only.
@@ -45,7 +48,7 @@ jobs:
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           $zip = "SysVitals-windows-x64-$version.zip"
-          Compress-Archive -Path target/release/SysVitals.exe -DestinationPath $zip
+          Compress-Archive -Path target/release/SysVitals.exe, target/release/SysVitalsSettings.exe -DestinationPath $zip
           Write-Host "Packaged $zip"
       - name: Upload Windows portable package
         if: matrix.os == 'windows-latest'
