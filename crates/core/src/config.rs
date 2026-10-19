@@ -36,7 +36,7 @@ pub const DEFAULT_ITEM_SPACING_PX: u32 = 16;
 
 /// Allowed left-margin values in pixels for the far-left anchor. The settings
 /// UI offers exactly these choices; any other value snaps to the nearest one.
-pub const ALLOWED_LEFT_MARGIN_PX: [u32; 6] = [8, 12, 16, 24, 48, 128];
+pub const ALLOWED_LEFT_MARGIN_PX: [u32; 7] = [8, 12, 16, 24, 48, 128, 256];
 
 /// Default left margin: 16 px.
 pub const DEFAULT_LEFT_MARGIN_PX: u32 = 16;
@@ -607,7 +607,7 @@ mod tests {
         let mut big = Config::default();
         big.windows.left_margin_px = 500;
         big.sanitize();
-        assert_eq!(big.windows.left_margin_px, 128);
+        assert_eq!(big.windows.left_margin_px, 256);
     }
 
     #[test]

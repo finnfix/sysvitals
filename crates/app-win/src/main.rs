@@ -35,9 +35,7 @@ mod win {
     use sysvitals_core::{
         format_frame, format_frame_vertical, t, Config, Language, NetSelection, Sampler, Theme,
     };
-    use windows::Win32::Foundation::{
-        CloseHandle, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
-    };
+    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC,
         DeleteObject, DrawTextW, GetDC, GetSysColor, ReleaseDC, SelectObject, SetBkMode,
@@ -56,9 +54,7 @@ mod win {
         REG_VALUE_TYPE,
     };
     use windows::Win32::System::SystemInformation::GetLocalTime;
-    use windows::Win32::System::Threading::{
-        CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::HiDpi::{
         GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
@@ -67,17 +63,16 @@ mod win {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-        DispatchMessageW, EnumChildWindows, FindWindowExW, FindWindowW, GetCursorPos,
-        GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-        IsWindowVisible, KillTimer, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW,
-        SendMessageW, SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
-        UpdateLayeredWindow, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CBS_DROPDOWNLIST, CS_DBLCLKS,
-        CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, HWND_TOPMOST, MF_STRING, MSG, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN,
-        TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-        WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW,
-        WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU,
-        WS_VISIBLE,
+        DispatchMessageW, EnumChildWindows, FindWindowExW, FindWindowW, GetCursorPos, GetMessageW,
+        GetWindowRect, GetWindowTextW, IsWindowVisible, KillTimer, MoveWindow, PostMessageW,
+        PostQuitMessage, RegisterClassExW, SendMessageW, SetTimer, SetWindowTextW, ShowWindow,
+        TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON,
+        CBS_DROPDOWNLIST, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, HWND_TOPMOST,
+        MF_STRING, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW,
+        SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
+        WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK,
+        WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD,
+        WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
     };
 
     /// Gap between the widget's edge and its anchor (tray left / taskbar left).
@@ -414,78 +409,6 @@ mod win {
         make_font_with(TEXT_WEIGHT.load(Ordering::Relaxed), CLEARTYPE_QUALITY)
     }
 
-    /// True when the foreground window covers the whole primary screen, i.e.
-    /// a fullscreen app (game, video, presentation) that the overlay should
-    /// make room for.
-    ///
-    /// Shell flyout windows (Start menu, search, quick settings, etc.) are
-    /// excluded: on Windows 11 the Start menu window reports a full-screen
-    /// rect even though it is not a fullscreen app, which would incorrectly
-    /// hide the indicator while the Start menu is open.
-    unsafe fn foreground_is_fullscreen(me: HWND) -> bool {
-        let fg = GetForegroundWindow();
-        if fg.is_invalid() || fg == me {
-            return false;
-        }
-        // Exclude shell flyout processes before the rect check.
-        if is_shell_flyout_window(fg) {
-            return false;
-        }
-        let mut r = RECT::default();
-        if GetWindowRect(fg, &mut r).is_err() {
-            return false;
-        }
-        let w = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-            windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN,
-        );
-        let h = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-            windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN,
-        );
-        r.left <= 0 && r.top <= 0 && r.right >= w && r.bottom >= h
-    }
-
-    /// Returns true when the window belongs to a Windows shell flyout process
-    /// (Start menu, search, quick settings, action center, widgets, etc.).
-    /// These windows can report full-screen rects but are not fullscreen apps.
-    unsafe fn is_shell_flyout_window(hwnd: HWND) -> bool {
-        let mut pid: u32 = 0;
-        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid == 0 {
-            return false;
-        }
-        let Ok(proc) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
-            return false;
-        };
-        let mut buf = [0u16; 512];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(
-            proc,
-            Default::default(),
-            windows::core::PWSTR(buf.as_mut_ptr()),
-            &mut len,
-        )
-        .is_ok();
-        let _ = CloseHandle(proc);
-        if !ok {
-            return false;
-        }
-        let path = String::from_utf16_lossy(&buf[..len as usize]);
-        // Extract the executable name from the full path.
-        let exe_name = path
-            .rsplit(['\\', '/'])
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        matches!(
-            exe_name.as_str(),
-            "startmenuexperiencehost.exe"
-                | "searchhost.exe"
-                | "shellexperiencehost.exe"
-                | "widgets.exe"
-                | "lockapp.exe"
-        )
-    }
-
     /// Taskbar geometry: rect in screen coordinates plus which screen edge it
     /// occupies. `vertical` is true for left/right taskbars where the indicator
     /// switches to a one-metric-per-line column layout.
@@ -530,24 +453,25 @@ mod win {
     /// left edge. Vertical taskbar (left/right screen edge): the indicator is
     /// a one-metric-per-line column; `Left` anchor means top of the taskbar,
     /// default parks near the tray. Vertically centered (horizontal) or
-    /// horizontally centered (vertical) within the taskbar. Hides the window
-    /// when there is nothing to sit on (taskbar gone) or a fullscreen app
-    /// owns the screen, and restores it otherwise.
+    /// horizontally centered (vertical) within the taskbar.
+    ///
+    /// Visibility follows the taskbar alone: as long as the taskbar is on
+    /// screen the indicator stays visible (even over the Start menu or other
+    /// shell flyouts). It hides only when the taskbar itself is gone — which
+    /// is exactly what happens when the taskbar auto-hides or a true
+    /// fullscreen app (game/video) pushes it off screen. No foreground-window
+    /// heuristics are involved, so shell popups can never hide it by mistake.
     unsafe fn reposition(hwnd: HWND) {
         let Some(info) = taskbar_info() else {
             if IsWindowVisible(hwnd).as_bool() {
-                log_event("INFO", "overlay hidden: taskbar not on screen (auto-hide)");
+                log_event(
+                    "INFO",
+                    "overlay hidden: taskbar not on screen (auto-hide or fullscreen app)",
+                );
             }
             let _ = ShowWindow(hwnd, SW_HIDE);
             return;
         };
-        if foreground_is_fullscreen(hwnd) {
-            if IsWindowVisible(hwnd).as_bool() {
-                log_event("INFO", "overlay hidden: fullscreen foreground app");
-            }
-            let _ = ShowWindow(hwnd, SW_HIDE);
-            return;
-        }
         let bar = info.rect;
 
         // Track orientation changes: reset grow-only width when the taskbar
@@ -662,10 +586,6 @@ mod win {
         row: &FormattedRow,
         spacing_px: i32,
     ) -> FrameMetrics {
-        // The dual-row column gap is deliberately tighter (one space) than the
-        // single-row item spacing: the two columns are stacked pairs (CPU over
-        // MEM, U over D), so a wide gap reads as two separate widgets.
-        let gap = " ".to_string();
         let multi_line = row.lines.len() > 1;
         let has_right_col = row.lines.iter().any(|l| !l.right.is_empty());
         let mut line_h = 0i32;
@@ -726,8 +646,9 @@ mod win {
                 right_col_w = right_col_w.max(text_w(&line.right));
             }
         }
-        let gap_w = text_w(&gap);
-        let right_x = left_col_w + gap_w;
+        // The gap between the two columns honors the configured pixel spacing so
+        // the "item spacing" setting takes effect in dual-row mode too.
+        let right_x = left_col_w + spacing_px;
         FrameMetrics {
             line_h,
             want_w: right_x + right_col_w,
@@ -1922,6 +1843,10 @@ mod win {
                     "INFO",
                     "WM_APP_APPLY received: repositioning and re-rendering",
                 );
+                // Width is grow-only, so reset it before re-measuring; otherwise
+                // a spacing/metric change to a narrower layout would keep the
+                // old (wider) window size and the new spacing would not show.
+                WIN_W.store(0, Ordering::Relaxed);
                 reposition(hwnd);
                 sample_now(hwnd);
                 LRESULT(0)
@@ -2003,18 +1928,54 @@ mod win {
     }
 
     unsafe extern "system" fn unhandled_exception_filter(info: *const EXCEPTION_POINTERS) -> i32 {
-        let code = if !info.is_null() && !(*info).ExceptionRecord.is_null() {
-            (*(*info).ExceptionRecord).ExceptionCode.0 as u32
-        } else {
-            0
-        };
+        let mut code = 0u32;
+        let mut addr = 0usize;
+        if !info.is_null() && !(*info).ExceptionRecord.is_null() {
+            let rec = &*(*info).ExceptionRecord;
+            code = rec.ExceptionCode.0 as u32;
+            addr = rec.ExceptionAddress as usize;
+        }
+        // Resolve the module that owns the faulting address so the crash can be
+        // attributed (our exe vs. a system DLL such as comctl32/gdi32).
+        let module = module_name_for_address(addr as *mut std::ffi::c_void);
         log_event(
             "FATAL",
-            &format!("unhandled exception: 0x{code:08X} — process will terminate"),
+            &format!(
+                "unhandled exception: 0x{code:08X} at 0x{addr:016X} in {module} — process will terminate"
+            ),
         );
         // EXCEPTION_EXECUTE_HANDLER: let the OS terminate the process after
         // our logging. We do not attempt recovery.
         1
+    }
+
+    /// Best-effort: return the module file name that contains `addr`, or a
+    /// placeholder when it cannot be resolved. Never panics.
+    unsafe fn module_name_for_address(addr: *mut std::ffi::c_void) -> String {
+        use windows::Win32::System::LibraryLoader::{
+            GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        };
+        let mut hmod = windows::Win32::Foundation::HMODULE::default();
+        let ok = GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            windows::core::PCWSTR(addr as *const u16),
+            &mut hmod,
+        )
+        .is_ok();
+        if !ok {
+            return "<unknown module>".to_string();
+        }
+        let mut buf = [0u16; 512];
+        let n = GetModuleFileNameW(Some(hmod), &mut buf);
+        if n == 0 {
+            return "<unknown module>".to_string();
+        }
+        let path = String::from_utf16_lossy(&buf[..n as usize]);
+        path.rsplit(['\\', '/'])
+            .next()
+            .unwrap_or("<unknown module>")
+            .to_string()
     }
 
     pub fn run() {
