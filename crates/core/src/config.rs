@@ -157,10 +157,10 @@ impl DisplayConfig {
 impl Default for PrefixConfig {
     fn default() -> Self {
         PrefixConfig {
-            cpu: "CPU".to_string(),
-            mem: "MEM".to_string(),
-            up: "U".to_string(),
-            down: "D".to_string(),
+            cpu: "CPU:".to_string(),
+            mem: "MEM:".to_string(),
+            up: "U:".to_string(),
+            down: "D:".to_string(),
         }
     }
 }
@@ -401,8 +401,8 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.sample.interval_ms, 2000);
         assert_eq!(c.display.language, Language::En);
-        assert_eq!(c.display.prefix.cpu, "CPU");
-        assert_eq!(c.display.prefix.up, "U");
+        assert_eq!(c.display.prefix.cpu, "CPU:");
+        assert_eq!(c.display.prefix.up, "U:");
         assert_eq!(c.windows.anchor, Anchor::Right);
         assert!(!c.windows.dual_row);
         assert_eq!(c.history.retention_days, 30);
@@ -475,7 +475,7 @@ mod tests {
         // A hand-written partial config must still load with defaults filled in.
         let (c, _) = Config::from_toml_str("[display]\nlanguage = \"zh\"\n").unwrap();
         assert_eq!(c.display.language, Language::Zh);
-        assert_eq!(c.display.prefix.cpu, "CPU");
+        assert_eq!(c.display.prefix.cpu, "CPU:");
         assert_eq!(c.sample.interval_ms, 2000);
     }
 

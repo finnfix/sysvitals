@@ -51,31 +51,35 @@ mod win {
     use windows::Win32::UI::HiDpi::{
         GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
-    use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
     use windows::Win32::UI::Shell::{
         SHAppBarMessage, ShellExecuteW, ABM_GETTASKBARPOS, APPBARDATA,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
         DispatchMessageW, EnumChildWindows, FindWindowExW, FindWindowW, GetCursorPos,
-        GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW, KillTimer, MoveWindow,
-        PostQuitMessage, RegisterClassExW, SendMessageW, SetTimer, SetWindowTextW, ShowWindow,
-        TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON,
-        CBS_DROPDOWNLIST, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, HWND_TOPMOST,
-        MF_STRING, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW,
-        SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
-        WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK,
-        WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD,
-        WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+        GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW, IsWindowVisible,
+        KillTimer, MoveWindow, PostQuitMessage, RegisterClassExW, SendMessageW, SetTimer,
+        SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, UpdateLayeredWindow,
+        BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CBS_DROPDOWNLIST, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
+        ES_AUTOHSCROLL, HWND_TOPMOST, MF_STRING, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD,
+        TPM_RIGHTBUTTON, ULW_ALPHA, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+        WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW,
+        WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU,
+        WS_VISIBLE,
     };
 
     /// Gap between the widget's edge and its anchor (tray left / taskbar left).
-    const TRAY_GAP_PX: i32 = 8;
+    /// Kept at 0 so the indicator sits as close to the tray as the tray's own
+    /// icons do; the internal text padding provides the visual breathing room.
+    const TRAY_GAP_PX: i32 = 0;
     const TIMER_SAMPLE: usize = 0x515;
     const TIMER_MOVE: usize = 0x516;
     const MOVE_MS: u32 = 1_000;
-    /// Horizontal padding around the measured text.
-    const PAD_PX: i32 = 12;
+    /// Horizontal padding around the measured text. Small so the indicator can
+    /// sit tight to the tray (matching tray-icon spacing) while still keeping
+    /// a hit-testable margin.
+    const PAD_PX: i32 = 6;
     const THEME_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
     const THEME_VALUE: &str = "SystemUsesLightTheme";
     const TASKBAR_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced";
@@ -127,6 +131,7 @@ mod win {
 
     #[derive(Default, Clone, Copy)]
     struct SettingsHandles {
+        dlg: HWND,
         lang: HWND,
         interval: HWND,
         dual: HWND,
@@ -136,6 +141,19 @@ mod win {
         show_res: HWND,
         show_net: HWND,
         prefix: [HWND; 4],
+        // Text-bearing controls that need re-translation when the language
+        // changes via Apply (issue: dialog used to stay in the old language).
+        lbl_lang: HWND,
+        lbl_interval: HWND,
+        lbl_spacing: HWND,
+        lbl_anchor: HWND,
+        lbl_theme: HWND,
+        lbl_prefixes: HWND,
+        lbl_prefix: [HWND; 4],
+        lbl_hint: HWND,
+        btn_apply: HWND,
+        btn_ok: HWND,
+        btn_cancel: HWND,
     }
 
     fn config() -> Config {
@@ -405,7 +423,80 @@ mod win {
             return; // would leave the taskbar; keep last position
         }
         let _ = MoveWindow(hwnd, x, y, w, h, true);
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        // Only re-show when actually hidden (e.g. returning from auto-hide or
+        // fullscreen). Calling ShowWindow unconditionally every tick makes an
+        // owned settings dialog flicker.
+        if !IsWindowVisible(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+
+    /// Geometry of one frame measured with the font currently selected into
+    /// `hdc`. `right_x` is `Some` only for a true two-column (dual-row) frame
+    /// and gives the pixel offset (from the text origin) where the right column
+    /// must start so U/D line up across both rows. Drawing the two columns as
+    /// separate strings at this measured offset is what guarantees pixel-level
+    /// alignment in a proportional font — space padding alone cannot.
+    struct FrameMetrics {
+        line_h: i32,
+        want_w: i32,
+        right_x: Option<i32>,
+        /// True when the frame has more than one line (dual-row layout).
+        /// Multi-line frames are always left-aligned; single-line is centered.
+        multi_line: bool,
+    }
+
+    unsafe fn measure_frame(
+        hdc: windows::Win32::Graphics::Gdi::HDC,
+        row: &FormattedRow,
+        spacing: u32,
+    ) -> FrameMetrics {
+        let gap = " ".repeat(spacing.max(1) as usize);
+        let multi_line = row.lines.len() > 1;
+        let has_right_col = row.lines.iter().any(|l| !l.right.is_empty());
+        let mut line_h = 0i32;
+        let mut text_w = |text: &str| -> i32 {
+            let mut rc = RECT::default();
+            let mut buf = utf16(text);
+            DrawTextW(
+                hdc,
+                &mut buf,
+                &mut rc,
+                DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            line_h = line_h.max(rc.bottom - rc.top);
+            rc.right - rc.left
+        };
+        if !multi_line || !has_right_col {
+            // Single line, or multi-line with only one column: measure each
+            // line independently and use the widest.
+            let mut want_w = 0i32;
+            for line in &row.lines {
+                want_w = want_w.max(text_w(&row_text(line)));
+            }
+            return FrameMetrics {
+                line_h,
+                want_w,
+                right_x: None,
+                multi_line,
+            };
+        }
+        let mut left_col_w = 0i32;
+        let mut right_col_w = 0i32;
+        for line in &row.lines {
+            left_col_w = left_col_w.max(text_w(&line.left));
+            if !line.right.is_empty() {
+                right_col_w = right_col_w.max(text_w(&line.right));
+            }
+        }
+        let gap_w = text_w(&gap);
+        let right_x = left_col_w + gap_w;
+        FrameMetrics {
+            line_h,
+            want_w: right_x + right_col_w,
+            right_x: Some(right_x),
+            multi_line,
+        }
     }
 
     /// Measure the formatted rows and grow the window to fit. Width only ever
@@ -415,29 +506,16 @@ mod win {
         let hdc = GetDC(Some(hwnd));
         let font = make_font();
         let old = SelectObject(hdc, font.into());
-        let mut line_h = 0i32;
-        let mut want_w = 0i32;
-        for line in &row.lines {
-            let text = row_text(line);
-            let mut rc = RECT::default();
-            let mut buf = utf16(&text);
-            DrawTextW(
-                hdc,
-                &mut buf,
-                &mut rc,
-                DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
-            );
-            line_h = line_h.max(rc.bottom - rc.top);
-            want_w = want_w.max(rc.right - rc.left);
-        }
+        let spacing = config().display.item_spacing;
+        let m = measure_frame(hdc, row, spacing);
         SelectObject(hdc, old);
         let _ = DeleteObject(font.into());
         let _ = ReleaseDC(Some(hwnd), hdc);
-        if line_h == 0 {
+        if m.line_h == 0 {
             return;
         }
-        let line_h = line_h + 4; // breathing room between the two rows
-        let want_w = want_w + PAD_PX * 2;
+        let line_h = m.line_h + 4; // breathing room between the two rows
+        let want_w = m.want_w + PAD_PX * 2;
         let want_h = line_h * row.lines.len() as i32 + 4;
         WIN_W.fetch_max(want_w, Ordering::Relaxed);
         WIN_H.store(want_h, Ordering::Relaxed);
@@ -577,26 +655,83 @@ mod win {
         let ss_line_h = sh / row.lines.len().max(1) as i32;
         // Dual-row uses left-aligned columns (CPU over MEM, U over D) so the
         // two columns read as aligned pairs; single-row stays centered.
-        let dual = row.lines.len() > 1;
+        //
+        // Column alignment: in a proportional font, padding with spaces does
+        // not guarantee the right column starts at the same pixel on every
+        // row. So for dual-row we measure the left column's max pixel width
+        // and draw the right column as a separate string at that measured
+        // offset (scaled by the supersample factor). This is what makes U/D
+        // line up vertically.
+        let spacing = config().display.item_spacing;
+        let fm = measure_frame(mem_dc, row, spacing);
         for (i, line) in row.lines.iter().enumerate() {
-            let text = row_text(line);
-            let mut line_rc = RECT {
-                left: if dual { PAD_PX * SS } else { 0 },
-                top: i as i32 * ss_line_h,
-                right: if dual { sw - PAD_PX * SS } else { sw },
-                bottom: (i as i32 + 1) * ss_line_h,
-            };
-            let mut buf = utf16(&text);
-            DrawTextW(
-                mem_dc,
-                &mut buf,
-                &mut line_rc,
-                if dual {
-                    DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX
-                } else {
-                    DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX
-                },
-            );
+            let top = i as i32 * ss_line_h;
+            let bottom = (i as i32 + 1) * ss_line_h;
+            if let Some(right_x) = fm.right_x {
+                // Left column, left-aligned at the padding.
+                let mut left_rc = RECT {
+                    left: PAD_PX * SS,
+                    top,
+                    right: PAD_PX * SS + right_x,
+                    bottom,
+                };
+                let mut lbuf = utf16(&line.left);
+                DrawTextW(
+                    mem_dc,
+                    &mut lbuf,
+                    &mut left_rc,
+                    DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+                // Right column at the measured pixel offset.
+                if !line.right.is_empty() {
+                    let mut right_rc = RECT {
+                        left: PAD_PX * SS + right_x,
+                        top,
+                        right: sw - PAD_PX * SS,
+                        bottom,
+                    };
+                    let mut rbuf = utf16(&line.right);
+                    DrawTextW(
+                        mem_dc,
+                        &mut rbuf,
+                        &mut right_rc,
+                        DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                    );
+                }
+            } else if fm.multi_line {
+                // Multi-line but single column (e.g. dual-row with network off):
+                // left-aligned, not centered.
+                let text = row_text(line);
+                let mut line_rc = RECT {
+                    left: PAD_PX * SS,
+                    top,
+                    right: sw - PAD_PX * SS,
+                    bottom,
+                };
+                let mut buf = utf16(&text);
+                DrawTextW(
+                    mem_dc,
+                    &mut buf,
+                    &mut line_rc,
+                    DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+            } else {
+                // Single row: centered.
+                let text = row_text(line);
+                let mut line_rc = RECT {
+                    left: 0,
+                    top,
+                    right: sw,
+                    bottom,
+                };
+                let mut buf = utf16(&text);
+                DrawTextW(
+                    mem_dc,
+                    &mut buf,
+                    &mut line_rc,
+                    DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+            }
         }
 
         SelectObject(mem_dc, old_ss_font);
@@ -739,6 +874,7 @@ mod win {
     const CB_ADDSTRING: u32 = 0x0143;
     const CB_SETCURSEL: u32 = 0x014E;
     const CB_GETCURSEL: u32 = 0x0147;
+    const CB_RESETCONTENT: u32 = 0x014A;
     const BM_GETCHECK: u32 = 0x00F0;
     const BM_SETCHECK: u32 = 0x00F1;
     const WM_SETFONT: u32 = 0x0030;
@@ -824,6 +960,55 @@ mod win {
         .unwrap_or_default()
     }
 
+    /// Re-translate every static label, checkbox caption, combo item and
+    /// button in the settings dialog to `lang`. Called after Apply so the
+    /// dialog reflects the newly chosen language immediately (issue #1).
+    unsafe fn refresh_settings_texts(lang: Language) {
+        let h = SETTINGS.with(|s| *s.borrow());
+        let set = |hwnd: HWND, text: &str| {
+            let buf = utf16(text);
+            let _ = SetWindowTextW(hwnd, windows::core::PCWSTR(buf.as_ptr()));
+        };
+        set(h.dlg, t(lang, "settings.title"));
+        set(h.lbl_lang, t(lang, "settings.language"));
+        set(h.lbl_interval, t(lang, "settings.sample_interval"));
+        set(h.dual, t(lang, "settings.dual_row"));
+        set(h.lbl_spacing, t(lang, "settings.item_spacing"));
+        set(h.lbl_anchor, t(lang, "settings.anchor"));
+        set(h.lbl_theme, t(lang, "settings.theme"));
+        set(
+            h.show_res,
+            &format!("{} / {}", t(lang, "metric.cpu"), t(lang, "metric.mem")),
+        );
+        set(
+            h.show_net,
+            &format!("{} / {}", t(lang, "metric.up"), t(lang, "metric.down")),
+        );
+        set(h.lbl_prefixes, t(lang, "settings.prefixes"));
+        let metric_keys = ["metric.cpu", "metric.mem", "metric.up", "metric.down"];
+        for i in 0..4 {
+            set(h.lbl_prefix[i], t(lang, metric_keys[i]));
+        }
+        set(h.lbl_hint, t(lang, "settings.prefix_hint"));
+        set(h.btn_apply, t(lang, "settings.apply"));
+        set(h.btn_ok, t(lang, "settings.ok"));
+        set(h.btn_cancel, t(lang, "settings.cancel"));
+        // Rebuild the anchor combo items in the new language, keeping the
+        // current selection index.
+        let sel = combo_sel(h.anchor);
+        let _ = SendMessageW(h.anchor, CB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+        combo_add(h.anchor, t(lang, "anchor.right"));
+        if win11_centered_taskbar() {
+            combo_add(h.anchor, t(lang, "anchor.left"));
+        }
+        let _ = SendMessageW(
+            h.anchor,
+            CB_SETCURSEL,
+            Some(WPARAM(sel.max(0) as usize)),
+            Some(LPARAM(0)),
+        );
+    }
+
     unsafe fn open_settings(owner: HWND) {
         if SETTINGS_OPEN.swap(true, Ordering::Relaxed) {
             return;
@@ -869,7 +1054,7 @@ mod win {
         let mut y = s(14);
         let row_h = s(30);
 
-        static_at(
+        let lbl_lang = static_at(
             dlg,
             s(12),
             y + s(4),
@@ -900,7 +1085,7 @@ mod win {
         );
         y += row_h;
 
-        static_at(
+        let lbl_interval = static_at(
             dlg,
             s(12),
             y + s(4),
@@ -944,7 +1129,7 @@ mod win {
         }
         y += row_h;
 
-        static_at(
+        let lbl_spacing = static_at(
             dlg,
             s(12),
             y + s(4),
@@ -971,7 +1156,7 @@ mod win {
         );
         y += row_h;
 
-        static_at(
+        let lbl_anchor = static_at(
             dlg,
             s(12),
             y + s(4),
@@ -1000,7 +1185,7 @@ mod win {
         );
         y += row_h;
 
-        static_at(
+        let lbl_theme = static_at(
             dlg,
             s(12),
             y + s(4),
@@ -1067,7 +1252,7 @@ mod win {
         }
         y += row_h + s(8);
 
-        static_at(dlg, s(12), y, s(340), s(20), t(lang, "settings.prefixes"));
+        let lbl_prefixes = static_at(dlg, s(12), y, s(340), s(20), t(lang, "settings.prefixes"));
         y += s(24);
         let labels = [
             t(lang, "metric.cpu"),
@@ -1088,8 +1273,9 @@ mod win {
             IDC_PREFIX_DOWN,
         ];
         let mut prefix_hwnds = [HWND::default(); 4];
+        let mut prefix_label_hwnds = [HWND::default(); 4];
         for i in 0..4 {
-            static_at(dlg, s(12), y + s(4), label_w, s(20), labels[i]);
+            prefix_label_hwnds[i] = static_at(dlg, s(12), y + s(4), label_w, s(20), labels[i]);
             let edit = control(
                 dlg,
                 "EDIT",
@@ -1102,7 +1288,7 @@ mod win {
             prefix_hwnds[i] = edit;
             y += row_h;
         }
-        static_at(
+        let lbl_hint = static_at(
             dlg,
             s(12),
             y,
@@ -1138,6 +1324,7 @@ mod win {
 
         SETTINGS.with(|s| {
             *s.borrow_mut() = SettingsHandles {
+                dlg,
                 lang: lang_cb,
                 interval: int_cb,
                 dual,
@@ -1147,10 +1334,24 @@ mod win {
                 show_res: res,
                 show_net: net,
                 prefix: prefix_hwnds,
+                lbl_lang,
+                lbl_interval,
+                lbl_spacing,
+                lbl_anchor,
+                lbl_theme,
+                lbl_prefixes,
+                lbl_prefix: prefix_label_hwnds,
+                lbl_hint,
+                btn_apply: apply,
+                btn_ok: ok,
+                btn_cancel: cancel,
             };
         });
 
-        let _ = EnableWindow(owner, false);
+        // Do NOT disable the owner overlay: the indicator should stay
+        // interactive (right-click menu, double-click) while settings is open.
+        // The settings dialog is an owned window, so it stays on top of the
+        // overlay regardless.
         let _ = ShowWindow(dlg, SW_SHOW);
 
         // Nested modal loop: the overlay keeps ticking behind the dialog
@@ -1161,7 +1362,6 @@ mod win {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        let _ = EnableWindow(owner, true);
         let _ = DeleteObject(dlg_font.into());
         SETTINGS_OPEN.store(false, Ordering::Relaxed);
     }
@@ -1235,6 +1435,9 @@ mod win {
         );
         reposition(overlay);
         sample_now(overlay);
+        // Re-translate the dialog itself so a language change via Apply is
+        // visible immediately without reopening the window.
+        refresh_settings_texts(cfg.display.language);
     }
 
     unsafe extern "system" fn settings_wndproc(

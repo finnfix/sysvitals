@@ -252,15 +252,21 @@ pub fn format_frame(snapshot: &Snapshot, cfg: &Config) -> FormattedRow {
             .max()
             .unwrap_or(0);
 
-        // If one column has no enabled metric, collapse to a single line.
+        // If one column has no enabled metric, keep the two-line layout
+        // with only the populated column (the user chose dual-row; collapsing
+        // to a single line would silently override that choice).
         if left.is_empty() || right.is_empty() {
-            let all = enabled
+            let cells = if left.is_empty() { &right } else { &left };
+            let w = cells
                 .iter()
-                .map(|m| join_prefix(prefix_for(*m, cfg), &format_value(*m, snapshot)))
-                .collect::<Vec<_>>()
-                .join("  ");
+                .map(|(_, s)| display_width(s))
+                .max()
+                .unwrap_or(0);
             return FormattedRow {
-                lines: vec![Line::single(all)],
+                lines: vec![
+                    Line::single(cell_at(cells, 0, w)),
+                    Line::single(cell_at(cells, 1, w)),
+                ],
             };
         }
 
@@ -367,7 +373,7 @@ mod tests {
         assert_eq!(f.lines.len(), 1);
         assert_eq!(
             f.lines[0].render(),
-            "CPU 29%  MEM 68%  U 1.20 M/s  D 314 K/s"
+            "CPU: 29%  MEM: 68%  U: 1.20 M/s  D: 314 K/s"
         );
     }
 
@@ -381,7 +387,7 @@ mod tests {
         assert_eq!(f.lines.len(), 1);
         assert_eq!(
             f.lines[0].render(),
-            "CPU 29%    MEM 68%    U 1.00 K/s    D 2.00 K/s"
+            "CPU: 29%    MEM: 68%    U: 1.00 K/s    D: 2.00 K/s"
         );
     }
 
@@ -394,12 +400,12 @@ mod tests {
         let f = format_frame(&snap(29.0, 68.0, 1024.0, 2048.0), &cfg);
         let text = f.lines[0].render();
         assert!(!text.contains("CPU") && !text.contains("MEM"));
-        assert!(text.starts_with("U "));
+        assert!(text.starts_with("U: "));
 
         let mut cfg2 = Config::default();
         cfg2.display.show_network = false;
         let f2 = format_frame(&snap(29.0, 68.0, 1024.0, 2048.0), &cfg2);
-        assert_eq!(f2.lines[0].render(), "CPU 29%  MEM 68%");
+        assert_eq!(f2.lines[0].render(), "CPU: 29%  MEM: 68%");
     }
 
     #[test]
@@ -411,10 +417,10 @@ mod tests {
         // Left column width fixed by max(CPU.., MEM..) so right column starts
         // at the same offset in both rows.
         assert_eq!(f.lines[0].left.len(), f.lines[1].left.len());
-        assert_eq!(f.lines[0].render(), "CPU 29%  U 1.20 M/s");
-        // "D 314 K/s" is one col narrower, padded to the column width -> the
+        assert_eq!(f.lines[0].render(), "CPU: 29%  U: 1.20 M/s");
+        // "D: 314 K/s" is one col narrower, padded to the column width -> the
         // trailing space is the alignment, matching the row above.
-        assert_eq!(f.lines[1].render(), "MEM 68%  D 314 K/s ");
+        assert_eq!(f.lines[1].render(), "MEM: 68%  D: 314 K/s ");
     }
 
     #[test]
@@ -451,23 +457,24 @@ mod tests {
     fn nan_values_show_placeholder() {
         let cfg = Config::default();
         let f = format_frame(&snap(f64::NAN, f64::NAN, f64::NAN, f64::NAN), &cfg);
-        assert_eq!(f.lines[0].render(), "CPU --%  MEM --%  U --  D --");
+        assert_eq!(f.lines[0].render(), "CPU: --%  MEM: --%  U: --  D: --");
         // And the whole group disappears when its paired toggle is off.
         let mut c2 = Config::default();
         c2.display.show_network = false;
         let f2 = format_frame(&snap(f64::NAN, f64::NAN, f64::NAN, f64::NAN), &c2);
-        assert_eq!(f2.lines[0].render(), "CPU --%  MEM --%");
+        assert_eq!(f2.lines[0].render(), "CPU: --%  MEM: --%");
     }
 
     #[test]
-    fn dual_row_collapses_when_a_column_empty() {
+    fn dual_row_keeps_two_lines_when_a_column_empty() {
         let mut cfg = Config::default();
         cfg.windows.dual_row = true;
         cfg.display.show_network = false;
         let f = format_frame(&snap(29.0, 68.0, 0.0, 0.0), &cfg);
-        // Right column has nothing -> single line fallback.
-        assert_eq!(f.lines.len(), 1);
-        assert_eq!(f.lines[0].render(), "CPU 29%  MEM 68%");
+        // Right column has nothing -> still two lines, left column only.
+        assert_eq!(f.lines.len(), 2);
+        assert_eq!(f.lines[0].render(), "CPU: 29%");
+        assert_eq!(f.lines[1].render(), "MEM: 68%");
     }
 
     #[test]
@@ -476,6 +483,9 @@ mod tests {
         cfg.display.prefix.cpu = "".to_string();
         cfg.display.prefix.up = "↑".to_string();
         let f = format_frame(&snap(29.0, 68.0, 1024.0, 0.0), &cfg);
-        assert_eq!(f.lines[0].render(), "29%  MEM 68%  ↑ 1.00 K/s  D 0.00 K/s");
+        assert_eq!(
+            f.lines[0].render(),
+            "29%  MEM: 68%  ↑ 1.00 K/s  D: 0.00 K/s"
+        );
     }
 }
