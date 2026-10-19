@@ -9,8 +9,39 @@ repository.workspace = true
 publish.workspace = true
 
 # macOS-only. Build explicitly with `cargo build -p app-mac` on macOS.
-# objc2 / objc2-app-kit / GPUI deps are added with the menu-bar layer so the
-# workspace resolves on Linux/Windows.
+# Dependencies are target-gated so the workspace resolves on other platforms.
+
+[dependencies]
+sysvitals-core = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.5"
+objc2-app-kit = { version = "=0.3.2", features = [
+    "NSApplication",
+    "NSButton",
+    "NSColor",
+    "NSControl",
+    "NSFont",
+    "NSMenu",
+    "NSMenuItem",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSScreen",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { version = "=0.3.2", features = [
+    "NSDate",
+    "NSNotification",
+    "NSRunLoop",
+    "NSString",
+    "NSThread",
+    "NSTimer",
+    "NSValue",
+] }
+block2 = "=0.6.2"
 
 [[bin]]
 name = "sysvitals"

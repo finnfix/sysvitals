@@ -62,3 +62,24 @@ jobs:
       - name: Build macOS display layer
         if: matrix.os == 'macos-latest'
         run: cargo build --release -p app-mac
+      # macOS .app bundle: assemble the bundle structure (binary + Info.plist +
+      # AppIcon.icns), then zip it. Package name: SysVitals-macos-{arch}-{version}.zip.
+      - name: Package macOS app bundle
+        if: matrix.os == 'macos-latest'
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          arch=$(uname -m)
+          app="SysVitals.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/release/sysvitals "$app/Contents/MacOS/sysvitals"
+          cp crates/app-mac/assets/Info.plist "$app/Contents/Info.plist"
+          cp crates/app-mac/assets/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
+          zip -qr "SysVitals-macos-$arch-$version.zip" "$app"
+          echo "Packaged SysVitals-macos-$arch-$version.zip"
+      - name: Upload macOS app bundle
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SysVitals-macos
+          path: SysVitals-macos-*.zip
+          if-no-files-found: error

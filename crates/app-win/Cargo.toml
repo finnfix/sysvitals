@@ -18,6 +18,9 @@ sysvitals-core = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
 
+[target.'cfg(windows)'.build-dependencies]
+winres = "=0.1.12"
+
 [[bin]]
 # Mixed-case on purpose: the shipped executable is `SysVitals.exe`.
 name = "SysVitals"
