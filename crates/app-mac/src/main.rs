@@ -21,7 +21,7 @@ mod macos {
 
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
-    use objc2::{define_class, msg_send, sel, ClassType, MainThreadMarker, MainThreadOnly};
+    use objc2::{define_class, msg_send_id, sel, MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{
         NSApplication, NSApplicationActivationPolicy, NSEventType, NSMenu, NSMenuItem, NSStatusBar,
         NSStatusItem, NSVariableStatusItemLength,
@@ -273,9 +273,9 @@ mod macos {
     );
 
     impl ActionHandler {
-        fn new() -> Retained<Self> {
-            let this = Self::alloc();
-            unsafe { msg_send![super(this), init] }
+        fn new(mtm: MainThreadMarker) -> Retained<Self> {
+            let this = Self::alloc(mtm);
+            unsafe { msg_send_id![super(this), init] }
         }
     }
 
@@ -299,7 +299,7 @@ mod macos {
         }
 
         // Action handler (kept alive for the process lifetime).
-        let handler = ActionHandler::new();
+        let handler = ActionHandler::new(mtm);
 
         // Wire button action (handles single/double/right click).
         if let Some(button) = status_item.button(mtm) {
