@@ -41,6 +41,7 @@ objc2-foundation = { version = "=0.3.2", features = [
     "NSThread",
     "NSTimer",
     "NSValue",
+    "block2",
 ] }
 block2 = "=0.6.2"
 

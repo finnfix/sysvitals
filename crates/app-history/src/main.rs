@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gpui_kit::component::button::*;
 use gpui_kit::component::chart::LineChart;
 use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use sysvitals_core::config::{config_path, history_path, Config, CsvScope};

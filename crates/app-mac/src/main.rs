@@ -21,10 +21,10 @@ mod macos {
 
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
-    use objc2::{define_class, msg_send, sel, ClassType, MainThreadOnly};
+    use objc2::{define_class, msg_send, sel, ClassType, MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventType, NSMenu, NSMenuItem,
-        NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+        NSApplication, NSApplicationActivationPolicy, NSEventType, NSMenu, NSMenuItem, NSStatusBar,
+        NSStatusItem, NSVariableStatusItemLength,
     };
     use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimer};
 
@@ -37,6 +37,12 @@ mod macos {
         static CONFIG: RefCell<Config> = RefCell::new(Config::default());
         static STATUS_ITEM: RefCell<Option<Retained<NSStatusItem>>> = const { RefCell::new(None) };
         static CONFIG_MTIME: RefCell<i64> = const { RefCell::new(0) };
+        static MTM: RefCell<Option<MainThreadMarker>> = const { RefCell::new(None) };
+    }
+
+    /// Get the MainThreadMarker (must be called from main thread).
+    fn mtm() -> MainThreadMarker {
+        MTM.with(|m| m.borrow().expect("MainThreadMarker not set"))
     }
 
     /// Load or reload the config file, updating the cached mtime.
@@ -95,9 +101,10 @@ mod macos {
         };
 
         let title = NSString::from_str(&text);
+        let mtm = mtm();
         STATUS_ITEM.with(|si| {
             if let Some(item) = si.borrow().as_ref() {
-                if let Some(button) = item.button() {
+                if let Some(button) = item.button(mtm) {
                     button.setTitle(&title);
                 }
             }
@@ -155,52 +162,56 @@ mod macos {
             .arg(format!("sleep 2 && open '{}'", exe_str))
             .spawn();
         // Exit current instance.
-        let app = NSApplication::sharedApplication();
+        let mtm = mtm();
+        let app = NSApplication::sharedApplication(mtm);
         app.terminate(None);
     }
 
     /// Show the context menu at the status item position.
     fn show_context_menu() {
+        let mtm = mtm();
         STATUS_ITEM.with(|si| {
             let si_borrow = si.borrow();
             let Some(item) = si_borrow.as_ref() else {
                 return;
             };
-            let Some(button) = item.button() else {
+            let Some(button) = item.button(mtm) else {
                 return;
             };
 
-            let menu = NSMenu::new();
+            let menu = NSMenu::new(mtm);
 
             let history_title = NSString::from_str("Show History");
-            let history_item = NSMenuItem::new();
+            let history_item = NSMenuItem::new(mtm);
             history_item.setTitle(&history_title);
-            history_item.setAction(Some(sel!(showHistory:)));
+            // SAFETY: setting a valid selector on a menu item.
+            unsafe { history_item.setAction(Some(sel!(showHistory:))) };
             menu.addItem(&history_item);
 
             let settings_title = NSString::from_str("Settings…");
-            let settings_item = NSMenuItem::new();
+            let settings_item = NSMenuItem::new(mtm);
             settings_item.setTitle(&settings_title);
-            settings_item.setAction(Some(sel!(showSettings:)));
+            unsafe { settings_item.setAction(Some(sel!(showSettings:))) };
             menu.addItem(&settings_item);
 
             let restart_title = NSString::from_str("Restart");
-            let restart_item = NSMenuItem::new();
+            let restart_item = NSMenuItem::new(mtm);
             restart_item.setTitle(&restart_title);
-            restart_item.setAction(Some(sel!(restartApp:)));
+            unsafe { restart_item.setAction(Some(sel!(restartApp:))) };
             menu.addItem(&restart_item);
 
-            menu.addItem(&NSMenuItem::separatorItem());
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
 
             let quit_title = NSString::from_str("Quit SysVitals");
-            let quit_item = NSMenuItem::new();
+            let quit_item = NSMenuItem::new(mtm);
             quit_item.setTitle(&quit_title);
-            quit_item.setAction(Some(sel!(terminate:)));
+            unsafe { quit_item.setAction(Some(sel!(terminate:))) };
             menu.addItem(&quit_item);
 
             // Pop up the menu at the button's position.
             item.setMenu(Some(&menu));
-            button.performClick(None);
+            // SAFETY: performing a click on a valid button to show the menu.
+            unsafe { button.performClick(None) };
             item.setMenu(None);
         });
     }
@@ -216,10 +227,12 @@ mod macos {
         impl ActionHandler {
             /// Called when the status item button is clicked.
             /// Distinguishes single-click, double-click, and right-click
-            /// using NSEvent.currentEvent.
+            /// using NSApplication.currentEvent.
             #[unsafe(method(buttonClicked:))]
             fn button_clicked(&self, _sender: Option<&AnyObject>) {
-                let event = NSEvent::currentEvent();
+                let mtm = mtm();
+                let app = NSApplication::sharedApplication(mtm);
+                let event = app.currentEvent();
                 let Some(event) = event else {
                     // Fallback: treat as single click.
                     launch_history();
@@ -267,16 +280,20 @@ mod macos {
     }
 
     pub fn run() {
+        // Get MainThreadMarker — must be on main thread.
+        let mtm = MainThreadMarker::new().expect("must run on main thread");
+        MTM.with(|m| *m.borrow_mut() = Some(mtm));
+
         // NSApplication setup — must happen on the main thread.
-        let app = NSApplication::sharedApplication();
+        let app = NSApplication::sharedApplication(mtm);
         app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
         // Create the status item with variable width.
         let status_bar = NSStatusBar::systemStatusBar();
-        let status_item = unsafe { status_bar.statusItemWithLength(NSVariableStatusItemLength) };
+        let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
 
         // Set initial title so something shows immediately.
-        if let Some(button) = status_item.button() {
+        if let Some(button) = status_item.button(mtm) {
             let title = NSString::from_str("SysVitals");
             button.setTitle(&title);
         }
@@ -285,9 +302,12 @@ mod macos {
         let handler = ActionHandler::new();
 
         // Wire button action (handles single/double/right click).
-        if let Some(button) = status_item.button() {
-            button.setTarget(Some(&handler));
-            button.setAction(Some(sel!(buttonClicked:)));
+        if let Some(button) = status_item.button(mtm) {
+            // SAFETY: setting a valid target and selector on the button.
+            unsafe {
+                button.setTarget(Some(&handler));
+                button.setAction(Some(sel!(buttonClicked:)));
+            }
         }
 
         // Keep the handler alive.
@@ -310,11 +330,13 @@ mod macos {
         let interval_ms = CONFIG.with(|c| c.borrow().sample.interval_ms);
         let interval_secs = interval_ms as f64 / 1000.0;
 
-        let block = block2::RcBlock::new(|_timer: &NSTimer| {
+        let block = block2::RcBlock::new(|_timer: std::ptr::NonNull<NSTimer>| {
             tick();
         });
-        let _timer =
-            NSTimer::scheduledTimerWithTimeInterval_repeats_block(interval_secs, true, &block);
+        // SAFETY: the block is sendable (captures nothing non-Send).
+        let _timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_repeats_block(interval_secs, true, &block)
+        };
 
         // Enter the application event loop (blocks forever).
         app.run();
