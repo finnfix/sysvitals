@@ -1041,10 +1041,12 @@ mod win {
             );
         }
         // Exit the current instance.
-        let _ = KillTimer(Some(hwnd), TIMER_SAMPLE);
-        let _ = KillTimer(Some(hwnd), TIMER_MOVE);
-        let _ = KillTimer(Some(hwnd), TIMER_CONFIG);
-        let _ = DestroyWindow(hwnd);
+        unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_SAMPLE);
+            let _ = KillTimer(Some(hwnd), TIMER_MOVE);
+            let _ = KillTimer(Some(hwnd), TIMER_CONFIG);
+            let _ = DestroyWindow(hwnd);
+        }
     }
 
     // -------------------------------------------------------------------- menu
