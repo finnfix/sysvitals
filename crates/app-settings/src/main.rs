@@ -143,6 +143,39 @@ impl SettingsView {
     }
 }
 
+/// A row with a label on the left and a cycle-button control on the right.
+/// Generic over the click handler types so each call site can pass its own
+/// `cx.listener()` closure without type unification conflicts.
+fn cycle_row<F1, F2>(label: &str, value: String, on_prev: F1, on_next: F2) -> impl IntoElement
+where
+    F1: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    F2: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+{
+    h_flex()
+        .justify_between()
+        .items_center()
+        .py_1()
+        .child(label.to_string())
+        .child(
+            h_flex()
+                .gap_1()
+                .items_center()
+                .child(
+                    Button::new(format!("prev-{label}"))
+                        .small()
+                        .child("<")
+                        .on_click(on_prev),
+                )
+                .child(div().min_w(px(100.)).text_center().child(value))
+                .child(
+                    Button::new(format!("next-{label}"))
+                        .small()
+                        .child(">")
+                        .on_click(on_next),
+                ),
+        )
+}
+
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let section_label = |text: &str| {
@@ -151,33 +184,6 @@ impl Render for SettingsView {
                 .font_semibold()
                 .text_color(cx.theme().foreground.opacity(0.5))
                 .child(text.to_string())
-        };
-
-        // A row with a label on the left and a cycle-button control on the right.
-        let cycle_row = |label: &str, value: String, on_prev, on_next| {
-            h_flex()
-                .justify_between()
-                .items_center()
-                .py_1()
-                .child(label.to_string())
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .child(
-                            Button::new(format!("prev-{label}"))
-                                .small()
-                                .child("<")
-                                .on_click(on_prev),
-                        )
-                        .child(div().min_w(px(100.)).text_center().child(value))
-                        .child(
-                            Button::new(format!("next-{label}"))
-                                .small()
-                                .child(">")
-                                .on_click(on_next),
-                        ),
-                )
         };
 
         v_flex()
