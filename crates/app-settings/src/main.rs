@@ -6,6 +6,7 @@
 
 use gpui_kit::component::button::*;
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::*;
 use gpui_kit::*;
@@ -183,7 +184,7 @@ impl Render for SettingsView {
             .size_full()
             .p_4()
             .gap_2()
-            .overflow_y_scroll()
+            .overflow_y_scrollbar()
             // --- General ---
             .child(section_label("General"))
             .child(cycle_row(
