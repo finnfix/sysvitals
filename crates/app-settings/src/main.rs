@@ -6,7 +6,6 @@
 
 use gpui_kit::component::button::*;
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::select::*;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::*;
 use gpui_kit::*;
@@ -22,12 +21,6 @@ use sysvitals_core::{Config, Language, Theme};
 
 struct SettingsView {
     cfg: Config,
-    // Select states
-    lang_select: Entity<SelectState<SearchableVec<usize>>>,
-    interval_select: Entity<SelectState<SearchableVec<usize>>>,
-    spacing_select: Entity<SelectState<SearchableVec<usize>>>,
-    margin_select: Entity<SelectState<SearchableVec<usize>>>,
-    theme_select: Entity<SelectState<SearchableVec<usize>>>,
     // Input states for prefixes
     prefix_cpu: Entity<InputState>,
     prefix_mem: Entity<InputState>,
@@ -37,86 +30,16 @@ struct SettingsView {
     dual_row: bool,
     show_resources: bool,
     show_network: bool,
-}
-
-fn make_select(
-    items: Vec<(usize, String)>,
-    selected: usize,
-    window: &mut Window,
-    cx: &mut App,
-) -> Entity<SelectState<SearchableVec<usize>>> {
-    cx.new(|cx| {
-        let mut delegate = SearchableVec::new();
-        delegate.set_items(
-            items
-                .into_iter()
-                .map(|(v, label)| SelectItem::new(v, label))
-                .collect::<Vec<_>>(),
-        );
-        let mut state = SelectState::new(delegate, window, cx);
-        state.select(Some(selected), window, cx);
-        state
-    })
+    // Index-based selections (cycled with buttons)
+    lang_idx: usize,
+    interval_idx: usize,
+    spacing_idx: usize,
+    margin_idx: usize,
+    theme_idx: usize,
 }
 
 impl SettingsView {
     fn new(cfg: Config, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let lang_items: Vec<(usize, String)> = Language::ALL
-            .iter()
-            .enumerate()
-            .map(|(i, l)| (i, l.label().to_string()))
-            .collect();
-        let lang_sel = Language::ALL
-            .iter()
-            .position(|l| *l == cfg.display.language)
-            .unwrap_or(0);
-        let lang_select = make_select(lang_items, lang_sel, window, cx);
-
-        let interval_items: Vec<(usize, String)> = ALLOWED_INTERVAL_MS
-            .iter()
-            .enumerate()
-            .map(|(i, ms)| (i, format!("{} s", ms / 1000)))
-            .collect();
-        let interval_sel = ALLOWED_INTERVAL_MS
-            .iter()
-            .position(|v| *v == cfg.sample.interval_ms)
-            .unwrap_or(0);
-        let interval_select = make_select(interval_items, interval_sel, window, cx);
-
-        let spacing_items: Vec<(usize, String)> = ALLOWED_ITEM_SPACING_PX
-            .iter()
-            .enumerate()
-            .map(|(i, px)| (i, format!("{} px", px)))
-            .collect();
-        let spacing_sel = ALLOWED_ITEM_SPACING_PX
-            .iter()
-            .position(|v| *v == cfg.display.item_spacing)
-            .unwrap_or(0);
-        let spacing_select = make_select(spacing_items, spacing_sel, window, cx);
-
-        let margin_items: Vec<(usize, String)> = ALLOWED_LEFT_MARGIN_PX
-            .iter()
-            .enumerate()
-            .map(|(i, px)| (i, format!("{} px", px)))
-            .collect();
-        let margin_sel = ALLOWED_LEFT_MARGIN_PX
-            .iter()
-            .position(|v| *v == cfg.windows.left_margin_px)
-            .unwrap_or(0);
-        let margin_select = make_select(margin_items, margin_sel, window, cx);
-
-        let theme_items: Vec<(usize, String)> = vec![
-            (0, "Follow system".into()),
-            (1, "Light".into()),
-            (2, "Dark".into()),
-        ];
-        let theme_sel = match cfg.display.theme {
-            Theme::Auto => 0,
-            Theme::Light => 1,
-            Theme::Dark => 2,
-        };
-        let theme_select = make_select(theme_items, theme_sel, window, cx);
-
         let prefix_cpu =
             cx.new(|cx| InputState::new(window, cx).default_value(&cfg.display.prefix.cpu));
         let prefix_mem =
@@ -126,53 +49,80 @@ impl SettingsView {
         let prefix_down =
             cx.new(|cx| InputState::new(window, cx).default_value(&cfg.display.prefix.down));
 
+        let lang_idx = Language::ALL
+            .iter()
+            .position(|l| *l == cfg.display.language)
+            .unwrap_or(0);
+        let interval_idx = ALLOWED_INTERVAL_MS
+            .iter()
+            .position(|v| *v == cfg.sample.interval_ms)
+            .unwrap_or(0);
+        let spacing_idx = ALLOWED_ITEM_SPACING_PX
+            .iter()
+            .position(|v| *v == cfg.display.item_spacing)
+            .unwrap_or(0);
+        let margin_idx = ALLOWED_LEFT_MARGIN_PX
+            .iter()
+            .position(|v| *v == cfg.windows.left_margin_px)
+            .unwrap_or(0);
+        let theme_idx = match cfg.display.theme {
+            Theme::Auto => 0,
+            Theme::Light => 1,
+            Theme::Dark => 2,
+        };
+
         Self {
             dual_row: cfg.display.dual_row,
             show_resources: cfg.display.show_resources,
             show_network: cfg.display.show_network,
             cfg,
-            lang_select,
-            interval_select,
-            spacing_select,
-            margin_select,
-            theme_select,
             prefix_cpu,
             prefix_mem,
             prefix_up,
             prefix_down,
+            lang_idx,
+            interval_idx,
+            spacing_idx,
+            margin_idx,
+            theme_idx,
+        }
+    }
+
+    fn lang_label(&self) -> &'static str {
+        Language::ALL[self.lang_idx].label()
+    }
+
+    fn interval_label(&self) -> String {
+        format!("{} s", ALLOWED_INTERVAL_MS[self.interval_idx] / 1000)
+    }
+
+    fn spacing_label(&self) -> String {
+        format!("{} px", ALLOWED_ITEM_SPACING_PX[self.spacing_idx])
+    }
+
+    fn margin_label(&self) -> String {
+        format!("{} px", ALLOWED_LEFT_MARGIN_PX[self.margin_idx])
+    }
+
+    fn theme_label(&self) -> &'static str {
+        match self.theme_idx {
+            1 => "Light",
+            2 => "Dark",
+            _ => "Follow system",
         }
     }
 
     fn collect_config(&self, cx: &App) -> Config {
         let mut cfg = self.cfg.clone();
-
-        if let Some(idx) = self.lang_select.read(cx).selected_value() {
-            if let Some(lang) = Language::ALL.get(idx) {
-                cfg.display.language = *lang;
-            }
-        }
-        if let Some(idx) = self.interval_select.read(cx).selected_value() {
-            if let Some(ms) = ALLOWED_INTERVAL_MS.get(idx) {
-                cfg.sample.interval_ms = *ms;
-            }
-        }
-        if let Some(idx) = self.spacing_select.read(cx).selected_value() {
-            if let Some(px) = ALLOWED_ITEM_SPACING_PX.get(idx) {
-                cfg.display.item_spacing = *px;
-            }
-        }
-        if let Some(idx) = self.margin_select.read(cx).selected_value() {
-            if let Some(px) = ALLOWED_LEFT_MARGIN_PX.get(idx) {
-                cfg.windows.left_margin_px = *px;
-            }
-        }
-        if let Some(idx) = self.theme_select.read(cx).selected_value() {
-            cfg.display.theme = match idx {
-                1 => Theme::Light,
-                2 => Theme::Dark,
-                _ => Theme::Auto,
-            };
-        }
+        cfg.display.language = Language::ALL[self.lang_idx];
+        cfg.sample.interval_ms = ALLOWED_INTERVAL_MS[self.interval_idx];
+        cfg.display.item_spacing = ALLOWED_ITEM_SPACING_PX[self.spacing_idx];
+        cfg.windows.left_margin_px = ALLOWED_LEFT_MARGIN_PX[self.margin_idx];
+        cfg.display.theme = match self.theme_idx {
+            1 => Theme::Light,
+            2 => Theme::Dark,
+            _ => Theme::Auto,
+        };
         cfg.display.dual_row = self.dual_row;
         cfg.display.show_resources = self.show_resources;
         cfg.display.show_network = self.show_network;
@@ -180,7 +130,6 @@ impl SettingsView {
         cfg.display.prefix.mem = self.prefix_mem.read(cx).value().to_string();
         cfg.display.prefix.up = self.prefix_up.read(cx).value().to_string();
         cfg.display.prefix.down = self.prefix_down.read(cx).value().to_string();
-
         cfg.sanitize();
         cfg
     }
@@ -194,7 +143,7 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let section_label = |text: &str| {
             div()
                 .text_sm()
@@ -203,14 +152,31 @@ impl Render for SettingsView {
                 .child(text.to_string())
         };
 
-        let row = |label: &str, control: AnyElement| {
+        // A row with a label on the left and a cycle-button control on the right.
+        let cycle_row = |label: &str, value: String, on_prev, on_next| {
             h_flex()
                 .justify_between()
                 .items_center()
                 .py_1()
                 .child(label.to_string())
-                .child(control)
-                .into_any_element()
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            Button::new(format!("prev-{label}"))
+                                .small()
+                                .child("<")
+                                .on_click(on_prev),
+                        )
+                        .child(div().min_w(px(100.)).text_center().child(value))
+                        .child(
+                            Button::new(format!("next-{label}"))
+                                .small()
+                                .child(">")
+                                .on_click(on_next),
+                        ),
+                )
         };
 
         v_flex()
@@ -220,23 +186,42 @@ impl Render for SettingsView {
             .overflow_y_scroll()
             // --- General ---
             .child(section_label("General"))
-            .child(row(
+            .child(cycle_row(
                 "Language",
-                Select::new(&self.lang_select)
-                    .w(px(180.))
-                    .into_any_element(),
+                self.lang_label().to_string(),
+                cx.listener(|this, _, _, cx| {
+                    this.lang_idx = (this.lang_idx + Language::ALL.len() - 1) % Language::ALL.len();
+                    cx.notify();
+                }),
+                cx.listener(|this, _, _, cx| {
+                    this.lang_idx = (this.lang_idx + 1) % Language::ALL.len();
+                    cx.notify();
+                }),
             ))
-            .child(row(
+            .child(cycle_row(
                 "Sample interval",
-                Select::new(&self.interval_select)
-                    .w(px(180.))
-                    .into_any_element(),
+                self.interval_label(),
+                cx.listener(|this, _, _, cx| {
+                    this.interval_idx = (this.interval_idx + ALLOWED_INTERVAL_MS.len() - 1)
+                        % ALLOWED_INTERVAL_MS.len();
+                    cx.notify();
+                }),
+                cx.listener(|this, _, _, cx| {
+                    this.interval_idx = (this.interval_idx + 1) % ALLOWED_INTERVAL_MS.len();
+                    cx.notify();
+                }),
             ))
-            .child(row(
+            .child(cycle_row(
                 "Theme",
-                Select::new(&self.theme_select)
-                    .w(px(180.))
-                    .into_any_element(),
+                self.theme_label().to_string(),
+                cx.listener(|this, _, _, cx| {
+                    this.theme_idx = (this.theme_idx + 2) % 3;
+                    cx.notify();
+                }),
+                cx.listener(|this, _, _, cx| {
+                    this.theme_idx = (this.theme_idx + 1) % 3;
+                    cx.notify();
+                }),
             ))
             .child(div().h(px(1.)).bg(cx.theme().border).my_1())
             // --- Display ---
@@ -284,40 +269,70 @@ impl Render for SettingsView {
                         }),
                     )),
             )
-            .child(row(
+            .child(cycle_row(
                 "Item spacing",
-                Select::new(&self.spacing_select)
-                    .w(px(180.))
-                    .into_any_element(),
+                self.spacing_label(),
+                cx.listener(|this, _, _, cx| {
+                    this.spacing_idx = (this.spacing_idx + ALLOWED_ITEM_SPACING_PX.len() - 1)
+                        % ALLOWED_ITEM_SPACING_PX.len();
+                    cx.notify();
+                }),
+                cx.listener(|this, _, _, cx| {
+                    this.spacing_idx = (this.spacing_idx + 1) % ALLOWED_ITEM_SPACING_PX.len();
+                    cx.notify();
+                }),
             ))
             .child(div().h(px(1.)).bg(cx.theme().border).my_1())
             // --- Layout ---
             .child(section_label("Layout (Windows)"))
-            .child(row(
+            .child(cycle_row(
                 "Left margin",
-                Select::new(&self.margin_select)
-                    .w(px(180.))
-                    .into_any_element(),
+                self.margin_label(),
+                cx.listener(|this, _, _, cx| {
+                    this.margin_idx = (this.margin_idx + ALLOWED_LEFT_MARGIN_PX.len() - 1)
+                        % ALLOWED_LEFT_MARGIN_PX.len();
+                    cx.notify();
+                }),
+                cx.listener(|this, _, _, cx| {
+                    this.margin_idx = (this.margin_idx + 1) % ALLOWED_LEFT_MARGIN_PX.len();
+                    cx.notify();
+                }),
             ))
             .child(div().h(px(1.)).bg(cx.theme().border).my_1())
             // --- Prefixes ---
             .child(section_label("Prefixes"))
-            .child(row(
-                "CPU",
-                Input::new(&self.prefix_cpu).w(px(180.)).into_any_element(),
-            ))
-            .child(row(
-                "MEM",
-                Input::new(&self.prefix_mem).w(px(180.)).into_any_element(),
-            ))
-            .child(row(
-                "Upload",
-                Input::new(&self.prefix_up).w(px(180.)).into_any_element(),
-            ))
-            .child(row(
-                "Download",
-                Input::new(&self.prefix_down).w(px(180.)).into_any_element(),
-            ))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .py_1()
+                    .child("CPU")
+                    .child(Input::new(&self.prefix_cpu).w(px(180.))),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .py_1()
+                    .child("MEM")
+                    .child(Input::new(&self.prefix_mem).w(px(180.))),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .py_1()
+                    .child("Upload")
+                    .child(Input::new(&self.prefix_up).w(px(180.))),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .py_1()
+                    .child("Download")
+                    .child(Input::new(&self.prefix_down).w(px(180.))),
+            )
             .child(
                 div()
                     .text_xs()
