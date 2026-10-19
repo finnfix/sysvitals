@@ -19,5 +19,6 @@ sysvitals-core = { workspace = true }
 windows = { workspace = true }
 
 [[bin]]
-name = "sysvitals"
+# Mixed-case on purpose: the shipped executable is `SysVitals.exe`.
+name = "SysVitals"
 path = "src/main.rs"

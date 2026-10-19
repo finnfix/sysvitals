@@ -35,12 +35,24 @@ jobs:
       - name: Build Windows display layer
         if: matrix.os == 'windows-latest'
         run: cargo build --release -p app-win
-      - name: Upload Windows indicator binary
+      # Portable (green) distribution: a single self-contained exe, no
+      # installer. Package name: SysVitals-{platform}-{arch}-{version}.zip;
+      # the version is read from the workspace Cargo.toml (single source of
+      # truth). Windows currently ships x64 only.
+      - name: Package Windows portable zip
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $zip = "SysVitals-windows-x64-$version.zip"
+          Compress-Archive -Path target/release/SysVitals.exe -DestinationPath $zip
+          Write-Host "Packaged $zip"
+      - name: Upload Windows portable package
         if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
-          name: sysvitals-windows
-          path: target/release/sysvitals.exe
+          name: SysVitals-windows-x64
+          path: SysVitals-windows-x64-*.zip
           if-no-files-found: error
       - name: Build macOS display layer
         if: matrix.os == 'macos-latest'

@@ -371,23 +371,23 @@ fn dir_join(parent: Option<&std::path::Path>, name: &str) -> PathBuf {
     }
 }
 
-/// Where the config file lives. Windows: `%APPDATA%\sysvitals\config.toml`;
-/// macOS: `~/Library/Application Support/sysvitals/config.toml`; Linux dev
+/// Where the config file lives. Windows: `%APPDATA%\SysVitals\config.toml`;
+/// macOS: `~/Library/Application Support/SysVitals/config.toml`; Linux dev
 /// falls back to the same helper's config dir.
 pub fn config_path() -> anyhow::Result<PathBuf> {
     use directories::ProjectDirs;
-    let dirs = ProjectDirs::from("", "", "sysvitals")
+    let dirs = ProjectDirs::from("", "", "SysVitals")
         .ok_or_else(|| anyhow::anyhow!("could not resolve project directories"))?;
     Ok(dirs.config_dir().join("config.toml"))
 }
 
 /// Where the history database lives. Windows:
-/// `%APPDATA%\sysvitals\history.db`; macOS:
-/// `~/Library/Application Support/sysvitals/history.db`. SQLite is the single
+/// `%APPDATA%\SysVitals\history.db`; macOS:
+/// `~/Library/Application Support/SysVitals/history.db`. SQLite is the single
 /// source of truth for historical data (R12); CSV is export-only.
 pub fn history_path() -> anyhow::Result<PathBuf> {
     use directories::ProjectDirs;
-    let dirs = ProjectDirs::from("", "", "sysvitals")
+    let dirs = ProjectDirs::from("", "", "SysVitals")
         .ok_or_else(|| anyhow::anyhow!("could not resolve project directories"))?;
     Ok(dirs.data_dir().join("history.db"))
 }
