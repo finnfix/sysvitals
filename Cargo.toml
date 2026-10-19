@@ -6,11 +6,13 @@ members = [
     "crates/app-win",
     "crates/app-mac",
     "crates/app-settings",
+    "crates/app-history",
 ]
 
 # Plain `cargo build|test|check` only touches cross-platform crates.
-# Platform crates (app-win / app-mac / app-settings) are built explicitly with
-# `-p`, so a Linux host never fails on `windows`/`objc2`/GPUI dependencies.
+# Platform crates (app-win / app-mac / app-settings / app-history) are built
+# explicitly with `-p`, so a Linux host never fails on `windows`/`objc2`/GPUI
+# dependencies.
 default-members = ["crates/core", "crates/ui-common"]
 
 [workspace.package]

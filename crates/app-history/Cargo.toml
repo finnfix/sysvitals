@@ -1,0 +1,21 @@
+[package]
+name = "app-history"
+description = "GPUI-based history trend chart popup for SysVitals, launched by the platform overlay on click."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Cross-platform GPUI window. Built explicitly with `cargo build -p app-history`.
+# Kept out of default-members so headless hosts skip it.
+
+[dependencies]
+sysvitals-core = { workspace = true }
+gpui-kit = { workspace = true }
+arboard = "=3.7.0"
+
+[[bin]]
+name = "SysVitalsHistory"
+path = "src/main.rs"

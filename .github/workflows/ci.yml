@@ -39,7 +39,11 @@ jobs:
       - name: Build GPUI settings window
         if: matrix.os == 'windows-latest'
         run: cargo build --release -p app-settings
-      # Portable (green) distribution: overlay exe (+ settings exe if built).
+      # GPUI history chart popup: required build gate on Windows.
+      - name: Build GPUI history chart
+        if: matrix.os == 'windows-latest'
+        run: cargo build --release -p app-history
+      # Portable (green) distribution: overlay exe (+ settings/history exes if built).
       # Package name: SysVitals-{platform}-{arch}-{version}.zip; the version
       # is read from the workspace Cargo.toml (single source of truth).
       - name: Package Windows portable zip
@@ -50,6 +54,7 @@ jobs:
           $zip = "SysVitals-windows-x64-$version.zip"
           $files = @("target/release/SysVitals.exe")
           if (Test-Path "target/release/SysVitalsSettings.exe") { $files += "target/release/SysVitalsSettings.exe" }
+          if (Test-Path "target/release/SysVitalsHistory.exe") { $files += "target/release/SysVitalsHistory.exe" }
           Compress-Archive -Path $files -DestinationPath $zip
           Write-Host "Packaged $zip"
       - name: Upload Windows portable package
@@ -66,6 +71,10 @@ jobs:
       - name: Build GPUI settings window (macOS)
         if: matrix.os == 'macos-latest'
         run: cargo build --release -p app-settings
+      # GPUI history chart popup is cross-platform; build it on macOS too.
+      - name: Build GPUI history chart (macOS)
+        if: matrix.os == 'macos-latest'
+        run: cargo build --release -p app-history
       # macOS .app bundle: assemble the bundle structure (binary + Info.plist +
       # AppIcon.icns), then zip it. Package name: SysVitals-macos-{arch}-{version}.zip.
       - name: Package macOS app bundle
@@ -78,6 +87,9 @@ jobs:
           cp target/release/sysvitals "$app/Contents/MacOS/sysvitals"
           if [ -f target/release/SysVitalsSettings ]; then
             cp target/release/SysVitalsSettings "$app/Contents/MacOS/SysVitalsSettings"
+          fi
+          if [ -f target/release/SysVitalsHistory ]; then
+            cp target/release/SysVitalsHistory "$app/Contents/MacOS/SysVitalsHistory"
           fi
           cp crates/app-mac/assets/Info.plist "$app/Contents/Info.plist"
           cp crates/app-mac/assets/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"

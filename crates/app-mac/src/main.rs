@@ -121,6 +121,18 @@ mod macos {
         let _ = std::process::Command::new(settings).spawn();
     }
 
+    /// Launch the external history chart process (`SysVitalsHistory`).
+    fn launch_history() {
+        let Some(dir) = exe_dir() else {
+            return;
+        };
+        let history = dir.join("SysVitalsHistory");
+        if !history.exists() {
+            return;
+        }
+        let _ = std::process::Command::new(history).spawn();
+    }
+
     // Menu action handler. A tiny NSObject subclass so NSMenuItem can target
     // it with a selector; the responder chain alone only covers `terminate:`.
     define_class!(
@@ -134,6 +146,11 @@ mod macos {
             #[unsafe(method(showSettings:))]
             fn show_settings(&self, _sender: Option<&AnyObject>) {
                 launch_settings();
+            }
+
+            #[unsafe(method(showHistory:))]
+            fn show_history(&self, _sender: Option<&AnyObject>) {
+                launch_history();
             }
         }
 
@@ -165,8 +182,15 @@ mod macos {
         // Menu action handler (kept alive for the process lifetime).
         let handler = MenuHandler::new();
 
-        // Build right-click menu: Settings, separator, Quit.
+        // Build right-click menu: History, Settings, separator, Quit.
         let menu = NSMenu::new();
+
+        let history_title = NSString::from_str("Show History");
+        let history_item = NSMenuItem::new();
+        history_item.setTitle(&history_title);
+        history_item.setTarget(Some(&handler));
+        history_item.setAction(Some(sel!(showHistory:)));
+        menu.addItem(&history_item);
 
         let settings_title = NSString::from_str("Settings…");
         let settings_item = NSMenuItem::new();

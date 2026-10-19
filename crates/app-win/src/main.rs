@@ -84,8 +84,8 @@ mod win {
         UpdateLayeredWindow, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, MF_STRING, MSG,
         SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
         SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
-        WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
-        WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
+        WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
+        WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
     // ------------------------------------------------------------------ consts
@@ -969,6 +969,38 @@ mod win {
         }
     }
 
+    /// Launch the external history chart process (`SysVitalsHistory.exe`)
+    /// from the same directory as the current executable. If the file is
+    /// missing, logs a warning and does nothing.
+    fn launch_history() {
+        let exe_path = current_exe_dir();
+        let Some(dir) = exe_path else {
+            log_event("WARN", "launch_history: cannot determine exe directory");
+            return;
+        };
+        let history_path = format!("{}\\SysVitalsHistory.exe", dir);
+        if !std::path::Path::new(&history_path).exists() {
+            log_event(
+                "WARN",
+                &format!("launch_history: not found: {}", history_path),
+            );
+            return;
+        }
+        log_event("INFO", &format!("launching history: {}", history_path));
+        let path_w = utf16(&history_path);
+        let verb = utf16("open");
+        unsafe {
+            let _ = ShellExecuteW(
+                None,
+                windows::core::PCWSTR(verb.as_ptr()),
+                windows::core::PCWSTR(path_w.as_ptr()),
+                windows::core::PCWSTR::null(),
+                windows::core::PCWSTR::null(),
+                SW_SHOWNORMAL,
+            );
+        }
+    }
+
     /// Best-effort: return the directory containing the current executable.
     fn current_exe_dir() -> Option<String> {
         let mut buf = [0u16; 1024];
@@ -1071,6 +1103,11 @@ mod win {
             WM_DISPLAYCHANGE => {
                 log_event("INFO", "WM_DISPLAYCHANGE: display configuration changed");
                 reposition(hwnd);
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                // Single-click opens the history trend chart popup.
+                launch_history();
                 LRESULT(0)
             }
             WM_LBUTTONDBLCLK => {
