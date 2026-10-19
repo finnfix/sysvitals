@@ -134,6 +134,13 @@ mod win {
     static OVERLAY: AtomicUsize = AtomicUsize::new(0);
     static SETTINGS_OPEN: AtomicBool = AtomicBool::new(false);
     static SETTINGS_DONE: AtomicBool = AtomicBool::new(false);
+    /// Handle to the settings dialog so the overlay can destroy it on exit.
+    /// The dialog is intentionally NOT an owned window of the overlay: an
+    /// owned window of a topmost WS_EX_LAYERED window creates a DWM
+    /// composition dependency that deadlocks the message pump when
+    /// UpdateLayeredWindow fires on the timer while the dialog is open
+    /// (manifests as "Not Responding").
+    static SETTINGS_HWND: AtomicUsize = AtomicUsize::new(0);
 
     thread_local! {
         static SAMPLER: RefCell<Option<Sampler>> = const { RefCell::new(None) };
@@ -548,8 +555,8 @@ mod win {
         }
         let _ = MoveWindow(hwnd, x, y, w, h, true);
         // Only re-show when actually hidden (e.g. returning from auto-hide or
-        // fullscreen). Calling ShowWindow unconditionally every tick makes an
-        // owned settings dialog flicker.
+        // fullscreen). Calling ShowWindow unconditionally every tick causes
+        // unnecessary z-order churn.
         if !IsWindowVisible(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
@@ -1141,7 +1148,7 @@ mod win {
         );
     }
 
-    unsafe fn open_settings(owner: HWND) {
+    unsafe fn open_settings(_owner: HWND) {
         if SETTINGS_OPEN.swap(true, Ordering::Relaxed) {
             return;
         }
@@ -1164,6 +1171,13 @@ mod win {
         let _ = RegisterClassExW(&wc);
 
         let title = utf16(t(lang, "settings.title"));
+        // The dialog is deliberately NOT owned by the overlay. An owned
+        // window of a topmost WS_EX_LAYERED window deadlocks the message
+        // pump on Windows 11: every UpdateLayeredWindow on the overlay's
+        // timer tick creates a composition dependency with the owned dialog
+        // and the pump stops delivering messages (the dialog freezes and
+        // Windows reports "Not Responding"). A standalone topmost
+        // window has no such dependency and stays above normal windows.
         let dlg = CreateWindowExW(
             Default::default(),
             windows::core::PCWSTR(class_name.as_ptr()),
@@ -1173,12 +1187,23 @@ mod win {
             s(120),
             s(380),
             s(560),
-            Some(owner),
+            None,
             None,
             Some(hmodule.into()),
             None,
         )
         .expect("settings window");
+        SETTINGS_HWND.store(dlg.0 as usize, Ordering::Relaxed);
+        // Keep the dialog visible above normal windows while it is open.
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+            dlg,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE,
+        );
 
         let label_w = s(140);
         let field_x = s(150);
@@ -1501,10 +1526,10 @@ mod win {
             };
         });
 
-        // Do NOT disable the owner overlay: the indicator should stay
-        // interactive (right-click menu, double-click) while settings is open.
-        // The settings dialog is an owned window, so it stays on top of the
-        // overlay regardless.
+        // Do NOT disable the overlay: the indicator should stay interactive
+        // (right-click menu, double-click) while settings is open. The
+        // settings dialog is a standalone topmost window, so it stays above
+        // normal windows on its own.
         SETTINGS.with(|s| update_anchor_visibility(&*s.borrow()));
         let _ = ShowWindow(dlg, SW_SHOW);
 
@@ -1518,6 +1543,11 @@ mod win {
         }
         let _ = DeleteObject(dlg_font.into());
         SETTINGS_OPEN.store(false, Ordering::Relaxed);
+        // If the loop ended because WM_QUIT was consumed (overlay destroyed
+        // while the dialog was open), re-post it so the main loop exits too.
+        if !SETTINGS_DONE.load(Ordering::Relaxed) {
+            PostQuitMessage(0);
+        }
     }
 
     /// Read the dialog controls back into the config, persist it, and make
@@ -1669,6 +1699,7 @@ mod win {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                SETTINGS_HWND.store(0, Ordering::Relaxed);
                 SETTINGS_DONE.store(true, Ordering::Relaxed);
                 LRESULT(0)
             }
@@ -1731,6 +1762,13 @@ mod win {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                // The settings dialog is a standalone window (not owned), so
+                // it must be explicitly destroyed when the overlay exits.
+                let sh = SETTINGS_HWND.swap(0, Ordering::Relaxed);
+                if sh != 0 {
+                    let _ = DestroyWindow(HWND(sh as *mut _));
+                }
+                SETTINGS_DONE.store(true, Ordering::Relaxed);
                 log_event("INFO", "SysVitals exiting");
                 PostQuitMessage(0);
                 LRESULT(0)
