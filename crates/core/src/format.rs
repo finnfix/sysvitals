@@ -1,7 +1,8 @@
 //! Pure formatting logic: percentage and rate rendering, prefix handling and
-//! the status-bar layout (single-row, and the Windows 2x2 dual-row quadrant
-//! with CPU/MEM over U/D). All functions are string-level and
-//! host-independent so they can be unit tested anywhere.
+//! the status-bar layout (single-row, the 2x2 dual-row quadrant with CPU/MEM
+//! over U/D, and a vertical one-metric-per-line column for vertical taskbars).
+//! All functions are string-level and host-independent so they can be unit
+//! tested anywhere.
 //!
 //! Width-stability: within one frame, dual-row columns are padded
 //! to equal widths so the two lines line up. Across frames the rendered text
@@ -13,12 +14,11 @@
 use crate::config::Config;
 use crate::model::{Metric, Snapshot};
 
-/// Bytes-per-second units the display uses: `K/s` below 1 MB/s, `M/s` at or
-/// above. There is deliberately no byte (`B`) tier and no `GB` tier:
-/// sub-KB traffic renders as a fractional `K/s`, and anything past a gigabit
-/// renders as a large `M/s`.
+/// Bytes-per-second unit thresholds on the 1024 base. Four adaptive tiers:
+/// `B/s` below 1 KB/s, `K/s` below 1 MB/s, `M/s` below 1 GB/s, `G/s` above.
 pub const KB: f64 = 1024.0;
 pub const MB: f64 = 1024.0 * KB;
+pub const GB: f64 = 1024.0 * MB;
 
 /// Render a CPU/MEM percentage as an integer percent string.
 pub fn format_percent(value: f64) -> String {
@@ -26,21 +26,26 @@ pub fn format_percent(value: f64) -> String {
     format!("{v:.0}%")
 }
 
-/// Render a rate in bytes/second as `K/s` or `M/s` on the 1024 base,
-/// adapting the unit to magnitude. Decimal places depend on the integer-part
-/// width so the field stays roughly the same size:
+/// Render a rate in bytes/second on the 1024 base, adapting the unit to
+/// magnitude across four tiers: `B/s` below 1 KB/s, `K/s` below 1 MB/s,
+/// `M/s` below 1 GB/s, `G/s` at or above. Decimal places depend on the
+/// integer-part width so the field stays roughly the same size:
 ///
 /// ```text
-///   314 K/s    (>=100 integer part -> 0 decimals)
+///   314 B/s    (>=100 integer part -> 0 decimals)
 ///   12.5 K/s   (>=10  -> 1 decimal)
 ///   1.20 M/s   (<10   -> 2 decimals)
 /// ```
 pub fn format_rate(bps: f64) -> String {
     let bps = if bps < 0.0 || bps.is_nan() { 0.0 } else { bps };
-    let (scaled, unit) = if bps < MB {
+    let (scaled, unit) = if bps < KB {
+        (bps, "B/s")
+    } else if bps < MB {
         (bps / KB, "K/s")
-    } else {
+    } else if bps < GB {
         (bps / MB, "M/s")
+    } else {
+        (bps / GB, "G/s")
     };
     let decimals = if scaled >= 100.0 {
         0
@@ -212,7 +217,7 @@ pub fn format_value(metric: Metric, snapshot: &Snapshot) -> String {
 pub fn format_frame(snapshot: &Snapshot, cfg: &Config) -> FormattedRow {
     let enabled: Vec<Metric> = Metric::ALL.into_iter().filter(|m| shown(*m, cfg)).collect();
 
-    if cfg.windows.dual_row {
+    if cfg.display.dual_row {
         // 2x2 quadrant: left column CPU over MEM, right column U over D
         // CPU/MEM over U/D. Only metrics that are both enabled and in
         // the column's role participate.
@@ -310,6 +315,23 @@ fn cell_at(cells: &[(Metric, String)], idx: usize, width: usize) -> String {
     }
 }
 
+/// Build a vertical (one metric per line) frame for a vertical taskbar
+/// (left or right edge). Each enabled metric gets its own row; column
+/// alignment is irrelevant since there is only one column.
+pub fn format_frame_vertical(snapshot: &Snapshot, cfg: &Config) -> FormattedRow {
+    let enabled: Vec<Metric> = Metric::ALL.into_iter().filter(|m| shown(*m, cfg)).collect();
+    let lines: Vec<Line> = enabled
+        .iter()
+        .map(|m| {
+            Line::single(join_prefix(
+                prefix_for(*m, cfg),
+                &format_value(*m, snapshot),
+            ))
+        })
+        .collect();
+    FormattedRow { lines }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,21 +357,27 @@ mod tests {
 
     #[test]
     fn rate_uses_binary_units_and_decimal_rules() {
-        assert_eq!(format_rate(314.0), "0.31 K/s");
-        assert_eq!(format_rate(0.0), "0.00 K/s");
+        // B/s tier: below 1 KB/s.
+        assert_eq!(format_rate(314.0), "314 B/s");
+        assert_eq!(format_rate(0.0), "0.00 B/s");
+        assert_eq!(format_rate(1023.0), "1023 B/s");
+        // K/s tier: 1 KB/s .. 1 MB/s.
         assert_eq!(format_rate(1024.0), "1.00 K/s");
         assert_eq!(format_rate(314.0 * KB), "314 K/s");
         assert_eq!(format_rate(12.0 * KB + 512.0), "12.5 K/s");
+        // M/s tier: 1 MB/s .. 1 GB/s.
         assert_eq!(format_rate(1.2 * MB), "1.20 M/s");
         assert_eq!(format_rate(100.0 * MB), "100 M/s");
-        // No GB tier: multi-gigabit links keep counting in M/s.
-        assert_eq!(format_rate(1.5 * 1024.0 * MB), "1536 M/s");
+        // G/s tier: 1 GB/s and above.
+        assert_eq!(format_rate(1.5 * GB), "1.50 G/s");
+        assert_eq!(format_rate(1024.0 * MB), "1.00 G/s");
+        assert_eq!(format_rate(120.0 * GB), "120 G/s");
     }
 
     #[test]
     fn rate_nan_and_negative_become_zero() {
-        assert_eq!(format_rate(f64::NAN), "0.00 K/s");
-        assert_eq!(format_rate(-5.0), "0.00 K/s");
+        assert_eq!(format_rate(f64::NAN), "0.00 B/s");
+        assert_eq!(format_rate(-5.0), "0.00 B/s");
     }
 
     #[test]
@@ -411,7 +439,7 @@ mod tests {
     #[test]
     fn dual_row_is_two_lines_aligned() {
         let mut cfg = Config::default();
-        cfg.windows.dual_row = true;
+        cfg.display.dual_row = true;
         let f = format_frame(&snap(29.0, 68.0, 1.2 * MB, 314.0 * KB), &cfg);
         assert_eq!(f.lines.len(), 2);
         // Left column width fixed by max(CPU.., MEM..) so right column starts
@@ -426,7 +454,7 @@ mod tests {
     #[test]
     fn dual_row_columns_align_within_frame() {
         let mut cfg = Config::default();
-        cfg.windows.dual_row = true;
+        cfg.display.dual_row = true;
         // CPU and MEM have different natural widths; MEM's row is padded so
         // both right-column cells start at the same offset.
         let f = format_frame(&snap(9.0, 68.0, 1024.0, 1024.0 * 1024.0), &cfg);
@@ -468,7 +496,7 @@ mod tests {
     #[test]
     fn dual_row_keeps_two_lines_when_a_column_empty() {
         let mut cfg = Config::default();
-        cfg.windows.dual_row = true;
+        cfg.display.dual_row = true;
         cfg.display.show_network = false;
         let f = format_frame(&snap(29.0, 68.0, 0.0, 0.0), &cfg);
         // Right column has nothing -> still two lines, left column only.
@@ -485,7 +513,28 @@ mod tests {
         let f = format_frame(&snap(29.0, 68.0, 1024.0, 0.0), &cfg);
         assert_eq!(
             f.lines[0].render(),
-            "29%  MEM: 68%  ↑ 1.00 K/s  D: 0.00 K/s"
+            "29%  MEM: 68%  ↑ 1.00 K/s  D: 0.00 B/s"
         );
+    }
+
+    #[test]
+    fn vertical_layout_one_metric_per_line() {
+        let cfg = Config::default();
+        let f = format_frame_vertical(&snap(29.0, 68.0, 1.2 * MB, 314.0 * KB), &cfg);
+        assert_eq!(f.lines.len(), 4);
+        assert_eq!(f.lines[0].render(), "CPU: 29%");
+        assert_eq!(f.lines[1].render(), "MEM: 68%");
+        assert_eq!(f.lines[2].render(), "U: 1.20 M/s");
+        assert_eq!(f.lines[3].render(), "D: 314 K/s");
+    }
+
+    #[test]
+    fn vertical_layout_respects_toggles() {
+        let mut cfg = Config::default();
+        cfg.display.show_network = false;
+        let f = format_frame_vertical(&snap(29.0, 68.0, 1024.0, 2048.0), &cfg);
+        assert_eq!(f.lines.len(), 2);
+        assert_eq!(f.lines[0].render(), "CPU: 29%");
+        assert_eq!(f.lines[1].render(), "MEM: 68%");
     }
 }

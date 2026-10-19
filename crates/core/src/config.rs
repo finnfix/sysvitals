@@ -60,6 +60,9 @@ pub struct DisplayConfig {
     /// Number of spaces between adjacent metrics on the single-row layout.
     /// Clamped to [1, 8] by `sanitize`; default 2 matches the original look.
     pub item_spacing: u32,
+    /// Dual-row (2x2 quadrant) layout. Cross-platform: Windows renders it in
+    /// the taskbar overlay; macOS will render it in the menu bar (Phase 4).
+    pub dual_row: bool,
     pub prefix: PrefixConfig,
 }
 
@@ -96,7 +99,6 @@ pub enum CsvScope {
 #[serde(default)]
 pub struct WindowsConfig {
     pub anchor: Anchor,
-    pub dual_row: bool,
     pub row_spacing: u32,
     pub auto_start: bool,
     /// Manual font-size override (points). `None` = follow the system metric.
@@ -140,6 +142,7 @@ impl Default for DisplayConfig {
             theme: Theme::Auto,
             binary_unit: true,
             item_spacing: 2,
+            dual_row: false,
             prefix: PrefixConfig::default(),
         }
     }
@@ -183,7 +186,6 @@ impl Default for WindowsConfig {
     fn default() -> Self {
         WindowsConfig {
             anchor: Anchor::Right,
-            dual_row: false,
             row_spacing: 1,
             auto_start: true,
             font_size_override: None,
@@ -435,7 +437,7 @@ mod tests {
         assert_eq!(c.display.prefix.cpu, "CPU:");
         assert_eq!(c.display.prefix.up, "U:");
         assert_eq!(c.windows.anchor, Anchor::Right);
-        assert!(!c.windows.dual_row);
+        assert!(!c.display.dual_row);
         assert_eq!(c.history.retention_days, 30);
     }
 
@@ -493,7 +495,7 @@ mod tests {
     fn toml_roundtrip_preserves_values() {
         let mut c = Config::default();
         c.display.language = Language::Zh;
-        c.windows.dual_row = true;
+        c.display.dual_row = true;
         c.windows.anchor = Anchor::Left;
         c.history.csv_scope = CsvScope::Last7d;
         let text = c.to_toml_string().unwrap();

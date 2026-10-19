@@ -32,7 +32,9 @@ mod win {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use sysvitals_core::format::FormattedRow;
-    use sysvitals_core::{format_frame, t, Config, Language, NetSelection, Sampler, Theme};
+    use sysvitals_core::{
+        format_frame, format_frame_vertical, t, Config, Language, NetSelection, Sampler, Theme,
+    };
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC,
@@ -48,12 +50,12 @@ mod win {
         RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
         REG_VALUE_TYPE,
     };
-    use windows::Win32::System::SystemInformation::{GetLocalTime, SYSTEMTIME};
+    use windows::Win32::System::SystemInformation::GetLocalTime;
     use windows::Win32::UI::HiDpi::{
         GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
     use windows::Win32::UI::Shell::{
-        SHAppBarMessage, ShellExecuteW, ABM_GETTASKBARPOS, APPBARDATA,
+        SHAppBarMessage, ShellExecuteW, ABE_LEFT, ABE_RIGHT, ABM_GETTASKBARPOS, APPBARDATA,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -195,8 +197,7 @@ mod win {
     /// Current local date/time strings from the OS clock. Used to name and
     /// timestamp log files (`YYYY-MM-DD` / `HH:MM:SS`).
     fn local_now() -> (String, String) {
-        let mut st = SYSTEMTIME::default();
-        unsafe { GetLocalTime(&mut st) };
+        let st = unsafe { GetLocalTime() };
         (
             format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay),
             format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond),
@@ -285,6 +286,29 @@ mod win {
     /// keep the right anchor).
     unsafe fn win11_centered_taskbar() -> bool {
         hkcu_dword(TASKBAR_KEY, TASKBAR_VALUE) == Some(1)
+    }
+
+    /// Whether the anchor/left-margin settings row should be visible at all.
+    /// Only Win11 with centered icons offers the choice; Win10, Win11
+    /// left-aligned, and vertical taskbars hide the entire row.
+    unsafe fn anchor_settings_available() -> bool {
+        win11_centered_taskbar() && !TASKBAR_VERTICAL.load(Ordering::Relaxed)
+    }
+
+    /// Show or hide the anchor label+combo and left-margin label+edit based
+    /// on current conditions. Called at dialog creation and on anchor selection
+    /// change.
+    unsafe fn update_anchor_visibility(handles: &SettingsHandles) {
+        let available = anchor_settings_available();
+        let show_anchor = if available { SW_SHOW } else { SW_HIDE };
+        let _ = ShowWindow(handles.lbl_anchor, show_anchor);
+        let _ = ShowWindow(handles.anchor, show_anchor);
+        // Left margin is only relevant when the left anchor is actually
+        // selected AND the anchor row is visible.
+        let anchor_left = available && combo_sel(handles.anchor) == 1;
+        let show_margin = if anchor_left { SW_SHOW } else { SW_HIDE };
+        let _ = ShowWindow(handles.lbl_left_margin, show_margin);
+        let _ = ShowWindow(handles.left_margin, show_margin);
     }
 
     /// Whether the effective theme is light (config override wins over the
@@ -392,9 +416,17 @@ mod win {
         r.left <= 0 && r.top <= 0 && r.right >= w && r.bottom >= h
     }
 
-    /// Taskbar rect in screen coordinates, or `None` when the taskbar is not
-    /// currently on screen (auto-hidden, or shell not ready).
-    unsafe fn taskbar_rect() -> Option<RECT> {
+    /// Taskbar geometry: rect in screen coordinates plus which screen edge it
+    /// occupies. `vertical` is true for left/right taskbars where the indicator
+    /// switches to a one-metric-per-line column layout.
+    struct TaskbarInfo {
+        rect: RECT,
+        vertical: bool,
+    }
+
+    /// Taskbar geometry, or `None` when the taskbar is not currently on screen
+    /// (auto-hidden, or shell not ready).
+    unsafe fn taskbar_info() -> Option<TaskbarInfo> {
         let mut abd = APPBARDATA {
             cbSize: std::mem::size_of::<APPBARDATA>() as u32,
             ..Default::default()
@@ -414,16 +446,25 @@ mod win {
         if !on_screen {
             return None;
         }
-        Some(r)
+        let vertical = abd.uEdge == ABE_LEFT || abd.uEdge == ABE_RIGHT;
+        Some(TaskbarInfo { rect: r, vertical })
     }
 
-    /// Move-only placement. Right anchor: right edge `TRAY_GAP_PX` left of
-    /// `TrayNotifyWnd`. Left anchor (Win11 centered only): taskbar left edge
-    /// plus the gap. Vertically centered in the taskbar. Size never changes
-    /// here. Hides the window when there is nothing to sit on (taskbar gone)
-    /// or a fullscreen app owns the screen, and restores it otherwise.
+    /// Track whether the taskbar is currently vertical so we can reset the
+    /// grow-only width when orientation flips (horizontal and vertical layouts
+    /// have completely different aspect ratios).
+    static TASKBAR_VERTICAL: AtomicBool = AtomicBool::new(false);
+
+    /// Move-only placement. Horizontal taskbar: right anchor parks left of
+    /// `TrayNotifyWnd`; left anchor (Win11 centered only) parks at the taskbar
+    /// left edge. Vertical taskbar (left/right screen edge): the indicator is
+    /// a one-metric-per-line column; `Left` anchor means top of the taskbar,
+    /// default parks near the tray. Vertically centered (horizontal) or
+    /// horizontally centered (vertical) within the taskbar. Hides the window
+    /// when there is nothing to sit on (taskbar gone) or a fullscreen app
+    /// owns the screen, and restores it otherwise.
     unsafe fn reposition(hwnd: HWND) {
-        let Some(bar) = taskbar_rect() else {
+        let Some(info) = taskbar_info() else {
             let _ = ShowWindow(hwnd, SW_HIDE);
             return;
         };
@@ -431,44 +472,77 @@ mod win {
             let _ = ShowWindow(hwnd, SW_HIDE);
             return;
         }
+        let bar = info.rect;
+
+        // Track orientation changes: reset grow-only width when the taskbar
+        // flips between horizontal and vertical (completely different aspect).
+        let was_vertical = TASKBAR_VERTICAL.swap(info.vertical, Ordering::Relaxed);
+        if was_vertical != info.vertical {
+            WIN_W.store(0, Ordering::Relaxed);
+            // Immediately re-render in the new layout orientation.
+            sample_now(hwnd);
+        }
 
         let cfg = config();
-        let left_anchor =
-            cfg.windows.anchor == sysvitals_core::Anchor::Left && win11_centered_taskbar();
         let w = WIN_W.load(Ordering::Relaxed);
         let h = WIN_H.load(Ordering::Relaxed);
-        let x = if left_anchor {
-            // Far-left anchor: a configurable margin (default 4 px) keeps the
-            // indicator slightly off the taskbar's left edge; the internal text
-            // padding adds the rest of the breathing room.
-            bar.left + cfg.windows.left_margin_px as i32
-        } else {
-            let cls = utf16("Shell_TrayWnd");
-            let Ok(tray) = FindWindowW(windows::core::PCWSTR(cls.as_ptr()), None) else {
-                return;
-            };
-            let notify_cls = utf16("TrayNotifyWnd");
-            let notify = FindWindowExW(
-                Some(tray),
-                None,
-                windows::core::PCWSTR(notify_cls.as_ptr()),
-                None,
-            )
-            .unwrap_or_else(|_| HWND::default());
-            let anchor_x = if notify.is_invalid() {
-                bar.right
+
+        let (x, y) = if info.vertical {
+            // Vertical taskbar: horizontally centered, anchored top or bottom.
+            let x = bar.left + (bar.right - bar.left - w) / 2;
+            let left_anchor =
+                cfg.windows.anchor == sysvitals_core::Anchor::Left && win11_centered_taskbar();
+            let y = if left_anchor {
+                // "Left" anchor on a vertical taskbar = top of the taskbar.
+                bar.top + cfg.windows.left_margin_px as i32
             } else {
-                let mut nr = RECT::default();
-                if GetWindowRect(notify, &mut nr).is_err() {
+                // Default: park near the tray (bottom of a left/right taskbar).
+                bar.bottom - h - TRAY_GAP_PX
+            };
+            (x, y)
+        } else {
+            // Horizontal taskbar (bottom or top).
+            let left_anchor =
+                cfg.windows.anchor == sysvitals_core::Anchor::Left && win11_centered_taskbar();
+            let x = if left_anchor {
+                bar.left + cfg.windows.left_margin_px as i32
+            } else {
+                let cls = utf16("Shell_TrayWnd");
+                let Ok(tray) = FindWindowW(windows::core::PCWSTR(cls.as_ptr()), None) else {
+                    return;
+                };
+                let notify_cls = utf16("TrayNotifyWnd");
+                let notify = FindWindowExW(
+                    Some(tray),
+                    None,
+                    windows::core::PCWSTR(notify_cls.as_ptr()),
+                    None,
+                )
+                .unwrap_or_else(|_| HWND::default());
+                let anchor_x = if notify.is_invalid() {
                     bar.right
                 } else {
-                    nr.left
-                }
+                    let mut nr = RECT::default();
+                    if GetWindowRect(notify, &mut nr).is_err() {
+                        bar.right
+                    } else {
+                        nr.left
+                    }
+                };
+                anchor_x - w - TRAY_GAP_PX
             };
-            anchor_x - w - TRAY_GAP_PX
+            let y = bar.top + (bar.bottom - bar.top - h) / 2;
+            (x, y)
         };
-        let y = bar.top + (bar.bottom - bar.top - h) / 2;
-        if x < 0 || y < 0 || x + w > bar.right {
+
+        if info.vertical {
+            // Vertical taskbar: allow the overlay to be slightly wider than
+            // the bar itself (it floats above; clipping to bar width would
+            // hide the indicator entirely when text is wider than the bar).
+            if y < 0 || y + h > bar.bottom {
+                return;
+            }
+        } else if x < 0 || y < 0 || x + w > bar.right {
             return; // would leave the taskbar; keep last position
         }
         let _ = MoveWindow(hwnd, x, y, w, h, true);
@@ -600,7 +674,12 @@ mod win {
         // intentionally not stored. A store failure must never break the live
         // indicator, so errors are swallowed here.
         record_history(&cfg, now, &snapshot);
-        let row = format_frame(&snapshot, &cfg);
+        // Vertical taskbar: one metric per line (no dual-row concept).
+        let row = if TASKBAR_VERTICAL.load(Ordering::Relaxed) {
+            format_frame_vertical(&snapshot, &cfg)
+        } else {
+            format_frame(&snapshot, &cfg)
+        };
         resize_to_content(hwnd, &row);
         LAST_ROW.with(|l| *l.borrow_mut() = Some(row));
         render_layered(hwnd);
@@ -925,6 +1004,7 @@ mod win {
     const CB_SETCURSEL: u32 = 0x014E;
     const CB_GETCURSEL: u32 = 0x0147;
     const CB_RESETCONTENT: u32 = 0x014A;
+    const CBN_SELCHANGE: u32 = 0x0001;
     const BM_GETCHECK: u32 = 0x00F0;
     const BM_SETCHECK: u32 = 0x00F1;
     const WM_SETFONT: u32 = 0x0030;
@@ -1170,7 +1250,7 @@ mod win {
         );
         let dual_text = utf16(t(lang, "settings.dual_row"));
         let _ = SetWindowTextW(dual, windows::core::PCWSTR(dual_text.as_ptr()));
-        if cfg.windows.dual_row {
+        if cfg.display.dual_row {
             let _ = SendMessageW(
                 dual,
                 BM_SETCHECK,
@@ -1424,6 +1504,7 @@ mod win {
         // interactive (right-click menu, double-click) while settings is open.
         // The settings dialog is an owned window, so it stays on top of the
         // overlay regardless.
+        SETTINGS.with(|s| update_anchor_visibility(&*s.borrow()));
         let _ = ShowWindow(dlg, SW_SHOW);
 
         // Nested modal loop: the overlay keeps ticking behind the dialog
@@ -1452,7 +1533,7 @@ mod win {
         if (0..sysvitals_core::config::ALLOWED_INTERVAL_MS.len() as i32).contains(&int_idx) {
             cfg.sample.interval_ms = sysvitals_core::config::ALLOWED_INTERVAL_MS[int_idx as usize];
         }
-        cfg.windows.dual_row =
+        cfg.display.dual_row =
             SendMessageW(handles.dual, BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 as usize
                 == BST_CHECKED;
         let spacing_idx = combo_sel(handles.spacing);
@@ -1556,6 +1637,13 @@ mod win {
         match msg {
             WM_COMMAND => {
                 let id = (wparam.0 & 0xFFFF) as i32;
+                let notify = ((wparam.0 >> 16) & 0xFFFF) as u32;
+                // Anchor combo selection changed: show/hide the left-margin
+                // row so it is only visible when the far-left anchor is chosen.
+                if id == IDC_ANCHOR && notify == CBN_SELCHANGE {
+                    SETTINGS.with(|s| update_anchor_visibility(&*s.borrow()));
+                    return LRESULT(0);
+                }
                 if id == CMD_OK {
                     collect_and_apply_settings();
                     let _ = DestroyWindow(hwnd);
@@ -1709,9 +1797,10 @@ mod win {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
-            // Seed one frame before showing so the first paint has content.
-            sample_now(hwnd);
+            // Detect taskbar orientation first (sets TASKBAR_VERTICAL), then
+            // seed one frame so the first paint has content.
             reposition(hwnd);
+            sample_now(hwnd);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             SetTimer(Some(hwnd), TIMER_SAMPLE, interval_ms, None);
             SetTimer(Some(hwnd), TIMER_MOVE, MOVE_MS, None);

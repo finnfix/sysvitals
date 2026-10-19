@@ -32,13 +32,13 @@ fn main() {
         let single = format_frame(&snap, &cfg);
         println!("[single] {}", single.lines[0].render());
 
-        // Dual-row rendering (Windows 2x2 quadrant).
-        cfg.windows.dual_row = true;
+        // Dual-row rendering (2x2 quadrant).
+        cfg.display.dual_row = true;
         let dual = format_frame(&snap, &cfg);
         for line in &dual.lines {
             println!("[dual  ] {}", line.render());
         }
-        cfg.windows.dual_row = false;
+        cfg.display.dual_row = false;
 
         println!(
             "raw: cpu={:.1} mem={:.1} up={:.0}B/s down={:.0}B/s\n",
