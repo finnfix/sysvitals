@@ -90,6 +90,8 @@ pub fn t(lang: Language, key: &str) -> &str {
         (Language::Zh, "settings.item_spacing") => "项目间距（空格数）",
         (Language::En, "settings.anchor") => "Taskbar position",
         (Language::Zh, "settings.anchor") => "任务栏位置",
+        (Language::En, "settings.left_margin") => "Left margin (px)",
+        (Language::Zh, "settings.left_margin") => "左侧边距（像素）",
         (Language::En, "anchor.right") => "Left of tray",
         (Language::Zh, "anchor.right") => "托盘左侧",
         (Language::En, "anchor.left") => "Far left (Win11 centered only)",

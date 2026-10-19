@@ -39,8 +39,8 @@ mod win {
         DeleteObject, DrawTextW, GetDC, GetSysColor, ReleaseDC, SelectObject, SetBkMode,
         SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER,
         BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE,
-        DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS,
-        DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_SWISS, FW_REGULAR, FW_SEMIBOLD, HFONT,
+        DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_LEFT,
+        DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_SWISS, FW_REGULAR, FW_SEMIBOLD, HFONT,
         OUT_DEFAULT_PRECIS, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -48,6 +48,7 @@ mod win {
         RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
         REG_VALUE_TYPE,
     };
+    use windows::Win32::System::SystemInformation::{GetLocalTime, SYSTEMTIME};
     use windows::Win32::UI::HiDpi::{
         GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
@@ -58,12 +59,12 @@ mod win {
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
         DispatchMessageW, EnumChildWindows, FindWindowExW, FindWindowW, GetCursorPos,
         GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW, IsWindowVisible,
-        KillTimer, MoveWindow, PostQuitMessage, RegisterClassExW, SendMessageW, SetTimer,
-        SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, UpdateLayeredWindow,
-        BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CBS_DROPDOWNLIST, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
-        ES_AUTOHSCROLL, HWND_TOPMOST, MF_STRING, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD,
-        TPM_RIGHTBUTTON, ULW_ALPHA, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+        KillTimer, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW,
+        SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
+        UpdateLayeredWindow, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CBS_DROPDOWNLIST, CS_DBLCLKS,
+        CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, HWND_TOPMOST, MF_STRING, MSG, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN,
+        TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY,
         WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW,
         WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU,
         WS_VISIBLE,
@@ -76,10 +77,21 @@ mod win {
     const TIMER_SAMPLE: usize = 0x515;
     const TIMER_MOVE: usize = 0x516;
     const MOVE_MS: u32 = 1_000;
+    /// Custom message posted to the overlay to apply a settings change. The
+    /// overlay re-samples, resizes and re-renders in its own wndproc — never
+    /// synchronously from inside the settings modal loop, which caused crashes
+    /// (reentrant rendering while the dialog message pump is active).
+    const WM_APP_APPLY: u32 = 0x8000 + 1;
     /// Horizontal padding around the measured text. Small so the indicator can
     /// sit tight to the tray (matching tray-icon spacing) while still keeping
     /// a hit-testable margin.
     const PAD_PX: i32 = 6;
+    /// Extra width slack added when sizing the overlay. Sizing measures text at
+    /// 1x with the overlay font, but rendering draws at 2x and downsamples; the
+    /// two rounded widths do not match exactly, so without slack the last
+    /// characters (`K/s`, `%`) get clipped. A few pixels of slack guarantees the
+    /// full string always fits.
+    const WIDTH_SLACK_PX: i32 = 8;
     const THEME_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
     const THEME_VALUE: &str = "SystemUsesLightTheme";
     const TASKBAR_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced";
@@ -105,6 +117,7 @@ mod win {
     const IDC_PREFIX_UP: i32 = 110;
     const IDC_PREFIX_DOWN: i32 = 111;
     const IDC_SPACING: i32 = 112;
+    const IDC_LEFT_MARGIN: i32 = 113;
 
     static WIN_W: AtomicI32 = AtomicI32::new(0);
     static WIN_H: AtomicI32 = AtomicI32::new(0);
@@ -151,6 +164,8 @@ mod win {
         lbl_prefixes: HWND,
         lbl_prefix: [HWND; 4],
         lbl_hint: HWND,
+        left_margin: HWND,
+        lbl_left_margin: HWND,
         btn_apply: HWND,
         btn_ok: HWND,
         btn_cancel: HWND,
@@ -175,6 +190,40 @@ mod win {
         if let Some(slot) = CONFIG.get() {
             *slot.write().expect("config lock") = new;
         }
+    }
+
+    /// Current local date/time strings from the OS clock. Used to name and
+    /// timestamp log files (`YYYY-MM-DD` / `HH:MM:SS`).
+    fn local_now() -> (String, String) {
+        let mut st = SYSTEMTIME::default();
+        unsafe { GetLocalTime(&mut st) };
+        (
+            format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay),
+            format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond),
+        )
+    }
+
+    /// Append one line to today's log file under the data dir. Logging must
+    /// never break the indicator, so failures are silently ignored.
+    fn log_event(level: &str, message: &str) {
+        let Ok(dir) = sysvitals_core::config::data_dir() else {
+            return;
+        };
+        let (date, time) = local_now();
+        sysvitals_core::logger::log_line(&dir, &date, &time, level, message);
+    }
+
+    /// Remove log files older than the retention window. Run once at startup.
+    fn prune_old_logs() {
+        let Ok(dir) = sysvitals_core::config::data_dir() else {
+            return;
+        };
+        let (date, _) = local_now();
+        sysvitals_core::logger::prune_logs(
+            &dir,
+            &date,
+            sysvitals_core::logger::DEFAULT_RETENTION_DAYS,
+        );
     }
 
     fn utf16(s: &str) -> Vec<u16> {
@@ -389,10 +438,10 @@ mod win {
         let w = WIN_W.load(Ordering::Relaxed);
         let h = WIN_H.load(Ordering::Relaxed);
         let x = if left_anchor {
-            // Flush against the taskbar's left edge; only the internal text
-            // padding provides breathing room, so the indicator reads tight to
-            // the edge like the native clock.
-            bar.left
+            // Far-left anchor: a configurable margin (default 4 px) keeps the
+            // indicator slightly off the taskbar's left edge; the internal text
+            // padding adds the rest of the breathing room.
+            bar.left + cfg.windows.left_margin_px as i32
         } else {
             let cls = utf16("Shell_TrayWnd");
             let Ok(tray) = FindWindowW(windows::core::PCWSTR(cls.as_ptr()), None) else {
@@ -449,9 +498,12 @@ mod win {
     unsafe fn measure_frame(
         hdc: windows::Win32::Graphics::Gdi::HDC,
         row: &FormattedRow,
-        spacing: u32,
     ) -> FrameMetrics {
-        let gap = " ".repeat(spacing.max(1) as usize);
+        // The dual-row column gap is deliberately tighter (one space) than the
+        // single-row item spacing: the two columns are stacked pairs (CPU over
+        // MEM, U over D), so a wide gap reads as two separate widgets. The
+        // single-row `item_spacing` setting still controls horizontal spacing.
+        let gap = " ".to_string();
         let multi_line = row.lines.len() > 1;
         let has_right_col = row.lines.iter().any(|l| !l.right.is_empty());
         let mut line_h = 0i32;
@@ -506,17 +558,16 @@ mod win {
         let hdc = GetDC(Some(hwnd));
         let font = make_font();
         let old = SelectObject(hdc, font.into());
-        let spacing = config().display.item_spacing;
-        let m = measure_frame(hdc, row, spacing);
+        let m = measure_frame(hdc, row);
         SelectObject(hdc, old);
         let _ = DeleteObject(font.into());
         let _ = ReleaseDC(Some(hwnd), hdc);
         if m.line_h == 0 {
             return;
         }
-        let line_h = m.line_h + 4; // breathing room between the two rows
-        let want_w = m.want_w + PAD_PX * 2;
-        let want_h = line_h * row.lines.len() as i32 + 4;
+        let line_h = m.line_h + 2; // minimal breathing room between the two rows
+        let want_w = m.want_w + PAD_PX * 2 + WIDTH_SLACK_PX;
+        let want_h = line_h * row.lines.len() as i32 + 2;
         WIN_W.fetch_max(want_w, Ordering::Relaxed);
         WIN_H.store(want_h, Ordering::Relaxed);
         let w = WIN_W.load(Ordering::Relaxed);
@@ -662,8 +713,7 @@ mod win {
         // and draw the right column as a separate string at that measured
         // offset (scaled by the supersample factor). This is what makes U/D
         // line up vertically.
-        let spacing = config().display.item_spacing;
-        let fm = measure_frame(mem_dc, &row, spacing);
+        let fm = measure_frame(mem_dc, &row);
         for (i, line) in row.lines.iter().enumerate() {
             let top = i as i32 * ss_line_h;
             let bottom = (i as i32 + 1) * ss_line_h;
@@ -680,7 +730,7 @@ mod win {
                     mem_dc,
                     &mut lbuf,
                     &mut left_rc,
-                    DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                    DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_NOPREFIX,
                 );
                 // Right column at the measured pixel offset.
                 if !line.right.is_empty() {
@@ -695,7 +745,7 @@ mod win {
                         mem_dc,
                         &mut rbuf,
                         &mut right_rc,
-                        DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                        DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_NOPREFIX,
                     );
                 }
             } else if fm.multi_line {
@@ -713,7 +763,7 @@ mod win {
                     mem_dc,
                     &mut buf,
                     &mut line_rc,
-                    DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                    DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_NOPREFIX,
                 );
             } else {
                 // Single row: centered.
@@ -729,7 +779,7 @@ mod win {
                     mem_dc,
                     &mut buf,
                     &mut line_rc,
-                    DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                    DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX,
                 );
             }
         }
@@ -975,6 +1025,7 @@ mod win {
         set(h.dual, t(lang, "settings.dual_row"));
         set(h.lbl_spacing, t(lang, "settings.item_spacing"));
         set(h.lbl_anchor, t(lang, "settings.anchor"));
+        set(h.lbl_left_margin, t(lang, "settings.left_margin"));
         set(h.lbl_theme, t(lang, "settings.theme"));
         set(
             h.show_res,
@@ -1185,6 +1236,25 @@ mod win {
         );
         y += row_h;
 
+        let lbl_left_margin = static_at(
+            dlg,
+            s(12),
+            y + s(4),
+            label_w,
+            s(20),
+            t(lang, "settings.left_margin"),
+        );
+        let left_margin = control(
+            dlg,
+            "EDIT",
+            IDC_LEFT_MARGIN,
+            (field_x, y, field_w, s(22)),
+            ES_AUTOHSCROLL | WS_BORDER.0 as i32,
+        );
+        let lm_text = utf16(&cfg.windows.left_margin_px.to_string());
+        let _ = SetWindowTextW(left_margin, windows::core::PCWSTR(lm_text.as_ptr()));
+        y += row_h;
+
         let lbl_theme = static_at(
             dlg,
             s(12),
@@ -1342,6 +1412,8 @@ mod win {
                 lbl_prefixes,
                 lbl_prefix: prefix_label_hwnds,
                 lbl_hint,
+                left_margin,
+                lbl_left_margin,
                 btn_apply: apply,
                 btn_ok: ok,
                 btn_cancel: cancel,
@@ -1393,6 +1465,11 @@ mod win {
         } else {
             sysvitals_core::Anchor::Right
         };
+        // Left margin (pixels) for the far-left anchor. Parse defensively:
+        // non-numeric input keeps the previous value.
+        if let Ok(px) = edit_text(handles.left_margin).trim().parse::<u32>() {
+            cfg.windows.left_margin_px = px;
+        }
         cfg.display.theme = match combo_sel(handles.theme) {
             1 => Theme::Light,
             2 => Theme::Dark,
@@ -1423,6 +1500,31 @@ mod win {
             let _ = cfg.save(&path);
         }
         store_config(cfg.clone());
+        // Sanitize enforces "at least one metric group stays visible" by
+        // re-enabling resources when both toggles were off. Reflect the
+        // sanitized state back into the checkboxes so the dialog matches reality.
+        let res_check = if cfg.display.show_resources {
+            BST_CHECKED
+        } else {
+            0
+        };
+        let net_check = if cfg.display.show_network {
+            BST_CHECKED
+        } else {
+            0
+        };
+        let _ = SendMessageW(
+            handles.show_res,
+            BM_SETCHECK,
+            Some(WPARAM(res_check)),
+            Some(LPARAM(0)),
+        );
+        let _ = SendMessageW(
+            handles.show_net,
+            BM_SETCHECK,
+            Some(WPARAM(net_check)),
+            Some(LPARAM(0)),
+        );
         // Re-seed sampling so the new interval takes effect immediately.
         SAMPLER.with(|s| *s.borrow_mut() = None);
         let overlay = HWND(OVERLAY.load(Ordering::Relaxed) as *mut _);
@@ -1433,11 +1535,16 @@ mod win {
             cfg.sample.interval_ms.clamp(500, 5000) as u32,
             None,
         );
-        reposition(overlay);
-        sample_now(overlay);
+        // Defer the overlay re-render to a posted message instead of rendering
+        // synchronously here. Rendering (GDI measure + UpdateLayeredWindow)
+        // reentrantly inside the settings modal loop's WM_COMMAND handler is
+        // what crashed the app on Apply. The overlay wndproc handles
+        // WM_APP_APPLY at top level, which is always safe.
+        let _ = PostMessageW(Some(overlay), WM_APP_APPLY, WPARAM(0), LPARAM(0));
         // Re-translate the dialog itself so a language change via Apply is
         // visible immediately without reopening the window.
         refresh_settings_texts(cfg.display.language);
+        log_event("INFO", "settings applied");
     }
 
     unsafe extern "system" fn settings_wndproc(
@@ -1497,6 +1604,14 @@ mod win {
                 }
                 LRESULT(0)
             }
+            WM_APP_APPLY => {
+                // Settings were applied: reposition and redraw at top level.
+                // This runs outside the settings dialog's WM_COMMAND handler,
+                // avoiding the reentrant-render crash.
+                reposition(hwnd);
+                sample_now(hwnd);
+                LRESULT(0)
+            }
             WM_SETTINGCHANGE => {
                 // Theme flips arrive here; re-read the flag and repaint.
                 refresh_theme();
@@ -1527,6 +1642,7 @@ mod win {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                log_event("INFO", "SysVitals exiting");
                 PostQuitMessage(0);
                 LRESULT(0)
             }
@@ -1540,6 +1656,11 @@ mod win {
             refresh_theme();
             let cfg = config();
             let interval_ms = cfg.sample.interval_ms.clamp(500, 5000) as u32;
+
+            // Daily-file logging: prune stale logs once at startup, then record
+            // the launch. Logging failures never block the indicator.
+            prune_old_logs();
+            log_event("INFO", "SysVitals starting");
 
             let hmodule = GetModuleHandleW(None).expect("module handle");
             let class_name = utf16("SysVitalsOverlay");

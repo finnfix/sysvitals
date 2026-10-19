@@ -102,6 +102,9 @@ pub struct WindowsConfig {
     /// Manual font-size override (points). `None` = follow the system metric.
     /// Dual-row scales the system font (≈0.75) automatically instead.
     pub font_size_override: Option<f32>,
+    /// Extra gap (pixels) between the taskbar's left edge and the indicator
+    /// when the far-left anchor is active. Default 4.
+    pub left_margin_px: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -184,6 +187,7 @@ impl Default for WindowsConfig {
             row_spacing: 1,
             auto_start: true,
             font_size_override: None,
+            left_margin_px: 4,
         }
     }
 }
@@ -263,6 +267,23 @@ impl Config {
 
         if self.windows.row_spacing > 8 {
             self.windows.row_spacing = 8;
+        }
+        if self.windows.left_margin_px > 64 {
+            let old = self.windows.left_margin_px;
+            self.windows.left_margin_px = 64;
+            issues.push(SanitizeIssue {
+                field: "windows.left_margin_px",
+                message: format!("clamped to [0,64] (was {old})"),
+            });
+        }
+        // At least one metric group must stay visible: if both toggles are
+        // off, re-enable resources (CPU/MEM) so the indicator never goes blank.
+        if !self.display.show_resources && !self.display.show_network {
+            self.display.show_resources = true;
+            issues.push(SanitizeIssue {
+                field: "display.show_resources",
+                message: "at least one group must remain visible; resources re-enabled".to_string(),
+            });
         }
         issues
     }
@@ -390,6 +411,16 @@ pub fn history_path() -> anyhow::Result<PathBuf> {
     let dirs = ProjectDirs::from("", "", "SysVitals")
         .ok_or_else(|| anyhow::anyhow!("could not resolve project directories"))?;
     Ok(dirs.data_dir().join("history.db"))
+}
+
+/// The per-user data directory (`%APPDATA%\SysVitals` on Windows,
+/// `~/Library/Application Support/SysVitals` on macOS). Log files live under
+/// `<data_dir>/logs/` (see [`crate::logger`]).
+pub fn data_dir() -> anyhow::Result<PathBuf> {
+    use directories::ProjectDirs;
+    let dirs = ProjectDirs::from("", "", "SysVitals")
+        .ok_or_else(|| anyhow::anyhow!("could not resolve project directories"))?;
+    Ok(dirs.data_dir().to_path_buf())
 }
 
 #[cfg(test)]

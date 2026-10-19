@@ -14,6 +14,7 @@
 pub mod config;
 pub mod format;
 pub mod i18n;
+pub mod logger;
 pub mod model;
 pub mod sampler;
 pub mod store;
