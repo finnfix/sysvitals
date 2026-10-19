@@ -35,7 +35,9 @@ mod win {
     use sysvitals_core::{
         format_frame, format_frame_vertical, t, Config, Language, NetSelection, Sampler, Theme,
     };
-    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+    use windows::Win32::Foundation::{
+        CloseHandle, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    };
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC,
         DeleteObject, DrawTextW, GetDC, GetSysColor, ReleaseDC, SelectObject, SetBkMode,
@@ -45,13 +47,18 @@ mod win {
         DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_SWISS, FW_REGULAR, FW_SEMIBOLD, HFONT,
         OUT_DEFAULT_PRECIS, TRANSPARENT,
     };
+    use windows::Win32::System::Diagnostics::Debug::{
+        SetUnhandledExceptionFilter, EXCEPTION_POINTERS,
+    };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Registry::{
         RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
         REG_VALUE_TYPE,
     };
     use windows::Win32::System::SystemInformation::GetLocalTime;
-    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::Win32::System::Threading::{
+        CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
     use windows::Win32::UI::HiDpi::{
         GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
@@ -61,9 +68,9 @@ mod win {
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
         DispatchMessageW, EnumChildWindows, FindWindowExW, FindWindowW, GetCursorPos,
-        GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW, IsWindowVisible,
-        KillTimer, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW,
-        SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
+        GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+        IsWindowVisible, KillTimer, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW,
+        SendMessageW, SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
         UpdateLayeredWindow, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CBS_DROPDOWNLIST, CS_DBLCLKS,
         CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, HWND_TOPMOST, MF_STRING, MSG, SWP_NOACTIVATE,
         SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN,
@@ -124,6 +131,10 @@ mod win {
 
     static WIN_W: AtomicI32 = AtomicI32::new(0);
     static WIN_H: AtomicI32 = AtomicI32::new(0);
+    /// Whether we already attempted to open the history store. A failed open
+    /// is logged once and never retried, so a broken data dir does not spam
+    /// the log on every tick.
+    static STORE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
     /// Cached `SystemUsesLightTheme` (1 = light taskbar). Refreshed on
     /// `WM_SETTINGCHANGE` so a live theme switch repaints correctly.
     static LIGHT_THEME: AtomicU32 = AtomicU32::new(0);
@@ -406,9 +417,18 @@ mod win {
     /// True when the foreground window covers the whole primary screen, i.e.
     /// a fullscreen app (game, video, presentation) that the overlay should
     /// make room for.
+    ///
+    /// Shell flyout windows (Start menu, search, quick settings, etc.) are
+    /// excluded: on Windows 11 the Start menu window reports a full-screen
+    /// rect even though it is not a fullscreen app, which would incorrectly
+    /// hide the indicator while the Start menu is open.
     unsafe fn foreground_is_fullscreen(me: HWND) -> bool {
         let fg = GetForegroundWindow();
         if fg.is_invalid() || fg == me {
+            return false;
+        }
+        // Exclude shell flyout processes before the rect check.
+        if is_shell_flyout_window(fg) {
             return false;
         }
         let mut r = RECT::default();
@@ -422,6 +442,48 @@ mod win {
             windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN,
         );
         r.left <= 0 && r.top <= 0 && r.right >= w && r.bottom >= h
+    }
+
+    /// Returns true when the window belongs to a Windows shell flyout process
+    /// (Start menu, search, quick settings, action center, widgets, etc.).
+    /// These windows can report full-screen rects but are not fullscreen apps.
+    unsafe fn is_shell_flyout_window(hwnd: HWND) -> bool {
+        let mut pid: u32 = 0;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return false;
+        }
+        let Ok(proc) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            proc,
+            Default::default(),
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(proc);
+        if !ok {
+            return false;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        // Extract the executable name from the full path.
+        let exe_name = path
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        matches!(
+            exe_name.as_str(),
+            "startmenuexperiencehost.exe"
+                | "searchhost.exe"
+                | "shellexperiencehost.exe"
+                | "widgets.exe"
+                | "lockapp.exe"
+        )
     }
 
     /// Taskbar geometry: rect in screen coordinates plus which screen edge it
@@ -473,10 +535,16 @@ mod win {
     /// owns the screen, and restores it otherwise.
     unsafe fn reposition(hwnd: HWND) {
         let Some(info) = taskbar_info() else {
+            if IsWindowVisible(hwnd).as_bool() {
+                log_event("INFO", "overlay hidden: taskbar not on screen (auto-hide)");
+            }
             let _ = ShowWindow(hwnd, SW_HIDE);
             return;
         };
         if foreground_is_fullscreen(hwnd) {
+            if IsWindowVisible(hwnd).as_bool() {
+                log_event("INFO", "overlay hidden: fullscreen foreground app");
+            }
             let _ = ShowWindow(hwnd, SW_HIDE);
             return;
         }
@@ -486,6 +554,10 @@ mod win {
         // flips between horizontal and vertical (completely different aspect).
         let was_vertical = TASKBAR_VERTICAL.swap(info.vertical, Ordering::Relaxed);
         if was_vertical != info.vertical {
+            log_event(
+                "INFO",
+                &format!("taskbar orientation changed: vertical={}", info.vertical),
+            );
             WIN_W.store(0, Ordering::Relaxed);
             // Immediately re-render in the new layout orientation.
             sample_now(hwnd);
@@ -558,6 +630,7 @@ mod win {
         // fullscreen). Calling ShowWindow unconditionally every tick causes
         // unnecessary z-order churn.
         if !IsWindowVisible(hwnd).as_bool() {
+            log_event("INFO", "overlay re-shown after being hidden");
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
     }
@@ -568,6 +641,11 @@ mod win {
     /// must start so U/D line up across both rows. Drawing the two columns as
     /// separate strings at this measured offset is what guarantees pixel-level
     /// alignment in a proportional font — space padding alone cannot.
+    ///
+    /// `item_widths` is `Some` only for the single-row layout when the frame
+    /// carries individual metric items (`row.items` non-empty). The display
+    /// layer lays these out with a pixel gap (`item_spacing`) instead of a
+    /// space-joined string.
     struct FrameMetrics {
         line_h: i32,
         want_w: i32,
@@ -575,16 +653,18 @@ mod win {
         /// True when the frame has more than one line (dual-row layout).
         /// Multi-line frames are always left-aligned; single-line is centered.
         multi_line: bool,
+        /// Per-item pixel widths for single-row pixel-spacing layout.
+        item_widths: Option<Vec<i32>>,
     }
 
     unsafe fn measure_frame(
         hdc: windows::Win32::Graphics::Gdi::HDC,
         row: &FormattedRow,
+        spacing_px: i32,
     ) -> FrameMetrics {
         // The dual-row column gap is deliberately tighter (one space) than the
         // single-row item spacing: the two columns are stacked pairs (CPU over
-        // MEM, U over D), so a wide gap reads as two separate widgets. The
-        // single-row `item_spacing` setting still controls horizontal spacing.
+        // MEM, U over D), so a wide gap reads as two separate widgets.
         let gap = " ".to_string();
         let multi_line = row.lines.len() > 1;
         let has_right_col = row.lines.iter().any(|l| !l.right.is_empty());
@@ -601,9 +681,31 @@ mod win {
             line_h = line_h.max(rc.bottom - rc.top);
             rc.right - rc.left
         };
+
+        // Single-row with individual items: lay out with a pixel gap.
+        if !row.items.is_empty() && !multi_line {
+            let mut item_widths = Vec::with_capacity(row.items.len());
+            let mut total_w = 0i32;
+            for (i, item) in row.items.iter().enumerate() {
+                let w = text_w(item);
+                item_widths.push(w);
+                total_w += w;
+                if i + 1 < row.items.len() {
+                    total_w += spacing_px;
+                }
+            }
+            return FrameMetrics {
+                line_h,
+                want_w: total_w,
+                right_x: None,
+                multi_line: false,
+                item_widths: Some(item_widths),
+            };
+        }
+
         if !multi_line || !has_right_col {
-            // Single line, or multi-line with only one column: measure each
-            // line independently and use the widest.
+            // Single line (fallback), or multi-line with only one column:
+            // measure each line independently and use the widest.
             let mut want_w = 0i32;
             for line in &row.lines {
                 want_w = want_w.max(text_w(&row_text(line)));
@@ -613,6 +715,7 @@ mod win {
                 want_w,
                 right_x: None,
                 multi_line,
+                item_widths: None,
             };
         }
         let mut left_col_w = 0i32;
@@ -630,6 +733,7 @@ mod win {
             want_w: right_x + right_col_w,
             right_x: Some(right_x),
             multi_line,
+            item_widths: None,
         }
     }
 
@@ -637,10 +741,12 @@ mod win {
     /// grows (content must not make the widget jiggle); height follows the
     /// row count so single/dual row switches stay exact.
     unsafe fn resize_to_content(hwnd: HWND, row: &FormattedRow) {
+        let cfg = config();
+        let spacing_px = cfg.display.item_spacing as i32;
         let hdc = GetDC(Some(hwnd));
         let font = make_font();
         let old = SelectObject(hdc, font.into());
-        let m = measure_frame(hdc, row);
+        let m = measure_frame(hdc, row, spacing_px);
         SelectObject(hdc, old);
         let _ = DeleteObject(font.into());
         let _ = ReleaseDC(Some(hwnd), hdc);
@@ -702,12 +808,28 @@ mod win {
         }
         STORE.with(|s| {
             let mut guard = s.borrow_mut();
-            if guard.is_none() {
+            if guard.is_none() && !STORE_ATTEMPTED.swap(true, Ordering::Relaxed) {
                 if let Ok(path) = sysvitals_core::config::history_path() {
                     if let Some(parent) = path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    *guard = sysvitals_core::Store::open(&path).ok();
+                    match sysvitals_core::Store::open(&path) {
+                        Ok(store) => {
+                            log_event("INFO", &format!("history store opened: {}", path.display()));
+                            *guard = Some(store);
+                        }
+                        Err(e) => {
+                            log_event(
+                                "WARN",
+                                &format!(
+                                    "history store failed to open ({}): {}",
+                                    path.display(),
+                                    e
+                                ),
+                            );
+                            *guard = None;
+                        }
+                    }
                 }
             }
             if let Some(store) = guard.as_ref() {
@@ -800,11 +922,37 @@ mod win {
         // and draw the right column as a separate string at that measured
         // offset (scaled by the supersample factor). This is what makes U/D
         // line up vertically.
-        let fm = measure_frame(mem_dc, &row);
+        let spacing_px = config().display.item_spacing as i32;
+        // The scratch DC has the 2x supersampled font selected, so pass the
+        // scaled spacing to keep measured widths and gaps at the same scale.
+        let fm = measure_frame(mem_dc, &row, spacing_px * SS);
         for (i, line) in row.lines.iter().enumerate() {
             let top = i as i32 * ss_line_h;
             let bottom = (i as i32 + 1) * ss_line_h;
-            if let Some(right_x) = fm.right_x {
+            if let Some(ref item_widths) = fm.item_widths {
+                // Single-row pixel-spacing layout: draw each metric item at its
+                // measured pixel offset, centered as a group within the window.
+                let gap = spacing_px * SS;
+                let total_w: i32 = item_widths.iter().sum::<i32>()
+                    + gap * (row.items.len().saturating_sub(1) as i32);
+                let mut x = (sw - total_w) / 2;
+                for (j, item) in row.items.iter().enumerate() {
+                    let mut rc = RECT {
+                        left: x,
+                        top,
+                        right: x + item_widths[j],
+                        bottom,
+                    };
+                    let mut buf = utf16(item);
+                    DrawTextW(
+                        mem_dc,
+                        &mut buf,
+                        &mut rc,
+                        DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_NOPREFIX,
+                    );
+                    x += item_widths[j] + gap;
+                }
+            } else if let Some(right_x) = fm.right_x {
                 // Left column, left-aligned at the padding.
                 let mut left_rc = RECT {
                     left: PAD_PX * SS,
@@ -1152,6 +1300,7 @@ mod win {
         if SETTINGS_OPEN.swap(true, Ordering::Relaxed) {
             return;
         }
+        log_event("INFO", "settings dialog opening");
         SETTINGS_DONE.store(false, Ordering::Relaxed);
         let cfg = config();
         let lang = cfg.display.language;
@@ -1301,10 +1450,13 @@ mod win {
             (field_x, y, field_w, s(120)),
             CBS_DROPDOWNLIST,
         );
-        for sp in 1..=8u32 {
-            combo_add(spacing_cb, &format!("{sp}"));
+        for sp in sysvitals_core::config::ALLOWED_ITEM_SPACING_PX {
+            combo_add(spacing_cb, &format!("{sp} px"));
         }
-        let spacing_idx = (cfg.display.item_spacing.clamp(1, 8) - 1) as usize;
+        let spacing_idx = sysvitals_core::config::ALLOWED_ITEM_SPACING_PX
+            .iter()
+            .position(|v| *v == cfg.display.item_spacing)
+            .unwrap_or(0);
         let _ = SendMessageW(
             spacing_cb,
             CB_SETCURSEL,
@@ -1352,13 +1504,24 @@ mod win {
         );
         let left_margin = control(
             dlg,
-            "EDIT",
+            "COMBOBOX",
             IDC_LEFT_MARGIN,
-            (field_x, y, field_w, s(22)),
-            ES_AUTOHSCROLL | WS_BORDER.0 as i32,
+            (field_x, y, field_w, s(120)),
+            CBS_DROPDOWNLIST,
         );
-        let lm_text = utf16(&cfg.windows.left_margin_px.to_string());
-        let _ = SetWindowTextW(left_margin, windows::core::PCWSTR(lm_text.as_ptr()));
+        for lm in sysvitals_core::config::ALLOWED_LEFT_MARGIN_PX {
+            combo_add(left_margin, &format!("{lm} px"));
+        }
+        let lm_idx = sysvitals_core::config::ALLOWED_LEFT_MARGIN_PX
+            .iter()
+            .position(|v| *v == cfg.windows.left_margin_px)
+            .unwrap_or(0);
+        let _ = SendMessageW(
+            left_margin,
+            CB_SETCURSEL,
+            Some(WPARAM(lm_idx)),
+            Some(LPARAM(0)),
+        );
         y += row_h;
 
         let lbl_theme = static_at(
@@ -1543,6 +1706,7 @@ mod win {
         }
         let _ = DeleteObject(dlg_font.into());
         SETTINGS_OPEN.store(false, Ordering::Relaxed);
+        log_event("INFO", "settings dialog closed");
         // If the loop ended because WM_QUIT was consumed (overlay destroyed
         // while the dialog was open), re-post it so the main loop exits too.
         if !SETTINGS_DONE.load(Ordering::Relaxed) {
@@ -1568,8 +1732,10 @@ mod win {
             SendMessageW(handles.dual, BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 as usize
                 == BST_CHECKED;
         let spacing_idx = combo_sel(handles.spacing);
-        if (0..8).contains(&spacing_idx) {
-            cfg.display.item_spacing = (spacing_idx + 1) as u32;
+        if (0..sysvitals_core::config::ALLOWED_ITEM_SPACING_PX.len() as i32).contains(&spacing_idx)
+        {
+            cfg.display.item_spacing =
+                sysvitals_core::config::ALLOWED_ITEM_SPACING_PX[spacing_idx as usize];
         }
         let anchor_idx = combo_sel(handles.anchor);
         cfg.windows.anchor = if anchor_idx == 1 {
@@ -1577,10 +1743,12 @@ mod win {
         } else {
             sysvitals_core::Anchor::Right
         };
-        // Left margin (pixels) for the far-left anchor. Parse defensively:
-        // non-numeric input keeps the previous value.
-        if let Ok(px) = edit_text(handles.left_margin).trim().parse::<u32>() {
-            cfg.windows.left_margin_px = px;
+        // Left margin (pixels) for the far-left anchor. Read from the combo
+        // selection; an out-of-range index keeps the previous value.
+        let lm_idx = combo_sel(handles.left_margin);
+        if (0..sysvitals_core::config::ALLOWED_LEFT_MARGIN_PX.len() as i32).contains(&lm_idx) {
+            cfg.windows.left_margin_px =
+                sysvitals_core::config::ALLOWED_LEFT_MARGIN_PX[lm_idx as usize];
         }
         cfg.display.theme = match combo_sel(handles.theme) {
             1 => Theme::Light,
@@ -1637,8 +1805,9 @@ mod win {
             Some(WPARAM(net_check)),
             Some(LPARAM(0)),
         );
-        // Re-seed sampling so the new interval takes effect immediately.
-        SAMPLER.with(|s| *s.borrow_mut() = None);
+        // Re-seed the timer so the new interval takes effect immediately.
+        // The sampler itself is NOT reset: it is expensive to re-create and
+        // the interval change is fully handled by the timer period.
         let overlay = HWND(OVERLAY.load(Ordering::Relaxed) as *mut _);
         let _ = KillTimer(Some(overlay), TIMER_SAMPLE);
         SetTimer(
@@ -1656,7 +1825,28 @@ mod win {
         // Re-translate the dialog itself so a language change via Apply is
         // visible immediately without reopening the window.
         refresh_settings_texts(cfg.display.language);
-        log_event("INFO", "settings applied");
+        log_event(
+            "INFO",
+            &format!(
+                "settings applied: interval={}ms language={:?} theme={:?} dual_row={} \
+                 show_resources={} show_network={} item_spacing={}px anchor={:?} \
+                 left_margin={}px prefix_cpu={:?} prefix_mem={:?} prefix_up={:?} \
+                 prefix_down={:?}",
+                cfg.sample.interval_ms,
+                cfg.display.language,
+                cfg.display.theme,
+                cfg.display.dual_row,
+                cfg.display.show_resources,
+                cfg.display.show_network,
+                cfg.display.item_spacing,
+                cfg.windows.anchor,
+                cfg.windows.left_margin_px,
+                cfg.display.prefix.cpu,
+                cfg.display.prefix.mem,
+                cfg.display.prefix.up,
+                cfg.display.prefix.down,
+            ),
+        );
     }
 
     unsafe extern "system" fn settings_wndproc(
@@ -1728,17 +1918,27 @@ mod win {
                 // Settings were applied: reposition and redraw at top level.
                 // This runs outside the settings dialog's WM_COMMAND handler,
                 // avoiding the reentrant-render crash.
+                log_event(
+                    "INFO",
+                    "WM_APP_APPLY received: repositioning and re-rendering",
+                );
                 reposition(hwnd);
                 sample_now(hwnd);
                 LRESULT(0)
             }
             WM_SETTINGCHANGE => {
                 // Theme flips arrive here; re-read the flag and repaint.
+                let old_light = LIGHT_THEME.load(Ordering::Relaxed);
                 refresh_theme();
+                let new_light = LIGHT_THEME.load(Ordering::Relaxed);
+                if old_light != new_light {
+                    log_event("INFO", &format!("theme changed: light={}", new_light == 1));
+                }
                 render_layered(hwnd);
                 LRESULT(0)
             }
             WM_DISPLAYCHANGE => {
+                log_event("INFO", "WM_DISPLAYCHANGE: display configuration changed");
                 reposition(hwnd);
                 LRESULT(0)
             }
@@ -1777,8 +1977,52 @@ mod win {
         }
     }
 
+    /// Install crash diagnostics: a Rust panic hook and a Win32 unhandled
+    /// exception filter. Both write the crash reason to the log file so a
+    /// silent process death becomes diagnosable. This is a GUI app
+    /// (`windows_subsystem = "windows"`), so without these hooks any panic or
+    /// access violation terminates the process with zero visible diagnostics.
+    fn install_crash_hooks() {
+        std::panic::set_hook(Box::new(|info| {
+            let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            let loc = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "unknown location".to_string());
+            log_event("FATAL", &format!("panic at {loc}: {msg}"));
+        }));
+        unsafe {
+            SetUnhandledExceptionFilter(Some(unhandled_exception_filter));
+        }
+    }
+
+    unsafe extern "system" fn unhandled_exception_filter(info: *const EXCEPTION_POINTERS) -> i32 {
+        let code = if !info.is_null() && !(*info).ExceptionRecord.is_null() {
+            (*(*info).ExceptionRecord).ExceptionCode.0 as u32
+        } else {
+            0
+        };
+        log_event(
+            "FATAL",
+            &format!("unhandled exception: 0x{code:08X} — process will terminate"),
+        );
+        // EXCEPTION_EXECUTE_HANDLER: let the OS terminate the process after
+        // our logging. We do not attempt recovery.
+        1
+    }
+
     pub fn run() {
         unsafe {
+            // Crash diagnostics first: any panic or access violation from here
+            // on is written to the log file before the process dies.
+            install_crash_hooks();
+
             // Single-instance guard: a named mutex ensures only one overlay
             // runs per session. A second launch exits immediately instead of
             // stacking a duplicate indicator on the taskbar.
@@ -1805,6 +2049,32 @@ mod win {
             // the launch. Logging failures never block the indicator.
             prune_old_logs();
             log_event("INFO", "SysVitals starting");
+            log_event(
+                "INFO",
+                &format!(
+                    "config loaded: interval={}ms language={:?} theme={:?} dual_row={} \
+                     show_resources={} show_network={} item_spacing={}px anchor={:?} \
+                     left_margin={}px",
+                    cfg.sample.interval_ms,
+                    cfg.display.language,
+                    cfg.display.theme,
+                    cfg.display.dual_row,
+                    cfg.display.show_resources,
+                    cfg.display.show_network,
+                    cfg.display.item_spacing,
+                    cfg.windows.anchor,
+                    cfg.windows.left_margin_px,
+                ),
+            );
+            let centered = win11_centered_taskbar();
+            log_event(
+                "INFO",
+                &format!(
+                    "environment: win11_centered_taskbar={} dpi={}",
+                    centered,
+                    GetDpiForSystem()
+                ),
+            );
 
             let hmodule = GetModuleHandleW(None).expect("module handle");
             let class_name = utf16("SysVitalsOverlay");

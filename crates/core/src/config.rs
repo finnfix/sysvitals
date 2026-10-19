@@ -26,6 +26,21 @@ pub const ALLOWED_INTERVAL_MS: [u64; 3] = [1000, 2000, 3000];
 /// Default sample interval: 2 seconds.
 pub const DEFAULT_INTERVAL_MS: u64 = 2000;
 
+/// Allowed item-spacing values in pixels for the single-row layout. The
+/// settings UI offers exactly these choices; any other value snaps to the
+/// nearest one.
+pub const ALLOWED_ITEM_SPACING_PX: [u32; 4] = [8, 12, 16, 24];
+
+/// Default item spacing: 16 px.
+pub const DEFAULT_ITEM_SPACING_PX: u32 = 16;
+
+/// Allowed left-margin values in pixels for the far-left anchor. The settings
+/// UI offers exactly these choices; any other value snaps to the nearest one.
+pub const ALLOWED_LEFT_MARGIN_PX: [u32; 6] = [8, 12, 16, 24, 48, 128];
+
+/// Default left margin: 16 px.
+pub const DEFAULT_LEFT_MARGIN_PX: u32 = 16;
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -57,8 +72,9 @@ pub struct DisplayConfig {
     /// config-only change. Anything other than `true` is ignored at format
     /// time; format always divides by 1024.
     pub binary_unit: bool,
-    /// Number of spaces between adjacent metrics on the single-row layout.
-    /// Clamped to [1, 8] by `sanitize`; default 2 matches the original look.
+    /// Horizontal gap between adjacent metrics on the single-row layout, in
+    /// pixels. One of [`ALLOWED_ITEM_SPACING_PX`]; anything else snaps to the
+    /// nearest allowed value via `sanitize`.
     pub item_spacing: u32,
     /// Dual-row (2x2 quadrant) layout. Cross-platform: Windows renders it in
     /// the taskbar overlay; macOS will render it in the menu bar (Phase 4).
@@ -105,7 +121,9 @@ pub struct WindowsConfig {
     /// Dual-row scales the system font (≈0.75) automatically instead.
     pub font_size_override: Option<f32>,
     /// Extra gap (pixels) between the taskbar's left edge and the indicator
-    /// when the far-left anchor is active. Default 4.
+    /// when the far-left anchor is active. One of [`ALLOWED_LEFT_MARGIN_PX`];
+    /// anything else snaps to the nearest allowed value via `sanitize`.
+    /// Default 16.
     pub left_margin_px: u32,
 }
 
@@ -141,7 +159,7 @@ impl Default for DisplayConfig {
             show_network: true,
             theme: Theme::Auto,
             binary_unit: true,
-            item_spacing: 2,
+            item_spacing: DEFAULT_ITEM_SPACING_PX,
             dual_row: false,
             prefix: PrefixConfig::default(),
         }
@@ -189,7 +207,7 @@ impl Default for WindowsConfig {
             row_spacing: 1,
             auto_start: true,
             font_size_override: None,
-            left_margin_px: 4,
+            left_margin_px: DEFAULT_LEFT_MARGIN_PX,
         }
     }
 }
@@ -239,12 +257,12 @@ impl Config {
             });
         }
 
-        if !(1..=8).contains(&self.display.item_spacing) {
+        if !ALLOWED_ITEM_SPACING_PX.contains(&self.display.item_spacing) {
             let old = self.display.item_spacing;
-            self.display.item_spacing = old.clamp(1, 8);
+            self.display.item_spacing = snap_u32(old, &ALLOWED_ITEM_SPACING_PX);
             issues.push(SanitizeIssue {
                 field: "display.item_spacing",
-                message: format!("clamped to [1,8] (was {old})"),
+                message: format!("snapped to nearest allowed value (was {old})"),
             });
         }
 
@@ -270,12 +288,12 @@ impl Config {
         if self.windows.row_spacing > 8 {
             self.windows.row_spacing = 8;
         }
-        if self.windows.left_margin_px > 64 {
+        if !ALLOWED_LEFT_MARGIN_PX.contains(&self.windows.left_margin_px) {
             let old = self.windows.left_margin_px;
-            self.windows.left_margin_px = 64;
+            self.windows.left_margin_px = snap_u32(old, &ALLOWED_LEFT_MARGIN_PX);
             issues.push(SanitizeIssue {
                 field: "windows.left_margin_px",
-                message: format!("clamped to [0,64] (was {old})"),
+                message: format!("snapped to nearest allowed value (was {old})"),
             });
         }
         // At least one metric group must stay visible: if both toggles are
@@ -355,6 +373,15 @@ fn snap_interval(value: u64, issues: &mut Vec<SanitizeIssue>) -> u64 {
         });
         snapped
     }
+}
+
+/// Snap an out-of-set `u32` value to the nearest entry of `allowed`. The
+/// caller guarantees `allowed` is non-empty.
+fn snap_u32(value: u32, allowed: &[u32]) -> u32 {
+    *allowed
+        .iter()
+        .min_by_key(|x| x.abs_diff(value))
+        .expect("allowed must be non-empty")
 }
 
 /// Trim outer whitespace, drop control chars, cap to MAX_PREFIX_CHARS.
@@ -439,6 +466,8 @@ mod tests {
         assert_eq!(c.windows.anchor, Anchor::Right);
         assert!(!c.display.dual_row);
         assert_eq!(c.history.retention_days, 30);
+        assert_eq!(c.display.item_spacing, DEFAULT_ITEM_SPACING_PX);
+        assert_eq!(c.windows.left_margin_px, DEFAULT_LEFT_MARGIN_PX);
     }
 
     #[test]
@@ -519,6 +548,66 @@ mod tests {
         let issues = c.sanitize();
         assert_eq!(c.sample.cpu_smoothing, 1.0);
         assert!(issues.iter().any(|i| i.field == "sample.cpu_smoothing"));
+    }
+
+    #[test]
+    fn item_spacing_snaps_to_allowed_set() {
+        // Allowed values pass through untouched.
+        for v in ALLOWED_ITEM_SPACING_PX {
+            let mut c = Config::default();
+            c.display.item_spacing = v;
+            let issues = c.sanitize();
+            assert_eq!(c.display.item_spacing, v);
+            assert!(issues.iter().all(|i| i.field != "display.item_spacing"));
+        }
+        // Out-of-set values snap to the nearest allowed entry.
+        let mut low = Config::default();
+        low.display.item_spacing = 1;
+        let issues = low.sanitize();
+        assert_eq!(low.display.item_spacing, 8);
+        assert!(issues.iter().any(|i| i.field == "display.item_spacing"));
+
+        let mut high = Config::default();
+        high.display.item_spacing = 20;
+        high.sanitize();
+        // 20 is equidistant from 16 and 24; the tie resolves to the first
+        // (smaller) allowed value.
+        assert_eq!(high.display.item_spacing, 16);
+
+        // Values above the max snap down to the max allowed entry.
+        let mut above = Config::default();
+        above.display.item_spacing = 100;
+        above.sanitize();
+        assert_eq!(above.display.item_spacing, 24);
+
+        // Legacy space-count values from old configs snap sensibly.
+        let mut legacy = Config::default();
+        legacy.display.item_spacing = 2;
+        legacy.sanitize();
+        assert_eq!(legacy.display.item_spacing, 8);
+    }
+
+    #[test]
+    fn left_margin_snaps_to_allowed_set() {
+        for v in ALLOWED_LEFT_MARGIN_PX {
+            let mut c = Config::default();
+            c.windows.left_margin_px = v;
+            let issues = c.sanitize();
+            assert_eq!(c.windows.left_margin_px, v);
+            assert!(issues.iter().all(|i| i.field != "windows.left_margin_px"));
+        }
+        // 4 (the old default) snaps to the nearest allowed value, 8.
+        let mut c = Config::default();
+        c.windows.left_margin_px = 4;
+        let issues = c.sanitize();
+        assert_eq!(c.windows.left_margin_px, 8);
+        assert!(issues.iter().any(|i| i.field == "windows.left_margin_px"));
+
+        // Large values snap down to the max allowed entry.
+        let mut big = Config::default();
+        big.windows.left_margin_px = 500;
+        big.sanitize();
+        assert_eq!(big.windows.left_margin_px, 128);
     }
 
     #[test]

@@ -155,6 +155,11 @@ impl Line {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormattedRow {
     pub lines: Vec<Line>,
+    /// Individual metric strings for the single-row layout. When non-empty the
+    /// display layer lays these out with a pixel gap (`item_spacing`) instead
+    /// of using the pre-joined text in `lines[0]`. Empty for dual-row and
+    /// vertical layouts where the column/line structure handles spacing.
+    pub items: Vec<String>,
 }
 
 impl FormattedRow {
@@ -272,6 +277,7 @@ pub fn format_frame(snapshot: &Snapshot, cfg: &Config) -> FormattedRow {
                     Line::single(cell_at(cells, 0, w)),
                     Line::single(cell_at(cells, 1, w)),
                 ],
+                items: Vec::new(),
             };
         }
 
@@ -292,18 +298,23 @@ pub fn format_frame(snapshot: &Snapshot, cfg: &Config) -> FormattedRow {
                     right: row1_right,
                 },
             ],
+            items: Vec::new(),
         }
     } else {
-        // Single row: all enabled metrics, joined by the configured number of
-        // spaces (default 2).
-        let sep = " ".repeat(cfg.display.item_spacing.max(1) as usize);
-        let text = enabled
+        // Single row: all enabled metrics. The display layer lays these out
+        // with a pixel gap (`item_spacing`), so we expose the individual items
+        // and also keep a space-joined fallback in `lines[0]` for consumers
+        // that only want a single string (e.g. the terminal example).
+        let items: Vec<String> = enabled
             .iter()
             .map(|m| join_prefix(prefix_for(*m, cfg), &format_value(*m, snapshot)))
-            .collect::<Vec<_>>()
-            .join(&sep);
+            .collect();
+        // Space-joined fallback for string-only consumers (terminal example).
+        // The display layer ignores this and uses `items` with a pixel gap.
+        let text = items.join("  ");
         FormattedRow {
             lines: vec![Line::single(text)],
+            items,
         }
     }
 }
@@ -329,7 +340,12 @@ pub fn format_frame_vertical(snapshot: &Snapshot, cfg: &Config) -> FormattedRow 
             ))
         })
         .collect();
-    FormattedRow { lines }
+    // Vertical layout stacks one metric per line; pixel item spacing does not
+    // apply, so `items` stays empty.
+    FormattedRow {
+        lines,
+        items: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -406,17 +422,33 @@ mod tests {
     }
 
     #[test]
-    fn single_row_item_spacing_is_configurable() {
-        // Wider spacing joins metrics with more spaces; the default of 2 keeps
-        // the original two-space look.
-        let mut cfg = Config::default();
-        cfg.display.item_spacing = 4;
+    fn single_row_exposes_items_for_pixel_spacing() {
+        // Item spacing is now a pixel value applied by the display layer, so
+        // the core exposes the individual metric strings (`items`) for the
+        // single-row layout instead of baking a space count into the text.
+        let cfg = Config::default();
         let f = format_frame(&snap(29.0, 68.0, 1024.0, 2048.0), &cfg);
-        assert_eq!(f.lines.len(), 1);
         assert_eq!(
-            f.lines[0].render(),
-            "CPU: 29%    MEM: 68%    U: 1.00 K/s    D: 2.00 K/s"
+            f.items,
+            vec!["CPU: 29%", "MEM: 68%", "U: 1.00 K/s", "D: 2.00 K/s"]
         );
+        // The fallback joined string is stable regardless of item_spacing.
+        let mut cfg2 = Config::default();
+        cfg2.display.item_spacing = 24;
+        let f2 = format_frame(&snap(29.0, 68.0, 1024.0, 2048.0), &cfg2);
+        assert_eq!(f2.items, f.items);
+        assert_eq!(f2.lines[0].render(), f.lines[0].render());
+    }
+
+    #[test]
+    fn dual_row_has_no_items() {
+        // Dual-row layout relies on column structure, not pixel item spacing,
+        // so `items` stays empty there.
+        let mut cfg = Config::default();
+        cfg.display.dual_row = true;
+        let f = format_frame(&snap(29.0, 68.0, 1024.0, 2048.0), &cfg);
+        assert!(f.items.is_empty());
+        assert_eq!(f.lines.len(), 2);
     }
 
     #[test]
