@@ -55,6 +55,10 @@ sysvitals-core = { path = "crates/core" }
 # Pinned to the exact version; GPUI is pre-1.0 and moves fast.
 gpui-kit = "=0.7.3"
 
+# Local-time formatting for history chart labels and clipboard rows. Only the
+# `clock`+`std` subset is enabled (no parsing, locales, or serde).
+chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
+
 # Profiles: GPUI-heavy stacks run poorly in a pure debug build, and the
 # sampler must stay cheap. Keep dev optimized enough to be representative.
 [profile.dev]

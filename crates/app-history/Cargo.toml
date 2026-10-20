@@ -15,6 +15,7 @@ publish.workspace = true
 sysvitals-core = { workspace = true }
 gpui-kit = { workspace = true }
 arboard = "=3.7.0"
+chrono = { workspace = true }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "=0.1.12"

@@ -11,6 +11,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Local};
 use gpui_kit::component::button::*;
 use gpui_kit::component::chart::LineChart;
 use gpui_kit::component::*;
@@ -170,36 +171,23 @@ impl HistoryView {
     }
 }
 
-/// Format a unix timestamp as HH:MM for chart labels.
+/// Format a unix timestamp as HH:MM in the machine's local time zone.
 fn format_ts(ts: i64) -> String {
-    let secs = ts % 86400;
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    format!("{:02}:{:02}", h, m)
+    DateTime::from_timestamp(ts, 0)
+        .map(|dt| dt.with_timezone(&Local).format("%H:%M").to_string())
+        .unwrap_or_default()
 }
 
-/// Format a unix timestamp as YYYY-MM-DD HH:MM:SS for CSV.
+/// Format a unix timestamp as YYYY-MM-DD HH:MM:SS in the machine's local
+/// time zone, so exported rows line up with the user's wall clock.
 fn format_ts_full(ts: i64) -> String {
-    // Simple UTC-based formatting (local time offset not applied for simplicity).
-    let days = ts / 86400;
-    let secs = ts % 86400;
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-
-    // Days since epoch to Y-M-D (civil calendar algorithm).
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if mo <= 2 { y + 1 } else { y };
-
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, m, s)
+    DateTime::from_timestamp(ts, 0)
+        .map(|dt| {
+            dt.with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 impl Render for HistoryView {
