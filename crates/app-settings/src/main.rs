@@ -19,7 +19,7 @@ use gpui_kit::*;
 use sysvitals_core::config::{
     ALLOWED_INTERVAL_MS, ALLOWED_ITEM_SPACING_PX, ALLOWED_LEFT_MARGIN_PX,
 };
-use sysvitals_core::{Config, Language, Theme};
+use sysvitals_core::{t, Config, Language, Theme};
 
 // ---------------------------------------------------------------------------
 // State
@@ -94,27 +94,24 @@ impl SettingsView {
         }
     }
 
-    fn lang_label(&self) -> &'static str {
-        Language::ALL[self.lang_idx].label()
+    fn current_lang(&self) -> Language {
+        Language::ALL[self.lang_idx]
     }
 
-    fn interval_label(&self) -> String {
-        format!("{} s", ALLOWED_INTERVAL_MS[self.interval_idx] / 1000)
+    /// Enforce "at least one indicator group stays on": when the user turns
+    /// off the last remaining group, re-enable the other one instead, so the
+    /// indicator is never left with nothing to show.
+    fn set_resources(&mut self, checked: bool) {
+        self.show_resources = checked;
+        if !self.show_resources && !self.show_network {
+            self.show_network = true;
+        }
     }
 
-    fn spacing_label(&self) -> String {
-        format!("{} px", ALLOWED_ITEM_SPACING_PX[self.spacing_idx])
-    }
-
-    fn margin_label(&self) -> String {
-        format!("{} px", ALLOWED_LEFT_MARGIN_PX[self.margin_idx])
-    }
-
-    fn theme_label(&self) -> &'static str {
-        match self.theme_idx {
-            1 => "Light",
-            2 => "Dark",
-            _ => "Follow system",
+    fn set_network(&mut self, checked: bool) {
+        self.show_network = checked;
+        if !self.show_network && !self.show_resources {
+            self.show_resources = true;
         }
     }
 
@@ -148,37 +145,16 @@ impl SettingsView {
     }
 }
 
-/// A row with a label on the left and a cycle-button control on the right.
-/// Generic over the click handler types so each call site can pass its own
-/// `cx.listener()` closure without type unification conflicts.
-fn cycle_row<F1, F2>(label: &str, value: String, on_prev: F1, on_next: F2) -> impl IntoElement
-where
-    F1: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    F2: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-{
+/// A labelled control row: title on the left, a wrapped tile group on the
+/// right.
+fn labeled_row(title: String, control: impl IntoElement) -> impl IntoElement {
     h_flex()
         .justify_between()
-        .items_center()
+        .items_start()
+        .gap_4()
         .py_1()
-        .child(label.to_string())
-        .child(
-            h_flex()
-                .gap_1()
-                .items_center()
-                .child(
-                    Button::new(format!("prev-{label}"))
-                        .small()
-                        .child("<")
-                        .on_click(on_prev),
-                )
-                .child(div().min_w(px(100.)).text_center().child(value))
-                .child(
-                    Button::new(format!("next-{label}"))
-                        .small()
-                        .child(">")
-                        .on_click(on_next),
-                ),
-        )
+        .child(title)
+        .child(control)
 }
 
 impl Render for SettingsView {
@@ -190,6 +166,129 @@ impl Render for SettingsView {
                 .text_color(cx.theme().foreground.opacity(0.5))
                 .child(text.to_string())
         };
+        let divider = div().h(px(1.)).bg(cx.theme().border).my_1();
+
+        // Every label comes from the core i18n table, keyed on the
+        // *currently selected* language, so switching language repaints the
+        // whole window immediately instead of only after saving.
+        let lang = self.current_lang();
+
+        // --- Flattened (segmented) option rows: every choice is a visible
+        // tile, the active one carries the primary style. Clicking a tile
+        // selects it directly; no previous/next cycling.
+        let mut lang_row = h_flex().gap_1().flex_wrap();
+        for i in 0..Language::ALL.len() {
+            let active = i == self.lang_idx;
+            lang_row = lang_row.child(
+                Button::new(format!("lang-{i}"))
+                    .small()
+                    .when(active, |b| b.primary())
+                    .label(Language::ALL[i].label().to_string())
+                    .on_click(cx.listener(
+                        move |this: &mut Self,
+                              _: &ClickEvent,
+                              _: &mut Window,
+                              cx: &mut Context<Self>| {
+                            this.lang_idx = i;
+                            cx.notify();
+                        },
+                    )),
+            );
+        }
+
+        let mut interval_row = h_flex().gap_1().flex_wrap();
+        for i in 0..ALLOWED_INTERVAL_MS.len() {
+            let active = i == self.interval_idx;
+            let secs = ALLOWED_INTERVAL_MS[i] / 1000;
+            let text = format!("{secs} {}", t(lang, "settings.unit_seconds"));
+            interval_row = interval_row.child(
+                Button::new(format!("interval-{i}"))
+                    .small()
+                    .when(active, |b| b.primary())
+                    .label(text)
+                    .on_click(cx.listener(
+                        move |this: &mut Self,
+                              _: &ClickEvent,
+                              _: &mut Window,
+                              cx: &mut Context<Self>| {
+                            this.interval_idx = i;
+                            cx.notify();
+                        },
+                    )),
+            );
+        }
+
+        const THEME_KEYS: [&str; 3] = ["theme.auto", "theme.light", "theme.dark"];
+        let mut theme_row = h_flex().gap_1().flex_wrap();
+        for i in 0..THEME_KEYS.len() {
+            let active = i == self.theme_idx;
+            let text = t(lang, THEME_KEYS[i]).to_string();
+            theme_row = theme_row.child(
+                Button::new(format!("theme-{i}"))
+                    .small()
+                    .when(active, |b| b.primary())
+                    .label(text)
+                    .on_click(cx.listener(
+                        move |this: &mut Self,
+                              _: &ClickEvent,
+                              _: &mut Window,
+                              cx: &mut Context<Self>| {
+                            this.theme_idx = i;
+                            cx.notify();
+                        },
+                    )),
+            );
+        }
+
+        let mut spacing_row = h_flex().gap_1().flex_wrap();
+        for i in 0..ALLOWED_ITEM_SPACING_PX.len() {
+            let active = i == self.spacing_idx;
+            let text = format!(
+                "{} {}",
+                ALLOWED_ITEM_SPACING_PX[i],
+                t(lang, "settings.unit_pixels")
+            );
+            spacing_row = spacing_row.child(
+                Button::new(format!("spacing-{i}"))
+                    .small()
+                    .when(active, |b| b.primary())
+                    .label(text)
+                    .on_click(cx.listener(
+                        move |this: &mut Self,
+                              _: &ClickEvent,
+                              _: &mut Window,
+                              cx: &mut Context<Self>| {
+                            this.spacing_idx = i;
+                            cx.notify();
+                        },
+                    )),
+            );
+        }
+
+        let mut margin_row = h_flex().gap_1().flex_wrap();
+        for i in 0..ALLOWED_LEFT_MARGIN_PX.len() {
+            let active = i == self.margin_idx;
+            let text = format!(
+                "{} {}",
+                ALLOWED_LEFT_MARGIN_PX[i],
+                t(lang, "settings.unit_pixels")
+            );
+            margin_row = margin_row.child(
+                Button::new(format!("margin-{i}"))
+                    .small()
+                    .when(active, |b| b.primary())
+                    .label(text)
+                    .on_click(cx.listener(
+                        move |this: &mut Self,
+                              _: &ClickEvent,
+                              _: &mut Window,
+                              cx: &mut Context<Self>| {
+                            this.margin_idx = i;
+                            cx.notify();
+                        },
+                    )),
+            );
+        }
 
         v_flex()
             .size_full()
@@ -197,66 +296,28 @@ impl Render for SettingsView {
             .gap_2()
             .overflow_y_scrollbar()
             // --- General ---
-            .child(section_label("General"))
-            .child(cycle_row(
-                "Language",
-                self.lang_label().to_string(),
-                cx.listener(
-                    |this: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
-                        this.lang_idx =
-                            (this.lang_idx + Language::ALL.len() - 1) % Language::ALL.len();
-                        cx.notify();
-                    },
-                ),
-                cx.listener(
-                    |this: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
-                        this.lang_idx = (this.lang_idx + 1) % Language::ALL.len();
-                        cx.notify();
-                    },
-                ),
+            .child(section_label(t(lang, "settings.general")))
+            .child(labeled_row(
+                t(lang, "settings.language").to_string(),
+                lang_row,
             ))
-            .child(cycle_row(
-                "Sample interval",
-                self.interval_label(),
-                cx.listener(
-                    |this: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
-                        this.interval_idx = (this.interval_idx + ALLOWED_INTERVAL_MS.len() - 1)
-                            % ALLOWED_INTERVAL_MS.len();
-                        cx.notify();
-                    },
-                ),
-                cx.listener(
-                    |this: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
-                        this.interval_idx = (this.interval_idx + 1) % ALLOWED_INTERVAL_MS.len();
-                        cx.notify();
-                    },
-                ),
+            .child(labeled_row(
+                t(lang, "settings.sample_interval").to_string(),
+                interval_row,
             ))
-            .child(cycle_row(
-                "Theme",
-                self.theme_label().to_string(),
-                cx.listener(
-                    |this: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
-                        this.theme_idx = (this.theme_idx + 2) % 3;
-                        cx.notify();
-                    },
-                ),
-                cx.listener(
-                    |this: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
-                        this.theme_idx = (this.theme_idx + 1) % 3;
-                        cx.notify();
-                    },
-                ),
+            .child(labeled_row(
+                t(lang, "settings.theme").to_string(),
+                theme_row,
             ))
-            .child(div().h(px(1.)).bg(cx.theme().border).my_1())
             // --- Display ---
-            .child(section_label("Display"))
+            .child(divider)
+            .child(section_label(t(lang, "settings.display")))
             .child(
                 h_flex()
                     .justify_between()
                     .items_center()
                     .py_1()
-                    .child("Dual-row layout (Windows)")
+                    .child(t(lang, "settings.dual_row").to_string())
                     .child(
                         Switch::new("dual-row")
                             .checked(self.dual_row)
@@ -271,12 +332,12 @@ impl Render for SettingsView {
                     .justify_between()
                     .items_center()
                     .py_1()
-                    .child("CPU / MEM")
+                    .child(t(lang, "settings.group_resources").to_string())
                     .child(
                         Switch::new("show-res")
                             .checked(self.show_resources)
                             .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                this.show_resources = *checked;
+                                this.set_resources(*checked);
                                 cx.notify();
                             })),
                     ),
@@ -286,60 +347,34 @@ impl Render for SettingsView {
                     .justify_between()
                     .items_center()
                     .py_1()
-                    .child("Upload / Download")
+                    .child(t(lang, "settings.group_network").to_string())
                     .child(Switch::new("show-net").checked(self.show_network).on_click(
                         cx.listener(|this, checked: &bool, _, cx| {
-                            this.show_network = *checked;
+                            this.set_network(*checked);
                             cx.notify();
                         }),
                     )),
             )
-            .child(cycle_row(
-                "Item spacing",
-                self.spacing_label(),
-                cx.listener(
-                    |this: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
-                        this.spacing_idx = (this.spacing_idx + ALLOWED_ITEM_SPACING_PX.len() - 1)
-                            % ALLOWED_ITEM_SPACING_PX.len();
-                        cx.notify();
-                    },
-                ),
-                cx.listener(
-                    |this: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
-                        this.spacing_idx = (this.spacing_idx + 1) % ALLOWED_ITEM_SPACING_PX.len();
-                        cx.notify();
-                    },
-                ),
+            .child(labeled_row(
+                t(lang, "settings.item_spacing").to_string(),
+                spacing_row,
             ))
+            // --- Layout (Windows) ---
             .child(div().h(px(1.)).bg(cx.theme().border).my_1())
-            // --- Layout ---
-            .child(section_label("Layout (Windows)"))
-            .child(cycle_row(
-                "Left margin",
-                self.margin_label(),
-                cx.listener(
-                    |this: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
-                        this.margin_idx = (this.margin_idx + ALLOWED_LEFT_MARGIN_PX.len() - 1)
-                            % ALLOWED_LEFT_MARGIN_PX.len();
-                        cx.notify();
-                    },
-                ),
-                cx.listener(
-                    |this: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
-                        this.margin_idx = (this.margin_idx + 1) % ALLOWED_LEFT_MARGIN_PX.len();
-                        cx.notify();
-                    },
-                ),
+            .child(section_label(t(lang, "settings.layout")))
+            .child(labeled_row(
+                t(lang, "settings.left_margin").to_string(),
+                margin_row,
             ))
-            .child(div().h(px(1.)).bg(cx.theme().border).my_1())
             // --- Prefixes ---
-            .child(section_label("Prefixes"))
+            .child(div().h(px(1.)).bg(cx.theme().border).my_1())
+            .child(section_label(t(lang, "settings.prefixes")))
             .child(
                 h_flex()
                     .justify_between()
                     .items_center()
                     .py_1()
-                    .child("CPU")
+                    .child(t(lang, "settings.cpu").to_string())
                     .child(Input::new(&self.prefix_cpu).w(px(180.))),
             )
             .child(
@@ -347,7 +382,7 @@ impl Render for SettingsView {
                     .justify_between()
                     .items_center()
                     .py_1()
-                    .child("MEM")
+                    .child(t(lang, "settings.mem").to_string())
                     .child(Input::new(&self.prefix_mem).w(px(180.))),
             )
             .child(
@@ -355,7 +390,7 @@ impl Render for SettingsView {
                     .justify_between()
                     .items_center()
                     .py_1()
-                    .child("Upload")
+                    .child(t(lang, "settings.upload").to_string())
                     .child(Input::new(&self.prefix_up).w(px(180.))),
             )
             .child(
@@ -363,14 +398,14 @@ impl Render for SettingsView {
                     .justify_between()
                     .items_center()
                     .py_1()
-                    .child("Download")
+                    .child(t(lang, "settings.download").to_string())
                     .child(Input::new(&self.prefix_down).w(px(180.))),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().foreground.opacity(0.4))
-                    .child("Independent of language; up to 8 characters."),
+                    .child(t(lang, "settings.prefix_hint").to_string()),
             )
             // --- Buttons ---
             .child(div().flex_1())
@@ -379,26 +414,30 @@ impl Render for SettingsView {
                     .justify_end()
                     .gap_2()
                     .pt_2()
-                    .child(Button::new("apply").label("Apply").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.save(cx);
-                            cx.notify();
-                        },
-                    )))
+                    .child(
+                        Button::new("apply")
+                            .label(t(lang, "settings.apply").to_string())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.save(cx);
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         Button::new("ok")
                             .primary()
-                            .label("OK")
+                            .label(t(lang, "settings.ok").to_string())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.save(cx);
                                 window.remove_window();
                             })),
                     )
-                    .child(Button::new("cancel").label("Cancel").on_click(cx.listener(
-                        |_, _, window, _| {
-                            window.remove_window();
-                        },
-                    ))),
+                    .child(
+                        Button::new("cancel")
+                            .label(t(lang, "settings.cancel").to_string())
+                            .on_click(cx.listener(|_, _, window, _| {
+                                window.remove_window();
+                            })),
+                    ),
             )
     }
 }
