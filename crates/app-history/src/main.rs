@@ -228,6 +228,13 @@ impl HistoryView {
         if self._activation.is_some() {
             return;
         }
+        // The observer only sees activation *changes*: a window created with
+        // `focus: true` is already active when the first render registers it,
+        // and that edge is not replayed. Seed the guard from the current
+        // state, otherwise the first click-away would not close the popup.
+        if window.is_window_active() {
+            self.ever_active = true;
+        }
         let subscription = cx.observe_window_activation(window, |view, window, _| {
             if window.is_window_active() {
                 view.ever_active = true;
