@@ -16,6 +16,9 @@ publish.workspace = true
 sysvitals-core = { workspace = true }
 gpui-kit = { workspace = true }
 
+[target.'cfg(windows)'.build-dependencies]
+winres = "=0.1.12"
+
 [[bin]]
 name = "SysVitalsSettings"
 path = "src/main.rs"

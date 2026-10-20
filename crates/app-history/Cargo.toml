@@ -16,6 +16,9 @@ sysvitals-core = { workspace = true }
 gpui-kit = { workspace = true }
 arboard = "=3.7.0"
 
+[target.'cfg(windows)'.build-dependencies]
+winres = "=0.1.12"
+
 [[bin]]
 name = "SysVitalsHistory"
 path = "src/main.rs"
