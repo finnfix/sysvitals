@@ -275,7 +275,10 @@ mod macos {
     impl ActionHandler {
         fn new(mtm: MainThreadMarker) -> Retained<Self> {
             let this = Self::alloc(mtm);
-            unsafe { msg_send![super(this), init] }
+            // ActionHandler does not override init, so calling it directly
+            // dispatches to NSObject's init. Avoids the super() wrapper which
+            // triggers RetainSemantics issues with Allocated<T> in objc2 0.6.5.
+            unsafe { msg_send![this, init] }
         }
     }
 
