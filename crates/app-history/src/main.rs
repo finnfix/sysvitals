@@ -4,6 +4,11 @@
 //! Shows CPU and memory usage over time as line charts, with a time
 //! range selector and a Copy CSV button. Closes on Esc or window blur.
 
+// A GUI child process must not allocate a console window on Windows: without
+// this attribute the binary is built as a console subsystem executable and a
+// terminal flashes up beside the history window every time it launches.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::component::button::*;

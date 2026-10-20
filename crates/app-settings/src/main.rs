@@ -4,6 +4,11 @@
 //! settings. Reads the shared config, presents a modern grouped UI, and writes
 //! changes back atomically. The overlay watches the config file and reloads.
 
+// A GUI child process must not allocate a console window on Windows: without
+// this attribute the binary is built as a console subsystem executable and a
+// terminal flashes up beside the settings window every time it launches.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use gpui_kit::component::button::*;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
