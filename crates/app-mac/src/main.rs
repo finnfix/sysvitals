@@ -119,6 +119,22 @@ mod macos {
             .map(|p| p.to_path_buf())
     }
 
+    /// Path to relaunch this program as: the enclosing `.app` bundle when
+    /// running from one, otherwise the executable itself.
+    ///
+    /// `open` resolves a bundle path through LaunchServices, which applies the
+    /// bundle's Info.plist (notably `LSUIElement`) and reuses the registered
+    /// application identity. Handing it the raw binary inside
+    /// `Contents/MacOS/` instead bypasses that registration, so the relaunched
+    /// process may not be treated as the same app.
+    fn relaunch_target() -> Option<std::path::PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let bundle = exe
+            .ancestors()
+            .find(|p| p.extension() == Some(std::ffi::OsStr::new("app")))?;
+        Some(bundle.to_path_buf())
+    }
+
     /// Launch the external GPUI settings process (`SysVitalsSettings`).
     fn launch_settings() {
         let Some(dir) = exe_dir() else {
@@ -152,14 +168,16 @@ mod macos {
 
     /// Restart: schedule a delayed relaunch, then exit.
     fn restart_self() {
-        let Some(exe) = std::env::current_exe().ok() else {
+        // Prefer the enclosing .app bundle; fall back to the bare executable
+        // when running unpackaged (e.g. straight from target/release).
+        let Some(target) = relaunch_target().or_else(|| std::env::current_exe().ok()) else {
             return;
         };
-        let exe_str = exe.to_string_lossy().to_string();
+        let target_str = target.to_string_lossy().to_string();
         // Use a background shell that waits 2 seconds then relaunches.
         let _ = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(format!("sleep 2 && open '{}'", exe_str))
+            .arg(format!("sleep 2 && open '{}'", target_str))
             .spawn();
         // Exit current instance.
         let mtm = mtm();

@@ -403,7 +403,25 @@ fn main() {
         .and_then(|p| Config::load(&p).map(|(c, _)| c))
         .unwrap_or_default();
 
-    gpui_kit::application().run(move |cx| {
+    // macOS: this process is a transient panel of a menu-bar utility, so it
+    // must not own foreground application UI (a Dock icon and a menu bar named
+    // after the process). Requesting the headless windowing mode maps to the
+    // AppKit accessory activation policy before the run loop starts, which
+    // still opens windows normally. The default quit mode on macOS is explicit
+    // (the process survives its last window), which would leave an invisible
+    // accessory process running after the user closes this window, so the
+    // process is asked to quit with its last window instead.
+    //
+    // Windows has no equivalent: a headless windowing request there refuses to
+    // open windows, so the default windowed startup is left untouched there.
+    #[cfg(target_os = "macos")]
+    let app = gpui_kit::application()
+        .with_windowing(WindowingRequest::Headless)
+        .with_quit_mode(QuitMode::LastWindowClosed);
+    #[cfg(not(target_os = "macos"))]
+    let app = gpui_kit::application();
+
+    app.run(move |cx| {
         gpui_kit::init(cx);
 
         let window_options = WindowOptions {
