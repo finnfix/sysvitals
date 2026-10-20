@@ -19,7 +19,7 @@ use gpui_kit::*;
 use sysvitals_core::config::{
     ALLOWED_INTERVAL_MS, ALLOWED_ITEM_SPACING_PX, ALLOWED_LEFT_MARGIN_PX,
 };
-use sysvitals_core::{t, Config, Language, Theme};
+use sysvitals_core::{Config, Language, Theme, t};
 
 // ---------------------------------------------------------------------------
 // State

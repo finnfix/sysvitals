@@ -190,7 +190,10 @@ mod macos {
     /// Launch the external GPUI settings process (`SysVitalsSettings`), one
     /// live instance at a time.
     fn launch_settings() {
-        if child_alive(&SETTINGS_CHILD) {
+        // `thread_local!` statics expose a `LocalKey`; reach the cell through
+        // `with`, and re-entrancy (`child_alive` borrows it) must not nest, so
+        // query liveness first, then spawn, then store.
+        if SETTINGS_CHILD.with(|slot| child_alive(slot)) {
             return;
         }
         let Some(dir) = exe_dir() else {
@@ -201,7 +204,7 @@ mod macos {
             return;
         }
         if let Ok(child) = std::process::Command::new(settings).spawn() {
-            *SETTINGS_CHILD.borrow_mut() = Some(child);
+            SETTINGS_CHILD.with(|slot| *slot.borrow_mut() = Some(child));
         }
     }
 
@@ -209,7 +212,7 @@ mod macos {
     /// the indicator's screen rect so the popup can anchor to it. One live
     /// instance at a time.
     fn launch_history() {
-        if child_alive(&HISTORY_CHILD) {
+        if HISTORY_CHILD.with(|slot| child_alive(slot)) {
             return;
         }
         let Some(dir) = exe_dir() else {
@@ -221,10 +224,16 @@ mod macos {
         }
         let mut cmd = std::process::Command::new(history);
         if let Some((l, t, r, b)) = anchor_rect() {
-            cmd.args(["--anchor", &l.to_string(), &t.to_string(), &r.to_string(), &b.to_string()]);
+            cmd.args([
+                "--anchor",
+                &l.to_string(),
+                &t.to_string(),
+                &r.to_string(),
+                &b.to_string(),
+            ]);
         }
         if let Ok(child) = cmd.spawn() {
-            *HISTORY_CHILD.borrow_mut() = Some(child);
+            HISTORY_CHILD.with(|slot| *slot.borrow_mut() = Some(child));
         }
     }
 
@@ -250,7 +259,11 @@ mod macos {
     fn schedule_single_click() {
         let delay = {
             let d = NSEvent::doubleClickInterval();
-            if d <= 0.0 { 0.1 } else { d as f64 }
+            if d <= 0.0 {
+                0.1
+            } else {
+                d as f64
+            }
         };
         cancel_pending_single_click();
         let block = block2::RcBlock::new(|_timer: std::ptr::NonNull<NSTimer>| {
@@ -261,9 +274,8 @@ mod macos {
         });
         // SAFETY: the block captures nothing non-Send and the timer fires on
         // the main run loop.
-        let timer = unsafe {
-            NSTimer::scheduledTimerWithTimeInterval_repeats_block(delay, false, &block)
-        };
+        let timer =
+            unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(delay, false, &block) };
         PENDING_SINGLE_CLICK.with(|p| {
             *p.borrow_mut() = Some(timer);
         });

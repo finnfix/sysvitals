@@ -71,7 +71,7 @@ mod win {
     };
     use windows::Win32::System::SystemInformation::GetLocalTime;
     use windows::Win32::System::Threading::CreateMutexW;
-    use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    use windows::Win32::System::Threading::WaitForSingleObject;
     use windows::Win32::UI::HiDpi::{
         GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -1091,14 +1091,17 @@ mod win {
 
     /// Launch the external settings process (`SysVitalsSettings.exe`).
     fn launch_settings() {
-        launch_child("SysVitalsSettings.exe", None, &SETTINGS_PROCESS);
+        // `thread_local!` statics expose a `LocalKey`; the cell itself is
+        // reached through `with`, not by borrowing the static.
+        SETTINGS_PROCESS.with(|slot| launch_child("SysVitalsSettings.exe", None, slot));
     }
 
     /// Launch the external history chart process (`SysVitalsHistory.exe`),
     /// passing the indicator's screen rectangle so the popup can anchor to it.
     fn launch_history(hwnd: HWND) {
-        let args = match unsafe { GetWindowRect(hwnd) } {
-            Ok(r) => {
+        let mut rect = RECT::default();
+        let args = match unsafe { GetWindowRect(hwnd, &mut rect) } {
+            Ok(()) => {
                 // `GetWindowRect` reports physical pixels; the child process
                 // lays its window out in GPUI's global logical pixel space
                 // (top-left origin, y down) — the same units app-mac emits.
@@ -1107,15 +1110,16 @@ mod win {
                 let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
                 Some(format!(
                     "--anchor {:.1} {:.1} {:.1} {:.1}",
-                    r.left as f32 / scale,
-                    r.top as f32 / scale,
-                    r.right as f32 / scale,
-                    r.bottom as f32 / scale
+                    rect.left as f32 / scale,
+                    rect.top as f32 / scale,
+                    rect.right as f32 / scale,
+                    rect.bottom as f32 / scale
                 ))
             }
             Err(_) => None,
         };
-        launch_child("SysVitalsHistory.exe", args.as_deref(), &HISTORY_PROCESS);
+        HISTORY_PROCESS
+            .with(move |slot| launch_child("SysVitalsHistory.exe", args.as_deref(), slot));
     }
 
     /// Best-effort: return the directory containing the current executable.
