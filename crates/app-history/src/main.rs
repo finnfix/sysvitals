@@ -9,7 +9,7 @@
 // terminal flashes up beside the history window every time it launches.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
 use gpui_kit::component::button::*;
@@ -145,10 +145,16 @@ impl HistoryView {
             CsvScope::Last30d => (now - 2_592_000, 3600),
         };
 
-        let mut csv = String::from("\u{FEFF}"); // UTF-8 BOM
+        // Tab-separated rows paste straight into spreadsheet cells (WPS /
+        // Excel split on tabs on paste), and unlike a space separator they
+        // do not collide with the internal space of the "YYYY-MM-DD HH:MM:SS"
+        // timestamp column. The UTF-8 BOM keeps CJK headers readable in Excel.
+        let mut csv = String::from("\u{FEFF}");
         let header = match self.lang {
-            Language::En => "timestamp,cpu_pct,mem_pct",
-            Language::Zh => "\u{65F6}\u{95F4},CPU\u{5360}\u{7528},\u{5185}\u{5B58}\u{5360}\u{7528}",
+            Language::En => "timestamp\tcpu_pct\tmem_pct",
+            Language::Zh => {
+                "\u{65F6}\u{95F4}\tCPU\u{5360}\u{7528}\t\u{5185}\u{5B58}\u{5360}\u{7528}"
+            }
         };
         csv.push_str(header);
         csv.push('\n');
@@ -158,7 +164,7 @@ impl HistoryView {
                 if let Ok(buckets) = store.buckets(from, now, bucket_secs) {
                     for b in &buckets {
                         let ts_str = format_ts_full(b.ts);
-                        csv.push_str(&format!("{},{:.1},{:.1}\n", ts_str, b.cpu, b.mem));
+                        csv.push_str(&format!("{ts_str}\t{:.1}\t{:.1}\n", b.cpu, b.mem));
                     }
                 }
             }
@@ -168,6 +174,23 @@ impl HistoryView {
             let _ = clipboard.set_text(csv);
             self.copied = true;
         }
+    }
+
+    /// Clear the "copied" confirmation once the history window has enough
+    /// time to show it. Spawning instead of storing the task lets a new copy
+    /// arm a fresh reset while an older timer simply clears an already-cleared
+    /// flag.
+    fn schedule_copied_reset(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1200))
+                .await;
+            let _ = this.update(cx, |view: &mut HistoryView, cx| {
+                view.copied = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }
 
@@ -215,7 +238,10 @@ impl Render for HistoryView {
             range_buttons = range_buttons.child(btn);
         }
 
-        let copy_label = if copied {
+        // Icon-only copy button: a green check flashes for ~1.2s after a
+        // successful copy, then the button returns to the copy icon. The
+        // tooltip keeps the textual hint in the current language.
+        let copy_tip = if copied {
             t(lang, "chart.copied").to_string()
         } else {
             t(lang, "chart.copy_csv").to_string()
@@ -223,9 +249,15 @@ impl Render for HistoryView {
 
         let copy_btn = Button::new("copy-csv")
             .small()
-            .label(copy_label)
+            .tooltip(copy_tip)
+            .when(copied, |b| {
+                b.icon(IconName::CircleCheck)
+                    .text_color(hsla(150.0 / 360.0, 0.7, 0.45, 1.0))
+            })
+            .when(!copied, |b| b.icon(IconName::Copy))
             .on_click(cx.listener(|this: &mut Self, _: &ClickEvent, _, cx| {
                 this.copy_csv();
+                this.schedule_copied_reset(cx);
                 cx.notify();
             }));
 
