@@ -73,19 +73,24 @@ mod win {
     use windows::Win32::UI::HiDpi::{
         GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
     use windows::Win32::UI::Shell::{
-        SHAppBarMessage, ShellExecuteW, ABE_LEFT, ABE_RIGHT, ABM_GETTASKBARPOS, APPBARDATA,
+        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, SHAppBarMessage, ShellExecuteExW, ShellExecuteW,
+        ABE_LEFT, ABE_RIGHT, ABM_GETTASKBARPOS, APPBARDATA,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
         DispatchMessageW, FindWindowExW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics,
         GetWindowRect, IsWindowVisible, KillTimer, MoveWindow, PostMessageW, PostQuitMessage,
-        RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage,
-        UpdateLayeredWindow, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, MF_STRING, MSG,
-        SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
-        SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
-        WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
-        WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
+        RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, SystemParametersInfoW, TrackPopupMenu,
+        TranslateMessage, UpdateLayeredWindow, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST,
+        MF_STRING, MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SM_CXSCREEN, SM_CYSCREEN,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
+        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_DESTROY, WM_DISPLAYCHANGE,
+        WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
+        WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
     // ------------------------------------------------------------------ consts
@@ -119,6 +124,14 @@ mod win {
     const IDM_QUIT: usize = 902;
     const IDM_RESTART: usize = 903;
 
+    /// Timer id: deferred single-click action (opens history). Armed on
+    /// WM_LBUTTONUP and cancelled by WM_LBUTTONDBLCLK, so a double-click does
+    /// not also fire the single-click action.
+    const TIMER_SINGLECLICK: usize = 0x518;
+    /// Safety net: if the system double-click interval reads as zero, still
+    /// delay single clicks by this much so double-clicks stay suppressible.
+    const MIN_SINGLECLICK_DELAY_MS: u32 = 100;
+
     // ----------------------------------------------------------------- statics
 
     static WIN_W: AtomicI32 = AtomicI32::new(0);
@@ -148,6 +161,16 @@ mod win {
         // data dir never blocks the indicator itself.
         static STORE: RefCell<Option<sysvitals_core::Store>> = const { RefCell::new(None) };
         static TICK_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        // Child process handles, kept so we can detect a still-running
+        // instance and avoid stacking duplicate windows.
+        static SETTINGS_PROCESS: RefCell<Option<HANDLE>> = const { RefCell::new(None) };
+        static HISTORY_PROCESS: RefCell<Option<HANDLE>> = const { RefCell::new(None) };
+        // Double-click suppression. The single-click action is deferred by a
+        // timer; a following WM_LBUTTONDBLCLK cancels it. Windows then
+        // delivers one more WM_LBUTTONUP, which this flag marks as swallowed
+        // so the deferred action is not re-armed. The flag is cleared on every
+        // WM_LBUTTONDOWN, so a lost up can never break later clicks.
+        static SWALLOW_NEXT_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     // ------------------------------------------------------------ config access
@@ -279,14 +302,56 @@ mod win {
 
     // ------------------------------------------------------------------- fonts
 
-    /// Overlay font: Segoe UI at the system caption size, grayscale AA.
-    /// Negative height = character height (em box). Antialiased (not ClearType)
-    /// because the glyphs are composited per-pixel-alpha over the taskbar.
+    /// System UI face + pixel height, cached on first use. Read from
+    /// `NONCLIENTMETRICS.lfMessageFont` so the indicator's font follows the
+    /// system setting (face and size) instead of a hardcoded Segoe UI 12px.
+    /// Font changes only take effect after re-login anyway, so caching is fine.
+    static UI_FONT: OnceLock<(i32, Vec<u16>)> = OnceLock::new();
+
+    fn ui_font() -> (i32, Vec<u16>) {
+        UI_FONT
+            .get_or_init(|| unsafe {
+                let fallback = || (-(12 * GetDpiForSystem() as i32 / 96), utf16("Segoe UI"));
+                let mut nc: NONCLIENTMETRICSW = std::mem::zeroed();
+                nc.cbSize = std::mem::size_of::<NONCLIENTMETRICSW>() as u32;
+                let ok = SystemParametersInfoW(
+                    SPI_GETNONCLIENTMETRICS,
+                    std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
+                    Some(std::ptr::from_mut(&mut nc).cast::<std::ffi::c_void>()),
+                    windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+                )
+                .is_ok();
+                if !ok {
+                    return fallback();
+                }
+                let lf = &nc.lfMessageFont;
+                // lfHeight is negative (character height) in practice, but be
+                // explicit: normalize to a negative em height so CreateFontW
+                // sizes glyphs exactly like the system does.
+                let height = match lf.lfHeight {
+                    h if h < 0 => h,
+                    h if h > 0 => -h,
+                    _ => fallback().0,
+                };
+                let mut face: Vec<u16> =
+                    lf.lfFaceName.iter().copied().take_while(|&c| c != 0).collect();
+                if face.is_empty() {
+                    face = utf16("Segoe UI");
+                } else {
+                    face.push(0);
+                }
+                (height, face)
+            })
+            .clone()
+    }
+
+    /// Overlay font: the system UI face at the system UI size, grayscale AA.
+    /// Antialiased (not ClearType) because the glyphs are composited
+    /// per-pixel-alpha over the taskbar.
     unsafe fn make_font() -> HFONT {
-        let dpi = GetDpiForSystem();
-        let face = utf16("Segoe UI");
+        let (height, face) = ui_font();
         CreateFontW(
-            -(12 * dpi as i32 / 96),
+            height,
             0,
             0,
             0,
@@ -303,12 +368,12 @@ mod win {
         )
     }
 
-    /// Overlay font at an explicit pixel height. Used to render at a
+    /// Overlay font at an integer supersample multiplier. Used to render at a
     /// supersampled scale (2x) before downsampling.
-    unsafe fn make_font_at(height_px: i32) -> HFONT {
-        let face = utf16("Segoe UI");
+    unsafe fn make_font_at(scale: i32) -> HFONT {
+        let (height, face) = ui_font();
         CreateFontW(
-            -height_px,
+            height * scale.max(1),
             0,
             0,
             0,
@@ -677,7 +742,7 @@ mod win {
             return;
         };
         let old_ss_bmp = SelectObject(mem_dc, ss_bmp.into());
-        let ss_font = make_font_at(12 * GetDpiForSystem() as i32 / 96 * SS);
+        let ss_font = make_font_at(SS);
         let old_ss_font = SelectObject(mem_dc, ss_font.into());
         SetBkMode(mem_dc, TRANSPARENT);
         SetTextColor(mem_dc, COLORREF(0x00FF_FFFF));
@@ -936,70 +1001,93 @@ mod win {
         let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_APPLY, WPARAM(0), LPARAM(0)) };
     }
 
-    // -------------------------------------------------------- settings launcher
+    // ------------------------------------------------------- child process launch
 
-    /// Launch the external settings process (`SysVitalsSettings.exe`) from the
-    /// same directory as the current executable. If the file is missing, logs
-    /// a warning and does nothing.
-    fn launch_settings() {
-        let exe_path = current_exe_dir();
-        let Some(dir) = exe_path else {
-            log_event("WARN", "launch_settings: cannot determine exe directory");
-            return;
+    /// Whether the child process behind `slot` is still running. Reaps the
+    /// handle when the process has exited.
+    fn child_alive(slot: &std::cell::RefCell<Option<HANDLE>>) -> bool {
+        let mut borrow = slot.borrow_mut();
+        let Some(handle) = borrow.as_ref() else {
+            return false;
         };
-        let settings_path = format!("{}\\SysVitalsSettings.exe", dir);
-        if !std::path::Path::new(&settings_path).exists() {
-            log_event(
-                "WARN",
-                &format!("launch_settings: not found: {}", settings_path),
-            );
-            return;
+        if handle.is_invalid() {
+            return false;
         }
-        log_event("INFO", &format!("launching settings: {}", settings_path));
-        let path_w = utf16(&settings_path);
-        let verb = utf16("open");
-        unsafe {
-            let _ = ShellExecuteW(
-                None,
-                windows::core::PCWSTR(verb.as_ptr()),
-                windows::core::PCWSTR(path_w.as_ptr()),
-                windows::core::PCWSTR::null(),
-                windows::core::PCWSTR::null(),
-                SW_SHOWNORMAL,
-            );
+        let wait = unsafe { WaitForSingleObject(*handle, 0) };
+        if wait == WAIT_TIMEOUT {
+            true
+        } else {
+            let _ = unsafe { CloseHandle(*handle) };
+            *borrow = None;
+            false
         }
     }
 
-    /// Launch the external history chart process (`SysVitalsHistory.exe`)
-    /// from the same directory as the current executable. If the file is
-    /// missing, logs a warning and does nothing.
-    fn launch_history() {
-        let exe_path = current_exe_dir();
-        let Some(dir) = exe_path else {
-            log_event("WARN", "launch_history: cannot determine exe directory");
-            return;
+    /// Launch a sibling executable from the current exe directory, keeping one
+    /// live instance per target: if a previously spawned process is still
+    /// running, this is a no-op. Extra argv (e.g. the `--anchor` geometry) is
+    /// passed through verbatim.
+    fn launch_child(
+        exe_name: &str,
+        args: Option<&str>,
+        slot: &std::cell::RefCell<Option<HANDLE>>,
+    ) -> bool {
+        if child_alive(slot) {
+            log_event("INFO", &format!("launch_child {exe_name}: already running, skipped"));
+            return false;
+        }
+        let Some(dir) = current_exe_dir() else {
+            log_event("WARN", &format!("launch_child: cannot determine exe directory: {exe_name}"));
+            return false;
         };
-        let history_path = format!("{}\\SysVitalsHistory.exe", dir);
-        if !std::path::Path::new(&history_path).exists() {
-            log_event(
-                "WARN",
-                &format!("launch_history: not found: {}", history_path),
-            );
-            return;
+        let exe_path = format!("{dir}\\{exe_name}");
+        if !std::path::Path::new(&exe_path).exists() {
+            log_event("WARN", &format!("launch_child: not found: {exe_path}"));
+            return false;
         }
-        log_event("INFO", &format!("launching history: {}", history_path));
-        let path_w = utf16(&history_path);
+        log_event(
+            "INFO",
+            &format!("launching {exe_name}{}", args.map(|a| format!(" {a}")).unwrap_or_default()),
+        );
+        let path_w = utf16(&exe_path);
         let verb = utf16("open");
-        unsafe {
-            let _ = ShellExecuteW(
-                None,
-                windows::core::PCWSTR(verb.as_ptr()),
-                windows::core::PCWSTR(path_w.as_ptr()),
-                windows::core::PCWSTR::null(),
-                windows::core::PCWSTR::null(),
-                SW_SHOWNORMAL,
-            );
+        let args_w = args.map(utf16);
+        let mut sei = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS,
+            lpVerb: windows::core::PCWSTR(verb.as_ptr()),
+            lpFile: windows::core::PCWSTR(path_w.as_ptr()),
+            lpParameters: args_w
+                .as_ref()
+                .map(|a| windows::core::PCWSTR(a.as_ptr()))
+                .unwrap_or(windows::core::PCWSTR::null()),
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+        if unsafe { ShellExecuteExW(&mut sei) }.is_err() {
+            log_event("WARN", &format!("launch_child: ShellExecuteExW failed for {exe_name}"));
+            return false;
         }
+        *slot.borrow_mut() = Some(sei.hProcess);
+        true
+    }
+
+    /// Launch the external settings process (`SysVitalsSettings.exe`).
+    fn launch_settings() {
+        launch_child("SysVitalsSettings.exe", None, &SETTINGS_PROCESS);
+    }
+
+    /// Launch the external history chart process (`SysVitalsHistory.exe`),
+    /// passing the indicator's screen rectangle so the popup can anchor to it.
+    fn launch_history(hwnd: HWND) {
+        let args = match unsafe { GetWindowRect(hwnd) } {
+            Ok(r) => Some(format!(
+                "--anchor {} {} {} {}",
+                r.left, r.top, r.right, r.bottom
+            )),
+            Err(_) => None,
+        };
+        launch_child("SysVitalsHistory.exe", args.as_deref(), &HISTORY_PROCESS);
     }
 
     /// Best-effort: return the directory containing the current executable.
@@ -1097,6 +1185,7 @@ mod win {
                 let _ = KillTimer(Some(hwnd), TIMER_SAMPLE);
                 let _ = KillTimer(Some(hwnd), TIMER_MOVE);
                 let _ = KillTimer(Some(hwnd), TIMER_CONFIG);
+                let _ = KillTimer(Some(hwnd), TIMER_SINGLECLICK);
                 let _ = DestroyWindow(hwnd);
             }
             _ => {}
@@ -1117,6 +1206,12 @@ mod win {
                     id if id == TIMER_SAMPLE => sample_now(hwnd),
                     id if id == TIMER_MOVE => reposition(hwnd),
                     id if id == TIMER_CONFIG => poll_config_change(hwnd),
+                    id if id == TIMER_SINGLECLICK => {
+                        // The double-click window elapsed: this was a true
+                        // single click. Open the history trend chart popup.
+                        let _ = KillTimer(Some(hwnd), TIMER_SINGLECLICK);
+                        launch_history(hwnd);
+                    }
                     _ => {}
                 }
                 LRESULT(0)
@@ -1150,12 +1245,30 @@ mod win {
                 reposition(hwnd);
                 LRESULT(0)
             }
+            WM_LBUTTONDOWN => {
+                // Fresh press: any previously swallowed-up state is stale.
+                SWALLOW_NEXT_UP.with(|c| c.set(false));
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_LBUTTONUP => {
-                // Single-click opens the history trend chart popup.
-                launch_history();
+                // The trailing up of a double-click is swallowed (the
+                // double-click already acted). Otherwise defer the single-click
+                // action so a quick second press can cancel it.
+                if SWALLOW_NEXT_UP.with(|c| c.replace(false)) {
+                    return LRESULT(0);
+                }
+                let delay = {
+                    let d = GetDoubleClickTime();
+                    if d == 0 { MIN_SINGLECLICK_DELAY_MS } else { d }
+                };
+                SetTimer(Some(hwnd), TIMER_SINGLECLICK, delay, None);
                 LRESULT(0)
             }
             WM_LBUTTONDBLCLK => {
+                // Cancel the deferred single-click and swallow the up that
+                // Windows delivers after this message.
+                let _ = KillTimer(Some(hwnd), TIMER_SINGLECLICK);
+                SWALLOW_NEXT_UP.with(|c| c.set(true));
                 // Double-click opens Task Manager.
                 let verb = utf16("open");
                 let target = utf16("taskmgr.exe");

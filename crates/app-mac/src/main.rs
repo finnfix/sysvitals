@@ -17,14 +17,15 @@
 #[cfg(target_os = "macos")]
 mod macos {
     use std::cell::RefCell;
+    use std::process::Child;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
     use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSEventType, NSMenu, NSMenuItem, NSStatusBar,
-        NSStatusItem, NSVariableStatusItemLength,
+        NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventType, NSMenu, NSMenuItem,
+        NSScreen, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
     };
     use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimer};
 
@@ -38,6 +39,41 @@ mod macos {
         static STATUS_ITEM: RefCell<Option<Retained<NSStatusItem>>> = const { RefCell::new(None) };
         static CONFIG_MTIME: RefCell<i64> = const { RefCell::new(0) };
         static MTM: RefCell<Option<MainThreadMarker>> = const { RefCell::new(None) };
+        // Child process handles, kept so a still-running instance is not
+        // duplicated (a second spawn is a no-op until the first exits).
+        static SETTINGS_CHILD: RefCell<Option<Child>> = const { RefCell::new(None) };
+        static HISTORY_CHILD: RefCell<Option<Child>> = const { RefCell::new(None) };
+        // Deferred single-click: armed on a single press, cancelled if a
+        // double-click arrives within the system double-click interval.
+        static PENDING_SINGLE_CLICK: RefCell<Option<Retained<NSTimer>>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Screen rectangle (left, top, right, bottom) in GPUI's global top-left,
+    /// y-downward logical coordinate space, derived from the status item's
+    /// button window. Returns `None` when the button or window is unavailable.
+    fn anchor_rect() -> Option<(i64, i64, i64, i64)> {
+        let mtm = mtm();
+        STATUS_ITEM.with(|si| {
+            let item = si.borrow().clone()?;
+            let button = item.button(mtm)?;
+            let window = button.window()?;
+            let frame = window.frame();
+            let screen = window.screen().or_else(|| NSScreen::mainScreen(mtm))?;
+            let screen_frame = screen.frame();
+            // Cocoa origin is bottom-left with y growing upward; GPUI wants
+            // top-left with y downward, so flip around the screen top edge.
+            let left = frame.origin.x;
+            let top = screen_frame.size.height - (frame.origin.y + frame.size.height);
+            let right = left + frame.size.width;
+            let bottom = top + frame.size.height;
+            Some((
+                left.round() as i64,
+                top.round() as i64,
+                right.round() as i64,
+                bottom.round() as i64,
+            ))
+        })
     }
 
     /// Get the MainThreadMarker (must be called from main thread).
@@ -135,8 +171,28 @@ mod macos {
         Some(bundle.to_path_buf())
     }
 
-    /// Launch the external GPUI settings process (`SysVitalsSettings`).
+    /// Whether a previously spawned child (held in `slot`) is still running.
+    /// Reaps it once it has exited.
+    fn child_alive(slot: &RefCell<Option<Child>>) -> bool {
+        let mut borrow = slot.borrow_mut();
+        match borrow.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(Some(_status)) => {
+                    *borrow = None;
+                    false
+                }
+                _ => true,
+            },
+            None => false,
+        }
+    }
+
+    /// Launch the external GPUI settings process (`SysVitalsSettings`), one
+    /// live instance at a time.
     fn launch_settings() {
+        if child_alive(&SETTINGS_CHILD) {
+            return;
+        }
         let Some(dir) = exe_dir() else {
             return;
         };
@@ -144,11 +200,18 @@ mod macos {
         if !settings.exists() {
             return;
         }
-        let _ = std::process::Command::new(settings).spawn();
+        if let Ok(child) = std::process::Command::new(settings).spawn() {
+            *SETTINGS_CHILD.borrow_mut() = Some(child);
+        }
     }
 
-    /// Launch the external history chart process (`SysVitalsHistory`).
+    /// Launch the external history chart process (`SysVitalsHistory`), passing
+    /// the indicator's screen rect so the popup can anchor to it. One live
+    /// instance at a time.
     fn launch_history() {
+        if child_alive(&HISTORY_CHILD) {
+            return;
+        }
         let Some(dir) = exe_dir() else {
             return;
         };
@@ -156,7 +219,13 @@ mod macos {
         if !history.exists() {
             return;
         }
-        let _ = std::process::Command::new(history).spawn();
+        let mut cmd = std::process::Command::new(history);
+        if let Some((l, t, r, b)) = anchor_rect() {
+            cmd.args(["--anchor", &l.to_string(), &t.to_string(), &r.to_string(), &b.to_string()]);
+        }
+        if let Ok(child) = cmd.spawn() {
+            *HISTORY_CHILD.borrow_mut() = Some(child);
+        }
     }
 
     /// Open Activity Monitor (macOS equivalent of Task Manager).
@@ -164,6 +233,40 @@ mod macos {
         let _ = std::process::Command::new("open")
             .args(["-a", "Activity Monitor"])
             .spawn();
+    }
+
+    /// Cancel any deferred single-click so a double-click does not also fire
+    /// the single-click action.
+    fn cancel_pending_single_click() {
+        PENDING_SINGLE_CLICK.with(|p| {
+            if let Some(timer) = p.borrow_mut().take() {
+                timer.invalidate();
+            }
+        });
+    }
+
+    /// Defer the single-click action by the system double-click interval. If a
+    /// double-click arrives first, [`cancel_pending_single_click`] drops it.
+    fn schedule_single_click() {
+        let delay = {
+            let d = NSEvent::doubleClickInterval();
+            if d <= 0.0 { 0.1 } else { d as f64 }
+        };
+        cancel_pending_single_click();
+        let block = block2::RcBlock::new(|_timer: std::ptr::NonNull<NSTimer>| {
+            PENDING_SINGLE_CLICK.with(|p| {
+                *p.borrow_mut() = None;
+            });
+            launch_history();
+        });
+        // SAFETY: the block captures nothing non-Send and the timer fires on
+        // the main run loop.
+        let timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_repeats_block(delay, false, &block)
+        };
+        PENDING_SINGLE_CLICK.with(|p| {
+            *p.borrow_mut() = Some(timer);
+        });
     }
 
     /// Restart: schedule a delayed relaunch, then exit.
@@ -245,7 +348,9 @@ mod macos {
         impl ActionHandler {
             /// Called when the status item button is clicked.
             /// Distinguishes single-click, double-click, and right-click
-            /// using NSApplication.currentEvent.
+            /// using NSApplication.currentEvent. The single-click action is
+            /// deferred so a double-click can cancel it (otherwise both the
+            /// history popup and Activity Monitor would open).
             #[unsafe(method(buttonClicked:))]
             fn button_clicked(&self, _sender: Option<&AnyObject>) {
                 let mtm = mtm();
@@ -263,9 +368,10 @@ mod macos {
                     }
                     _ => {
                         if event.clickCount() >= 2 {
+                            cancel_pending_single_click();
                             open_activity_monitor();
                         } else {
-                            launch_history();
+                            schedule_single_click();
                         }
                     }
                 }
