@@ -58,13 +58,14 @@ jobs:
       - name: Build GPUI history chart
         run: cargo build --release -p app-history
       # Portable (green) distribution: overlay exe plus the settings/history
-      # exes when present. Package name: SysVitals-windows-x64-{version}.zip;
-      # the version is read from the workspace Cargo.toml (single source of truth).
+      # exes when present. Package name: SysVitals_Windows_x64_{version}.zip
+      # (Windows ships x64 only); the version is read from the workspace
+      # Cargo.toml (single source of truth).
       - name: Package Windows portable zip
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          $zip = "SysVitals-windows-x64-$version.zip"
+          $zip = "SysVitals_Windows_x64_$version.zip"
           $files = @("target/release/SysVitals.exe")
           if (Test-Path "target/release/SysVitalsSettings.exe") { $files += "target/release/SysVitalsSettings.exe" }
           if (Test-Path "target/release/SysVitalsHistory.exe") { $files += "target/release/SysVitalsHistory.exe" }
@@ -74,7 +75,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: SysVitals-windows-x64
-          path: SysVitals-windows-x64-*.zip
+          path: SysVitals_Windows_x64_*.zip
           if-no-files-found: error
 
   build-macos:
@@ -83,37 +84,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
+      # Apple Silicon only: the explicit target pin keeps the package arm64
+      # no matter which arch the runner image happens to be.
       - name: Build macOS display layer
-        run: cargo build --release -p app-mac
+        run: cargo build --release --target aarch64-apple-darwin -p app-mac
       - name: Build GPUI settings window
-        run: cargo build --release -p app-settings
+        run: cargo build --release --target aarch64-apple-darwin -p app-settings
       - name: Build GPUI history chart
-        run: cargo build --release -p app-history
+        run: cargo build --release --target aarch64-apple-darwin -p app-history
       # One bundle, not three apps: the indicator is the declared
       # CFBundleExecutable, and the settings/history binaries are sibling
       # executables it launches from Contents/MacOS. Package name:
-      # SysVitals-macos-{arch}-{version}.zip.
+      # SysVitals_macOS_arm64_{version}.zip (macOS ships Apple Silicon only).
       - name: Package macOS app bundle
         run: |
           version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          arch=$(uname -m)
           app="SysVitals.app"
+          bin="target/aarch64-apple-darwin/release"
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-          cp target/release/sysvitals "$app/Contents/MacOS/sysvitals"
-          if [ -f target/release/SysVitalsSettings ]; then
-            cp target/release/SysVitalsSettings "$app/Contents/MacOS/SysVitalsSettings"
+          cp "$bin/sysvitals" "$app/Contents/MacOS/sysvitals"
+          if [ -f "$bin/SysVitalsSettings" ]; then
+            cp "$bin/SysVitalsSettings" "$app/Contents/MacOS/SysVitalsSettings"
           fi
-          if [ -f target/release/SysVitalsHistory ]; then
-            cp target/release/SysVitalsHistory "$app/Contents/MacOS/SysVitalsHistory"
+          if [ -f "$bin/SysVitalsHistory" ]; then
+            cp "$bin/SysVitalsHistory" "$app/Contents/MacOS/SysVitalsHistory"
           fi
           cp crates/app-mac/assets/Info.plist "$app/Contents/Info.plist"
           cp crates/app-mac/assets/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
-          zip -qr "SysVitals-macos-$arch-$version.zip" "$app"
-          echo "Packaged SysVitals-macos-$arch-$version.zip"
+          zip -qr "SysVitals_macOS_arm64_$version.zip" "$app"
+          echo "Packaged SysVitals_macOS_arm64_$version.zip"
       - name: Upload macOS app bundle
         uses: actions/upload-artifact@v4
         with:
-          name: SysVitals-macos
-          path: SysVitals-macos-*.zip
+          name: SysVitals-macos-arm64
+          path: SysVitals_macOS_arm64_*.zip
           if-no-files-found: error
