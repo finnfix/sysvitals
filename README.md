@@ -7,8 +7,8 @@
 A lightweight CPU / memory / network monitor living in your taskbar (Windows) and menu bar (macOS).
 
 SysVitals shows live percentages and transfer rates directly in the system status bar, follows
-your system font, DPI and light/dark theme, and opens a small history chart when clicked. It is
-built in Rust and aims to stay visually native and negligibly cheap to run 24/7.
+your system font, DPI and light/dark theme, and opens a small history chart beside it when
+clicked. It is built in Rust and aims to stay visually native and negligibly cheap to run 24/7.
 
 ### Status
 
@@ -20,7 +20,8 @@ implemented:
 - `crates/app-win` — Windows taskbar indicator (topmost layered overlay + GDI text)
 - `crates/app-mac` — macOS menu-bar indicator (`NSStatusItem`)
 - `crates/app-settings` — settings window (GPUI), launched as a separate process
-- `crates/app-history` — CPU / memory trend-chart popup (GPUI), with one-click CSV copy
+- `crates/app-history` — CPU / memory trend-chart popup (GPUI), with one-click copy for pasting
+  into spreadsheets
 - `crates/ui-common` — placeholder for a future shared GPUI settings/tray layer
 
 Nothing is tagged or packaged yet; the Windows and macOS layers are still being validated on real
@@ -33,8 +34,9 @@ desktops.
   Windows, vertical-taskbar support
 - Binary (1024-base) units with adaptive `B/s` / `K/s` / `M/s` / `G/s` rate formatting
 - Light / dark theme following the system
-- Click the indicator to open a CPU / memory history chart (5 min / 1 h / 1 d / 1 mo), retained
-  for up to a month, with one-click CSV copy to the clipboard
+- Click the indicator to open a CPU / memory history chart beside it (5 min / 1 h / 1 d / 1 mo),
+  retained for up to a month, with one-click copy of the visible data as spreadsheet-friendly
+  rows; the popup closes on click-away or Esc
 - English and Chinese UI (switchable; prefixes are independent of language)
 
 ### Building the core
@@ -90,7 +92,7 @@ DPI 自适应，点击状态栏项可弹出 CPU / 内存历史走势图。目标
 - `crates/app-win` —— Windows 任务栏指示器（topmost 分层窗口 + GDI 文本）
 - `crates/app-mac` —— macOS 菜单栏指示器（`NSStatusItem`）
 - `crates/app-settings` —— 设置窗口（GPUI），作为独立进程拉起
-- `crates/app-history` —— CPU / 内存走势图弹窗（GPUI），一键复制 CSV
+- `crates/app-history` —— CPU / 内存走势图弹窗（GPUI），一键复制可粘贴进表格的数据
 - `crates/ui-common` —— 未来共享 GPUI 设置/托盘层的占位
 
 尚未打 tag 或出包；Windows 与 macOS 显示层仍在真实桌面上验证。
@@ -101,7 +103,8 @@ DPI 自适应，点击状态栏项可弹出 CPU / 内存历史走势图。目标
 - 前缀可自定义，单行 / 双行布局，Windows 上可选托盘旁或最左侧锚位，支持垂直任务栏
 - 1024 进制，网速按 `B/s` / `K/s` / `M/s` / `G/s` 四档自适应
 - 亮 / 暗主题跟随系统
-- 点击指示器弹出 CPU / 内存走势图（5 分钟 / 1 小时 / 1 天 / 1 个月），历史最长保留一个月，一键复制 CSV 到剪贴板
+- 点击指示器在其旁弹出 CPU / 内存走势图（5 分钟 / 1 小时 / 1 天 / 1 个月），历史最长保留一个月，
+  一键复制当前可视范围数据（可直接粘贴进表格）；弹窗点击别处或按 Esc 自动关闭
 - 中英文界面（可切换；前缀不受语言影响）
 
 ### 构建核心层
