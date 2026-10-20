@@ -9,45 +9,58 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+  # ---------------------------------------------------------------------------
+  # Quality gate: the only job that lints and tests.
+  #
+  # The shared sampling/formatting/config layer is platform-independent, so it
+  # is checked on Linux, the cheapest runner. `cargo fmt` at a workspace root
+  # covers every member, so all crates are style-checked here even though the
+  # platform crates are not buildable on Linux; `cargo clippy` and `cargo test`
+  # act on the workspace's default members (the cross-platform crates), which
+  # is what they already did on every runner before this split.
+  # ---------------------------------------------------------------------------
+  quality:
+    name: Quality (fmt / clippy / test)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Format check
+      - name: Format check (all workspace members)
         run: cargo fmt --check
       - name: Clippy (default members)
         run: cargo clippy --all-targets -- -D warnings
-      - name: Tests
+      - name: Tests (default members)
         run: cargo test
-      # Platform-crate compile gate: each platform crate is built only on its
-      # own OS runner (MSVC on windows-latest, Xcode on macos-latest). This
-      # catches build breakage of the display layers without needing a local
-      # toolchain.
+
+  # ---------------------------------------------------------------------------
+  # Build gate + distribution packaging.
+  #
+  # Each platform crate can only compile with its own OS toolchain (MSVC on
+  # windows-latest, Xcode on macos-latest), so these runners exist to prove the
+  # display layers still build and to produce the shippable archives. They do
+  # not repeat the quality checks: the logic they depend on is already covered
+  # by the quality job.
+  # ---------------------------------------------------------------------------
+  build-windows:
+    name: Build & package (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build Windows display layer
-        if: matrix.os == 'windows-latest'
         run: cargo build --release -p app-win
-      # GPUI settings window: required build gate on Windows.
       - name: Build GPUI settings window
-        if: matrix.os == 'windows-latest'
         run: cargo build --release -p app-settings
-      # GPUI history chart popup: required build gate on Windows.
       - name: Build GPUI history chart
-        if: matrix.os == 'windows-latest'
         run: cargo build --release -p app-history
-      # Portable (green) distribution: overlay exe (+ settings/history exes if built).
-      # Package name: SysVitals-{platform}-{arch}-{version}.zip; the version
-      # is read from the workspace Cargo.toml (single source of truth).
+      # Portable (green) distribution: overlay exe plus the settings/history
+      # exes when present. Package name: SysVitals-windows-x64-{version}.zip;
+      # the version is read from the workspace Cargo.toml (single source of truth).
       - name: Package Windows portable zip
-        if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
@@ -58,27 +71,30 @@ jobs:
           Compress-Archive -Path $files -DestinationPath $zip
           Write-Host "Packaged $zip"
       - name: Upload Windows portable package
-        if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: SysVitals-windows-x64
           path: SysVitals-windows-x64-*.zip
           if-no-files-found: error
+
+  build-macos:
+    name: Build & package (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build macOS display layer
-        if: matrix.os == 'macos-latest'
         run: cargo build --release -p app-mac
-      # GPUI settings window is cross-platform; build it on macOS too.
-      - name: Build GPUI settings window (macOS)
-        if: matrix.os == 'macos-latest'
+      - name: Build GPUI settings window
         run: cargo build --release -p app-settings
-      # GPUI history chart popup is cross-platform; build it on macOS too.
-      - name: Build GPUI history chart (macOS)
-        if: matrix.os == 'macos-latest'
+      - name: Build GPUI history chart
         run: cargo build --release -p app-history
-      # macOS .app bundle: assemble the bundle structure (binary + Info.plist +
-      # AppIcon.icns), then zip it. Package name: SysVitals-macos-{arch}-{version}.zip.
+      # One bundle, not three apps: the indicator is the declared
+      # CFBundleExecutable, and the settings/history binaries are sibling
+      # executables it launches from Contents/MacOS. Package name:
+      # SysVitals-macos-{arch}-{version}.zip.
       - name: Package macOS app bundle
-        if: matrix.os == 'macos-latest'
         run: |
           version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           arch=$(uname -m)
@@ -96,7 +112,6 @@ jobs:
           zip -qr "SysVitals-macos-$arch-$version.zip" "$app"
           echo "Packaged SysVitals-macos-$arch-$version.zip"
       - name: Upload macOS app bundle
-        if: matrix.os == 'macos-latest'
         uses: actions/upload-artifact@v4
         with:
           name: SysVitals-macos
