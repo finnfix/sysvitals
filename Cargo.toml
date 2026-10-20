@@ -20,7 +20,7 @@ version = "0.0.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://github.com/finnfix/sysvitals"
+repository = "https://github.com/fynhq/sysvitals"
 publish = false
 
 [workspace.dependencies]
