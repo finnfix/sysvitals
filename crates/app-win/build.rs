@@ -3,8 +3,19 @@
 //! taskbar, and window chrome.
 
 fn main() {
-    // Only embed resources when targeting Windows (avoids breakage if
-    // someone runs cargo check on a non-Windows host with -p app-win).
+    #[cfg(windows)]
+    embed_resources();
+}
+
+/// Compile-time gate: `winres` is a Windows-only build-dependency, so the
+/// `winres::` path must not exist on other hosts at all. A runtime
+/// `CARGO_CFG_TARGET_OS` check is too late — the path is resolved before
+/// `main` runs, so `cargo check`/build on a non-Windows host fails with E0433.
+#[cfg(windows)]
+fn embed_resources() {
+    // The runtime check still matters for a Windows host cross-compiling to
+    // a non-Windows target: `winres` is linked there, but embedding PE
+    // resources would break the foreign binary.
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "windows" {
         return;
     }
