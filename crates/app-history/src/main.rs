@@ -1,14 +1,18 @@
 //! SysVitals History — a GPUI trend chart popup.
 //!
 //! Launched by the platform overlay when the user clicks the indicator.
-//! Shows CPU and memory usage over time as line charts, with a time
-//! range selector and a Copy CSV button. Closes on Esc or window blur.
+//! Shows CPU and memory usage over time as one merged chart, with a time
+//! range selector and a Copy CSV button. When the launcher passes the
+//! indicator rectangle via `--anchor`, the window opens as a topmost
+//! borderless popup beside the indicator; otherwise it opens centered.
+//! Closes on Esc or window blur.
 
 // A GUI child process must not allocate a console window on Windows: without
 // this attribute the binary is built as a console subsystem executable and a
 // terminal flashes up beside the history window every time it launches.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+use std::env;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
@@ -21,6 +25,91 @@ use gpui_kit::*;
 use sysvitals_core::config::{config_path, history_path, Config, CsvScope};
 use sysvitals_core::i18n::{t, Language};
 use sysvitals_core::store::{Bucket, Store};
+
+/// Screen rectangle of the indicator, passed by the overlay in GPUI's
+/// global logical pixel space (top-left origin, y growing downward).
+/// Both platform overlays convert their native coordinates to that space
+/// before launching.
+struct AnchorRect {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+/// Parse `--anchor L T R B` from the process arguments. Absent, malformed,
+/// or degenerate rectangles yield `None`, which keeps the old centered
+/// behavior — a bad argument must never prevent the window from opening.
+fn parse_anchor() -> Option<AnchorRect> {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg != "--anchor" {
+            continue;
+        }
+        let mut nums = [0f32; 4];
+        for slot in nums.iter_mut() {
+            *slot = args.next()?.trim().parse().ok()?;
+        }
+        let [left, top, right, bottom] = nums;
+        return (right > left && bottom > top).then_some(AnchorRect {
+            left,
+            top,
+            right,
+            bottom,
+        });
+    }
+    None
+}
+
+/// The usable area of the display an anchor sits on (taskbar/dock excluded),
+/// used to flip and clamp the popup inside a screen the indicator is on.
+fn anchor_work_area(anchor: &AnchorRect, cx: &App) -> Bounds<Pixels> {
+    let probe = point(
+        px((anchor.left + anchor.right) * 0.5),
+        px((anchor.top + anchor.bottom) * 0.5),
+    );
+    cx.displays()
+        .into_iter()
+        .find(|display| display.visible_bounds().contains(&probe))
+        .or_else(|| cx.primary_display())
+        .map(|display| display.visible_bounds())
+        .unwrap_or_else(|| Bounds::new(point(px(0.), px(0.)), size(px(1280.), px(720.))))
+}
+
+/// Origin for the popup, anchored to the indicator rect: horizontally
+/// centered on it, vertically preferred below and flipped above when it
+/// would not fit, finally clamped into the work area.
+fn anchor_origin(
+    anchor: &AnchorRect,
+    size_w: f32,
+    size_h: f32,
+    work: &Bounds<Pixels>,
+) -> Point<Pixels> {
+    let gap = 6.0f32;
+    let work_left = f32::from(work.origin.x);
+    let work_right = work_left + f32::from(work.size.width);
+    let work_top = f32::from(work.origin.y);
+    let work_bottom = work_top + f32::from(work.size.height);
+
+    let below = anchor.bottom + gap;
+    let above = anchor.top - gap - size_h;
+    let y = if below + size_h <= work_bottom {
+        below
+    } else if above >= work_top {
+        above
+    } else {
+        (work_bottom - size_h).max(work_top)
+    };
+
+    let mut x = (anchor.left + anchor.right) * 0.5 - size_w * 0.5;
+    if x + size_w > work_right {
+        x = work_right - size_w;
+    }
+    if x < work_left {
+        x = work_left;
+    }
+    point(px(x), px(y))
+}
 
 /// Time range options for the chart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +196,14 @@ struct HistoryView {
     buckets: Vec<Bucket>,
     csv_scope: CsvScope,
     copied: bool,
+    /// Guards blur-close: only close after the window has been active at
+    /// least once, so a transient "inactive" signal at open time (a macOS
+    /// nonactivating panel that has not become key yet) cannot close the
+    /// popup the instant it appears.
+    ever_active: bool,
+    /// Kept alive so the activation observer is not cancelled; dropped when
+    /// the view is released.
+    _activation: Option<Subscription>,
 }
 
 impl HistoryView {
@@ -117,10 +214,29 @@ impl HistoryView {
             buckets: Vec::new(),
             csv_scope,
             copied: false,
+            ever_active: false,
+            _activation: None,
         };
         view.load_data();
         view.start_refresh_loop(cx);
         view
+    }
+
+    /// Watch the window's activation and dismiss the popup when it loses
+    /// focus after having been focused once. Idempotent.
+    fn observe_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self._activation.is_some() {
+            return;
+        }
+        let subscription = cx.observe_window_activation(window, |view, window, _| {
+            if window.is_window_active() {
+                view.ever_active = true;
+            } else if view.ever_active {
+                // Clicked away: dismiss the popup like a native menu.
+                window.remove_window();
+            }
+        });
+        self._activation = Some(subscription);
     }
 
     /// Reload the stored samples every [`REFRESH_INTERVAL`] while the window
@@ -251,11 +367,23 @@ fn format_ts_full(ts: i64) -> String {
 }
 
 impl Render for HistoryView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let lang = self.lang;
         let points = self.points();
         let copied = self.copied;
         let current_range = self.range;
+
+        // Register the blur-close observer exactly once.
+        self.observe_activation(window, cx);
+
+        // Esc closes the popup. `on_key_event` belongs to the paint phase,
+        // so it lives here rather than in the constructor. It re-registers
+        // every frame, and the handler needs no entity state.
+        window.on_key_event::<KeyDownEvent>(|event, phase, window, _cx| {
+            if phase == DispatchPhase::Bubble && event.keystroke.key == "escape" {
+                window.remove_window();
+            }
+        });
 
         // Build range buttons individually to avoid borrow issues with cx.listener.
         let mut range_buttons = h_flex().gap_1();
@@ -404,16 +532,51 @@ fn main() {
     app.run(move |cx| {
         gpui_kit::init(cx);
 
+        // Popup geometry in GPUI logical pixels.
+        let popup_size = size(px(680.), px(520.));
+        let anchor = parse_anchor();
+        let window_bounds = match anchor.as_ref() {
+            Some(a) => {
+                let work = anchor_work_area(a, cx);
+                Bounds::new(
+                    anchor_origin(
+                        a,
+                        f32::from(popup_size.width),
+                        f32::from(popup_size.height),
+                        &work,
+                    ),
+                    popup_size,
+                )
+            }
+            None => Bounds::centered(None, popup_size, cx),
+        };
+        let anchored = anchor.is_some();
+
         let window_options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(680.), px(520.)), cx)),
+            window_bounds: Some(WindowBounds::Windowed(window_bounds)),
+            // Anchored popups behave like a menu: no title bar, no shadow of
+            // a normal window, cannot be dragged or resized. When no anchor
+            // was passed, fall back to a plain titled window so the process
+            // is still usable if the indicator failed to compute a rect.
             titlebar: Some(TitlebarOptions {
                 title: Some("SysVitals History".into()),
+                appears_transparent: anchored,
                 ..Default::default()
             }),
+            kind: if anchored {
+                WindowKind::PopUp
+            } else {
+                WindowKind::Normal
+            },
+            is_movable: !anchored,
+            is_resizable: !anchored,
             focus: true,
             ..Default::default()
         };
 
+        // Blur-close observation is registered from the first render pass
+        // (idempotent), and Esc is handled by a paint-phase key listener —
+        // the build closure only needs to create the view.
         gpui_kit::open_window(window_options, cx, move |_window, cx| {
             cx.new(|cx| HistoryView::new(lang, csv_scope, cx))
         })

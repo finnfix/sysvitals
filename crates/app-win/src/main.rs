@@ -48,6 +48,7 @@ mod win {
     use sysvitals_core::{
         format_frame, format_frame_vertical, t, Config, NetSelection, Sampler, Theme,
     };
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW,
@@ -70,27 +71,27 @@ mod win {
     };
     use windows::Win32::System::SystemInformation::GetLocalTime;
     use windows::Win32::System::Threading::CreateMutexW;
-    use windows::Win32::UI::HiDpi::{
-        GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-    };
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
     use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    use windows::Win32::UI::HiDpi::{
+        GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
     use windows::Win32::UI::Shell::{
-        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, SHAppBarMessage, ShellExecuteExW, ShellExecuteW,
-        ABE_LEFT, ABE_RIGHT, ABM_GETTASKBARPOS, APPBARDATA,
+        SHAppBarMessage, ShellExecuteExW, ShellExecuteW, ABE_LEFT, ABE_RIGHT, ABM_GETTASKBARPOS,
+        APPBARDATA, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
         DispatchMessageW, FindWindowExW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics,
         GetWindowRect, IsWindowVisible, KillTimer, MoveWindow, PostMessageW, PostQuitMessage,
-        RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, SystemParametersInfoW, TrackPopupMenu,
-        TranslateMessage, UpdateLayeredWindow, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST,
-        MF_STRING, MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SM_CXSCREEN, SM_CYSCREEN,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
-        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_DESTROY, WM_DISPLAYCHANGE,
-        WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
-        WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
+        RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, SystemParametersInfoW,
+        TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
+        HWND_TOPMOST, MF_STRING, MSG, NONCLIENTMETRICSW, SM_CXSCREEN, SM_CYSCREEN,
+        SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
+        SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
+        WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONUP,
+        WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
     // ------------------------------------------------------------------ consts
@@ -333,8 +334,12 @@ mod win {
                     h if h > 0 => -h,
                     _ => fallback().0,
                 };
-                let mut face: Vec<u16> =
-                    lf.lfFaceName.iter().copied().take_while(|&c| c != 0).collect();
+                let mut face: Vec<u16> = lf
+                    .lfFaceName
+                    .iter()
+                    .copied()
+                    .take_while(|&c| c != 0)
+                    .collect();
                 if face.is_empty() {
                     face = utf16("Segoe UI");
                 } else {
@@ -1033,11 +1038,17 @@ mod win {
         slot: &std::cell::RefCell<Option<HANDLE>>,
     ) -> bool {
         if child_alive(slot) {
-            log_event("INFO", &format!("launch_child {exe_name}: already running, skipped"));
+            log_event(
+                "INFO",
+                &format!("launch_child {exe_name}: already running, skipped"),
+            );
             return false;
         }
         let Some(dir) = current_exe_dir() else {
-            log_event("WARN", &format!("launch_child: cannot determine exe directory: {exe_name}"));
+            log_event(
+                "WARN",
+                &format!("launch_child: cannot determine exe directory: {exe_name}"),
+            );
             return false;
         };
         let exe_path = format!("{dir}\\{exe_name}");
@@ -1047,7 +1058,10 @@ mod win {
         }
         log_event(
             "INFO",
-            &format!("launching {exe_name}{}", args.map(|a| format!(" {a}")).unwrap_or_default()),
+            &format!(
+                "launching {exe_name}{}",
+                args.map(|a| format!(" {a}")).unwrap_or_default()
+            ),
         );
         let path_w = utf16(&exe_path);
         let verb = utf16("open");
@@ -1065,7 +1079,10 @@ mod win {
             ..Default::default()
         };
         if unsafe { ShellExecuteExW(&mut sei) }.is_err() {
-            log_event("WARN", &format!("launch_child: ShellExecuteExW failed for {exe_name}"));
+            log_event(
+                "WARN",
+                &format!("launch_child: ShellExecuteExW failed for {exe_name}"),
+            );
             return false;
         }
         *slot.borrow_mut() = Some(sei.hProcess);
@@ -1081,10 +1098,21 @@ mod win {
     /// passing the indicator's screen rectangle so the popup can anchor to it.
     fn launch_history(hwnd: HWND) {
         let args = match unsafe { GetWindowRect(hwnd) } {
-            Ok(r) => Some(format!(
-                "--anchor {} {} {} {}",
-                r.left, r.top, r.right, r.bottom
-            )),
+            Ok(r) => {
+                // `GetWindowRect` reports physical pixels; the child process
+                // lays its window out in GPUI's global logical pixel space
+                // (top-left origin, y down) — the same units app-mac emits.
+                // Scale by this window's own monitor DPI.
+                let dpi = unsafe { GetDpiForWindow(hwnd) };
+                let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+                Some(format!(
+                    "--anchor {:.1} {:.1} {:.1} {:.1}",
+                    r.left as f32 / scale,
+                    r.top as f32 / scale,
+                    r.right as f32 / scale,
+                    r.bottom as f32 / scale
+                ))
+            }
             Err(_) => None,
         };
         launch_child("SysVitalsHistory.exe", args.as_deref(), &HISTORY_PROCESS);
@@ -1259,7 +1287,11 @@ mod win {
                 }
                 let delay = {
                     let d = GetDoubleClickTime();
-                    if d == 0 { MIN_SINGLECLICK_DELAY_MS } else { d }
+                    if d == 0 {
+                        MIN_SINGLECLICK_DELAY_MS
+                    } else {
+                        d
+                    }
                 };
                 SetTimer(Some(hwnd), TIMER_SINGLECLICK, delay, None);
                 LRESULT(0)
