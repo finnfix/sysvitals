@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
 use gpui_kit::component::button::*;
-use gpui_kit::component::chart::LineChart;
+use gpui_kit::component::chart::AreaChart;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -68,11 +68,37 @@ impl TimeRange {
     }
 }
 
-/// A single data point for the chart.
+/// A single timestamped sample pair for the merged chart: one bucket renders
+/// as one x position carrying both series values, which is why CPU and memory
+/// live in one struct instead of two point lists.
 #[derive(Debug, Clone)]
 struct ChartPoint {
     label: String,
-    value: f64,
+    cpu: f64,
+    mem: f64,
+}
+
+/// How often a visible history window reloads the stored samples. The
+/// indicator writes samples every sample interval, so redrawing every few
+/// seconds makes the chart follow the indicator in near real time.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Chart stroke colors shared by the series, their fills, and the legend.
+const CPU_HUE: f32 = 210.0;
+const MEM_HUE: f32 = 150.0;
+
+fn cpu_color() -> Hsla {
+    hsla(CPU_HUE / 360.0, 0.8, 0.55, 1.0)
+}
+
+fn mem_color() -> Hsla {
+    hsla(MEM_HUE / 360.0, 0.7, 0.45, 1.0)
+}
+
+/// A fill that is invisible: the merged chart draws two zero-alpha areas,
+/// which is exactly two lines with no shading.
+fn transparent_color() -> Hsla {
+    hsla(0.0, 0.0, 0.0, 0.0)
 }
 
 struct HistoryView {
@@ -84,7 +110,7 @@ struct HistoryView {
 }
 
 impl HistoryView {
-    fn new(lang: Language, csv_scope: CsvScope) -> Self {
+    fn new(lang: Language, csv_scope: CsvScope, cx: &mut Context<Self>) -> Self {
         let mut view = Self {
             lang,
             range: TimeRange::Hour1,
@@ -93,7 +119,27 @@ impl HistoryView {
             copied: false,
         };
         view.load_data();
+        view.start_refresh_loop(cx);
         view
+    }
+
+    /// Reload the stored samples every [`REFRESH_INTERVAL`] while the window
+    /// lives. The loop stops as soon as the view entity is released, i.e.
+    /// when the window closes.
+    fn start_refresh_loop(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(REFRESH_INTERVAL).await;
+            if this
+                .update(cx, |view: &mut HistoryView, cx| {
+                    view.load_data();
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
     }
 
     fn load_data(&mut self) {
@@ -112,22 +158,13 @@ impl HistoryView {
         }
     }
 
-    fn cpu_points(&self) -> Vec<ChartPoint> {
+    fn points(&self) -> Vec<ChartPoint> {
         self.buckets
             .iter()
             .map(|b| ChartPoint {
                 label: format_ts(b.ts),
-                value: b.cpu,
-            })
-            .collect()
-    }
-
-    fn mem_points(&self) -> Vec<ChartPoint> {
-        self.buckets
-            .iter()
-            .map(|b| ChartPoint {
-                label: format_ts(b.ts),
-                value: b.mem,
+                cpu: b.cpu,
+                mem: b.mem,
             })
             .collect()
     }
@@ -216,8 +253,7 @@ fn format_ts_full(ts: i64) -> String {
 impl Render for HistoryView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let lang = self.lang;
-        let cpu_points = self.cpu_points();
-        let mem_points = self.mem_points();
+        let points = self.points();
         let copied = self.copied;
         let current_range = self.range;
 
@@ -273,63 +309,60 @@ impl Render for HistoryView {
             )
             .child(h_flex().gap_2().child(range_buttons).child(copy_btn));
 
-        // CPU chart (wrapped in a fixed-height container since LineChart fills parent)
-        let cpu_chart = div().h(px(200.)).child(
-            LineChart::new(cpu_points)
+        // One merged chart for both series. AreaChart accumulates one entry
+        // per `y`/`stroke`/`fill`/`name` call in order, so two of each give
+        // two lines; the zero-alpha fills keep the look of plain lines.
+        // Percentages share one 0..=100 axis, which is what makes merging
+        // sane. The x axis stays on (sparse tick labels read as a time
+        // reference) while the hover tooltip carries the exact value with
+        // two decimals and a percent sign.
+        let merged_chart = div().flex_1().child(
+            AreaChart::new(points)
                 .x(|p: &ChartPoint| p.label.clone())
-                .y(|p: &ChartPoint| p.value)
+                .y(|p: &ChartPoint| p.cpu)
+                .stroke(cpu_color())
+                .fill(transparent_color())
+                .name(t(lang, "chart.cpu").to_string())
+                .y(|p: &ChartPoint| p.mem)
+                .stroke(mem_color())
+                .fill(transparent_color())
+                .name(t(lang, "chart.mem").to_string())
                 .y_domain(0.0, 100.0)
                 .x_axis(true)
+                .x_tick_count(4)
                 .y_axis(true)
                 .grid(true)
-                .stroke(hsla(210.0 / 360.0, 0.8, 0.55, 1.0))
-                .name(t(lang, "chart.cpu").to_string()),
+                .tooltip_value(|_p: &ChartPoint, _series: usize, v: f64| format!("{v:.2}%").into()),
         );
 
-        // MEM chart
-        let mem_chart = div().h(px(200.)).child(
-            LineChart::new(mem_points)
-                .x(|p: &ChartPoint| p.label.clone())
-                .y(|p: &ChartPoint| p.value)
-                .y_domain(0.0, 100.0)
-                .x_axis(true)
-                .y_axis(true)
-                .grid(true)
-                .stroke(hsla(150.0 / 360.0, 0.7, 0.45, 1.0))
-                .name(t(lang, "chart.mem").to_string()),
-        );
-
-        // Legend row: colored dot + label for each series.
-        let cpu_legend = h_flex()
-            .gap_1()
+        // Shared legend: dot + label per series, aligned with the chart's
+        // own colors.
+        let legend = h_flex()
+            .gap_4()
             .items_center()
-            .child(div().w(px(8.)).h(px(8.)).rounded(px(4.)).bg(hsla(
-                210.0 / 360.0,
-                0.8,
-                0.55,
-                1.0,
-            )))
             .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().foreground.opacity(0.7))
-                    .child(t(lang, "chart.cpu").to_string()),
-            );
-
-        let mem_legend = h_flex()
-            .gap_1()
-            .items_center()
-            .child(div().w(px(8.)).h(px(8.)).rounded(px(4.)).bg(hsla(
-                150.0 / 360.0,
-                0.7,
-                0.45,
-                1.0,
-            )))
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(div().w(px(8.)).h(px(8.)).rounded(px(4.)).bg(cpu_color()))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().foreground.opacity(0.7))
+                            .child(t(lang, "chart.cpu").to_string()),
+                    ),
+            )
             .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().foreground.opacity(0.7))
-                    .child(t(lang, "chart.mem").to_string()),
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(div().w(px(8.)).h(px(8.)).rounded(px(4.)).bg(mem_color()))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().foreground.opacity(0.7))
+                            .child(t(lang, "chart.mem").to_string()),
+                    ),
             );
 
         v_flex()
@@ -337,10 +370,8 @@ impl Render for HistoryView {
             .p_4()
             .gap_3()
             .child(header)
-            .child(cpu_legend)
-            .child(cpu_chart)
-            .child(mem_legend)
-            .child(mem_chart)
+            .child(legend)
+            .child(merged_chart)
     }
 }
 
@@ -384,7 +415,7 @@ fn main() {
         };
 
         gpui_kit::open_window(window_options, cx, move |_window, cx| {
-            cx.new(|_cx| HistoryView::new(lang, csv_scope))
+            cx.new(|cx| HistoryView::new(lang, csv_scope, cx))
         })
         .expect("Failed to open history window");
     });
