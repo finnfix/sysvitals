@@ -14,6 +14,9 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::*;
+// `.when(cond, |b| ...)` on builders comes from this trait; the glob above
+// does not re-export it (app-history imports it the same way).
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use sysvitals_core::config::{
