@@ -715,7 +715,8 @@ mod win {
             .unwrap_or(0);
         let snapshot = SAMPLER.with(|s| {
             let mut guard = s.borrow_mut();
-            let sampler = guard.get_or_insert_with(|| Sampler::new(NetSelection::Auto));
+            let sampler = guard
+                .get_or_insert_with(|| Sampler::new(NetSelection::Auto, cfg.sample.cpu_smoothing));
             sampler.sample(now)
         });
         record_history(&cfg, now, &snapshot);
