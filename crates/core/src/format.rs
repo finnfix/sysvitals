@@ -326,21 +326,32 @@ fn cell_at(cells: &[(Metric, String)], idx: usize, width: usize) -> String {
     }
 }
 
-/// Build a vertical (one metric per line) frame for a vertical taskbar
-/// (left or right edge). Each enabled metric gets its own row; column
-/// alignment is irrelevant since there is only one column.
+/// Build a vertical frame for a vertical taskbar (left or right edge), where
+/// the bar's thickness — not its length — limits the usable width.
+///
+/// Layout: one metric per block, and inside a block the label and the value
+/// each occupy their own line so the widest line is only as wide as the label
+/// or the value, never their concatenation. Blocks are separated by one blank
+/// line. A metric whose prefix is empty gets just its value line (an empty
+/// label would be indistinguishable from a block separator).
+///
+/// The prefix is emitted verbatim: it already carries whatever punctuation the
+/// user configured (the built-in defaults end with `:`), and it stays
+/// independent of the UI language.
 pub fn format_frame_vertical(snapshot: &Snapshot, cfg: &Config) -> FormattedRow {
     let enabled: Vec<Metric> = Metric::ALL.into_iter().filter(|m| shown(*m, cfg)).collect();
-    let lines: Vec<Line> = enabled
-        .iter()
-        .map(|m| {
-            Line::single(join_prefix(
-                prefix_for(*m, cfg),
-                &format_value(*m, snapshot),
-            ))
-        })
-        .collect();
-    // Vertical layout stacks one metric per line; pixel item spacing does not
+    let mut lines: Vec<Line> = Vec::with_capacity(enabled.len() * 2);
+    for (i, m) in enabled.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::single(""));
+        }
+        let prefix = prefix_for(*m, cfg);
+        if !prefix.is_empty() {
+            lines.push(Line::single(prefix.to_string()));
+        }
+        lines.push(Line::single(format_value(*m, snapshot)));
+    }
+    // Vertical layout stacks lines and blanks; pixel item spacing does not
     // apply, so `items` stays empty.
     FormattedRow {
         lines,
@@ -550,14 +561,31 @@ mod tests {
     }
 
     #[test]
-    fn vertical_layout_one_metric_per_line() {
+    fn vertical_layout_stacks_label_and_value_per_metric() {
         let cfg = Config::default();
         let f = format_frame_vertical(&snap(29.0, 68.0, 1.2 * MB, 314.0 * KB), &cfg);
-        assert_eq!(f.lines.len(), 4);
-        assert_eq!(f.lines[0].render(), "CPU: 29%");
-        assert_eq!(f.lines[1].render(), "MEM: 68%");
-        assert_eq!(f.lines[2].render(), "U: 1.20 M/s");
-        assert_eq!(f.lines[3].render(), "D: 314 K/s");
+        let texts: Vec<&str> = f.lines.iter().map(|l| l.left.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["CPU:", "29%", "", "MEM:", "68%", "", "U:", "1.20 M/s", "", "D:", "314 K/s"]
+        );
+        assert!(f.items.is_empty());
+    }
+
+    #[test]
+    fn vertical_layout_keeps_widest_line_below_joined_width() {
+        // The whole point of the stacked layout: on a vertical taskbar the bar
+        // thickness limits the width, so no line may be wider than the value
+        // alone (the old joined "U: 1.20 M/s" line was the cause of clipping).
+        let cfg = Config::default();
+        let f = format_frame_vertical(&snap(90.0, 60.0, 1.56 * MB, 100.0 * KB), &cfg);
+        for l in &f.lines {
+            assert!(
+                display_width(&l.left) <= display_width("1.56 M/s"),
+                "line {:?} exceeds the value-only width",
+                l.left
+            );
+        }
     }
 
     #[test]
@@ -565,8 +593,21 @@ mod tests {
         let mut cfg = Config::default();
         cfg.display.show_network = false;
         let f = format_frame_vertical(&snap(29.0, 68.0, 1024.0, 2048.0), &cfg);
-        assert_eq!(f.lines.len(), 2);
-        assert_eq!(f.lines[0].render(), "CPU: 29%");
-        assert_eq!(f.lines[1].render(), "MEM: 68%");
+        let texts: Vec<&str> = f.lines.iter().map(|l| l.left.as_str()).collect();
+        assert_eq!(texts, vec!["CPU:", "29%", "", "MEM:", "68%"]);
+    }
+
+    #[test]
+    fn vertical_layout_empty_prefix_shows_value_only() {
+        // An empty prefix must not produce an extra blank line that would be
+        // indistinguishable from the inter-metric separator.
+        let mut cfg = Config::default();
+        cfg.display.prefix.cpu = "".to_string();
+        let f = format_frame_vertical(&snap(29.0, 68.0, 1024.0, 2048.0), &cfg);
+        let texts: Vec<&str> = f.lines.iter().map(|l| l.left.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["29%", "", "MEM:", "68%", "", "U:", "1.00 K/s", "", "D:", "2.00 K/s"]
+        );
     }
 }
