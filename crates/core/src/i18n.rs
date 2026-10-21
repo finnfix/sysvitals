@@ -42,24 +42,6 @@ impl Language {
 /// silently empty.
 pub fn t(lang: Language, key: &str) -> &str {
     match (lang, key) {
-        // Metric default labels (used as i18n hint, not as the stored prefix).
-        (_, "metric.cpu") => match lang {
-            Language::En => "CPU",
-            Language::Zh => "CPU",
-        },
-        (_, "metric.mem") => match lang {
-            Language::En => "MEM",
-            Language::Zh => "内存",
-        },
-        (_, "metric.up") => match lang {
-            Language::En => "U",
-            Language::Zh => "上传",
-        },
-        (_, "metric.down") => match lang {
-            Language::En => "D",
-            Language::Zh => "下载",
-        },
-
         (Language::En, "settings.title") => "SysVitals Settings",
         (Language::Zh, "settings.title") => "SysVitals 设置",
         (Language::En, "settings.general") => "General",
@@ -116,12 +98,6 @@ pub fn t(lang: Language, key: &str) -> &str {
         (Language::Zh, "anchor.left") => "最左侧（仅 Win11 居中时）",
         (Language::En, "settings.auto_start") => "Start on login",
         (Language::Zh, "settings.auto_start") => "开机自启",
-        (Language::En, "settings.apply") => "Apply",
-        (Language::Zh, "settings.apply") => "应用",
-        (Language::En, "settings.ok") => "OK",
-        (Language::Zh, "settings.ok") => "确定",
-        (Language::En, "settings.cancel") => "Cancel",
-        (Language::Zh, "settings.cancel") => "取消",
 
         (Language::En, "chart.title") => "History",
         (Language::Zh, "chart.title") => "历史走势",

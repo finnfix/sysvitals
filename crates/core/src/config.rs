@@ -96,7 +96,6 @@ pub struct PrefixConfig {
 pub struct HistoryConfig {
     pub enabled: bool,
     pub retention_days: u32,
-    pub sample_interval_ms: u64,
     pub csv_scope: CsvScope,
 }
 
@@ -194,7 +193,6 @@ impl Default for HistoryConfig {
         HistoryConfig {
             enabled: true,
             retention_days: 30,
-            sample_interval_ms: DEFAULT_INTERVAL_MS,
             csv_scope: CsvScope::default(),
         }
     }
@@ -237,9 +235,20 @@ impl Config {
     pub fn sanitize(&mut self) -> Vec<SanitizeIssue> {
         let mut issues = Vec::new();
 
-        self.sample.interval_ms = snap_interval(self.sample.interval_ms, &mut issues);
-        self.history.sample_interval_ms =
-            snap_interval(self.history.sample_interval_ms, &mut issues);
+        if !ALLOWED_INTERVAL_MS.contains(&self.sample.interval_ms) {
+            let old = self.sample.interval_ms;
+            self.sample.interval_ms = *ALLOWED_INTERVAL_MS
+                .iter()
+                .min_by_key(|x| x.abs_diff(old))
+                .unwrap_or(&DEFAULT_INTERVAL_MS);
+            issues.push(SanitizeIssue {
+                field: "sample.interval_ms",
+                message: format!(
+                    "{old} is not allowed, snapped to {}",
+                    self.sample.interval_ms
+                ),
+            });
+        }
 
         if !(0.0..=1.0).contains(&self.sample.cpu_smoothing) {
             let old = self.sample.cpu_smoothing;
@@ -356,22 +365,6 @@ impl Config {
 
         fs::rename(&tmp, path)?;
         Ok(())
-    }
-}
-
-fn snap_interval(value: u64, issues: &mut Vec<SanitizeIssue>) -> u64 {
-    if ALLOWED_INTERVAL_MS.contains(&value) {
-        value
-    } else {
-        let snapped = *ALLOWED_INTERVAL_MS
-            .iter()
-            .min_by_key(|x| x.abs_diff(value))
-            .unwrap_or(&DEFAULT_INTERVAL_MS);
-        issues.push(SanitizeIssue {
-            field: "sample.interval_ms",
-            message: format!("{value} is not allowed, snapped to {snapped}"),
-        });
-        snapped
     }
 }
 

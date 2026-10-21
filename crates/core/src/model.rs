@@ -15,16 +15,6 @@ pub enum Metric {
 
 impl Metric {
     pub const ALL: [Metric; 4] = [Metric::Cpu, Metric::Mem, Metric::Up, Metric::Down];
-
-    /// i18n key for this metric's default label (not the user prefix).
-    pub fn i18n_key(self) -> &'static str {
-        match self {
-            Metric::Cpu => "metric.cpu",
-            Metric::Mem => "metric.mem",
-            Metric::Up => "metric.up",
-            Metric::Down => "metric.down",
-        }
-    }
 }
 
 /// Taskbar anchor position (Windows only).
