@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/core",
-    "crates/ui-common",
     "crates/app-win",
     "crates/app-mac",
     "crates/app-settings",
@@ -13,7 +12,7 @@ members = [
 # Platform crates (app-win / app-mac / app-settings / app-history) are built
 # explicitly with `-p`, so a Linux host never fails on `windows`/`objc2`/GPUI
 # dependencies.
-default-members = ["crates/core", "crates/ui-common"]
+default-members = ["crates/core"]
 
 [workspace.package]
 version = "0.0.0"

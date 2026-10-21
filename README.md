@@ -22,7 +22,6 @@ implemented:
 - `crates/app-settings` — settings window (GPUI), launched as a separate process
 - `crates/app-history` — CPU / memory trend-chart popup (GPUI), with one-click copy for pasting
   into spreadsheets
-- `crates/ui-common` — placeholder for a future shared GPUI settings/tray layer
 
 Nothing is tagged or packaged yet; the Windows and macOS layers are still being validated on real
 desktops.
@@ -44,7 +43,7 @@ desktops.
 Requirements: a stable Rust toolchain (`rust-toolchain.toml` pins it).
 
 ```sh
-cargo build            # cross-platform crates only (core + ui-common)
+cargo build            # cross-platform crate only (core)
 cargo test             # core unit tests
 cargo run -p sysvitals-core --example monitor   # terminal demo of the sampling loop
 ```
@@ -93,7 +92,6 @@ DPI 自适应，点击状态栏项可弹出 CPU / 内存历史走势图。目标
 - `crates/app-mac` —— macOS 菜单栏指示器（`NSStatusItem`）
 - `crates/app-settings` —— 设置窗口（GPUI），作为独立进程拉起
 - `crates/app-history` —— CPU / 内存走势图弹窗（GPUI），一键复制可粘贴进表格的数据
-- `crates/ui-common` —— 未来共享 GPUI 设置/托盘层的占位
 
 尚未打 tag 或出包；Windows 与 macOS 显示层仍在真实桌面上验证。
 
@@ -112,7 +110,7 @@ DPI 自适应，点击状态栏项可弹出 CPU / 内存历史走势图。目标
 要求：stable Rust 工具链（版本由 `rust-toolchain.toml` 锁定）。
 
 ```sh
-cargo build            # 仅跨平台 crate（core + ui-common）
+cargo build            # 仅跨平台 crate（core）
 cargo test             # 核心层单元测试
 cargo run -p sysvitals-core --example monitor   # 终端版采样循环演示
 ```
