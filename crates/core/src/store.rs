@@ -73,15 +73,22 @@ impl Store {
         Ok(Self { conn })
     }
 
-    /// Insert one sample. A duplicate timestamp overwrites the previous value
-    /// (`INSERT OR REPLACE`), which keeps re-runs and clock adjustments from
-    /// producing duplicate rows.
-    pub fn insert(&self, ts: i64, cpu: f64, mem: f64) -> anyhow::Result<()> {
+    /// Insert one sample. Returns `false` (a no-op) when either value is not a
+    /// finite number: SQLite's `REAL NOT NULL` column rejects a NaN binding
+    /// with a constraint error (verified empirically), and first/wake ticks
+    /// legitimately carry NaN — skipping the row is correct, not an error. A
+    /// duplicate timestamp overwrites the previous value (`INSERT OR REPLACE`),
+    /// which keeps re-runs and clock adjustments from producing duplicate rows.
+    /// Real I/O failures still propagate.
+    pub fn insert(&self, ts: i64, cpu: f64, mem: f64) -> anyhow::Result<bool> {
+        if !cpu.is_finite() || !mem.is_finite() {
+            return Ok(false);
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO samples (ts, cpu, mem) VALUES (?1, ?2, ?3)",
             params![ts, cpu, mem],
         )?;
-        Ok(())
+        Ok(true)
     }
 
     /// Insert many samples in a single transaction. Batched writes keep the
@@ -204,6 +211,22 @@ mod tests {
         s.insert(100, 90.0, 90.0).unwrap();
         assert_eq!(s.count().unwrap(), 1);
         assert_eq!(s.latest().unwrap().unwrap().cpu, 90.0);
+    }
+
+    #[test]
+    fn nan_sample_is_skipped_not_error() {
+        // SQLite rejects a NaN binding into a `REAL NOT NULL` column, so the
+        // store must skip non-finite samples (first/wake ticks) as a no-op
+        // rather than error or store a poison row.
+        let s = Store::in_memory().unwrap();
+        assert!(!s.insert(100, f64::NAN, 50.0).unwrap());
+        assert!(!s.insert(101, 50.0, f64::NAN).unwrap());
+        assert!(!s.insert(102, f64::NAN, f64::NAN).unwrap());
+        assert_eq!(s.count().unwrap(), 0, "NaN rows must not be stored");
+        // A finite sample right after still inserts and becomes the latest.
+        assert!(s.insert(103, 50.0, 50.0).unwrap());
+        assert_eq!(s.count().unwrap(), 1);
+        assert_eq!(s.latest().unwrap().unwrap().ts, 103);
     }
 
     #[test]
