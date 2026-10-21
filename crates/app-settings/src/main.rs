@@ -150,9 +150,9 @@ struct SettingsView {
     theme_idx: usize,
     anchor_idx: usize,
     // Dropdown states (item text may carry the selected language)
-    spacing_select: Entity<AnchorSelectState>,
-    margin_select: Entity<AnchorSelectState>,
-    anchor_select: Entity<AnchorSelectState>,
+    spacing_select: Entity<StringSelectState>,
+    margin_select: Entity<StringSelectState>,
+    anchor_select: Entity<StringSelectState>,
     /// Whether the layout section is offered on this machine (see
     /// `layout_available`). False hides it entirely.
     layout_available: bool,
