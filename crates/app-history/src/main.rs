@@ -317,6 +317,7 @@ impl HistoryView {
     }
 
     fn copy_csv(&mut self) {
+        let lang = self.lang;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -334,13 +335,16 @@ impl HistoryView {
         // do not collide with the internal space of the "YYYY-MM-DD HH:MM:SS"
         // timestamp column. The UTF-8 BOM keeps CJK headers readable in Excel.
         let mut csv = String::from("\u{FEFF}");
-        let header = match self.lang {
-            Language::En => "timestamp\tcpu_pct\tmem_pct",
-            Language::Zh => {
-                "\u{65F6}\u{95F4}\tCPU\u{5360}\u{7528}\t\u{5185}\u{5B58}\u{5360}\u{7528}"
-            }
-        };
-        csv.push_str(header);
+        // Header labels come from the core i18n table (single source of truth
+        // for the CSV columns), not a local copy, so a header edit lives in
+        // exactly one place.
+        let header = format!(
+            "{}\t{}\t{}",
+            t(lang, "csv.header.timestamp"),
+            t(lang, "csv.header.cpu"),
+            t(lang, "csv.header.mem")
+        );
+        csv.push_str(&header);
         csv.push('\n');
 
         if let Ok(path) = history_path() {
