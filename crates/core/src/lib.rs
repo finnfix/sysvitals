@@ -20,10 +20,8 @@ pub mod sampler;
 pub mod store;
 
 pub use config::Config;
-pub use format::{
-    format_frame, format_frame_vertical, format_percent, format_rate, FormattedRow, Line,
-};
+pub use format::{format_frame, format_frame_vertical, FormattedRow, Line};
 pub use i18n::{t, Language};
 pub use model::{Anchor, Metric, Snapshot, Theme};
-pub use sampler::{CpuSampler, MemSampler, NetSampler, NetSelection, Sampler};
+pub use sampler::{CpuSampler, NetSampler, NetSelection, Sampler};
 pub use store::{Bucket, Sample, Store};
