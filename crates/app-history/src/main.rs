@@ -204,6 +204,15 @@ struct HistoryView {
     /// Kept alive so the activation observer is not cancelled; dropped when
     /// the view is released.
     _activation: Option<Subscription>,
+    /// Kept alive so the Esc observer is not cancelled. Esc closes the popup.
+    /// This is an app-level keystroke observer, not a window paint-phase
+    /// listener: registering from `render` with `Window::on_key_event` would
+    /// touch the dispatch tree's active node, which does not exist yet for
+    /// the root view on the first paint frame — GPUI unwraps it and panics,
+    /// killing the process the moment the popup opens. This process owns a
+    /// single window with no text fields, so a global keystroke observer is
+    /// both safe and simpler.
+    _escape: Option<Subscription>,
 }
 
 impl HistoryView {
@@ -216,10 +225,25 @@ impl HistoryView {
             copied: false,
             ever_active: false,
             _activation: None,
+            _escape: None,
         };
         view.load_data();
         view.start_refresh_loop(cx);
+        view.start_escape_observer(cx);
         view
+    }
+
+    /// Dismiss the popup when Esc is pressed.
+    fn start_escape_observer(&mut self, cx: &mut Context<Self>) {
+        if self._escape.is_some() {
+            return;
+        }
+        let subscription = cx.observe_keystrokes(|_view, event, window, _cx| {
+            if event.keystroke.key == "escape" {
+                window.remove_window();
+            }
+        });
+        self._escape = Some(subscription);
     }
 
     /// Watch the window's activation and dismiss the popup when it loses
@@ -382,15 +406,6 @@ impl Render for HistoryView {
 
         // Register the blur-close observer exactly once.
         self.observe_activation(window, cx);
-
-        // Esc closes the popup. `on_key_event` belongs to the paint phase,
-        // so it lives here rather than in the constructor. It re-registers
-        // every frame, and the handler needs no entity state.
-        window.on_key_event::<KeyDownEvent>(|event, phase, window, _cx| {
-            if phase == DispatchPhase::Bubble && event.keystroke.key == "escape" {
-                window.remove_window();
-            }
-        });
 
         // Build range buttons individually to avoid borrow issues with cx.listener.
         let mut range_buttons = h_flex().gap_1();
