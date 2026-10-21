@@ -10,20 +10,25 @@
 //! - Rates are differentials of monotonically increasing cumulative byte
 //!   counters. A counter below its baseline (wrap-around or driver reset)
 //!   yields "no data" (NaN) for that frame rather than a negative rate.
-//! - Interface set changes (add/remove/unplug, sleep-wake) rebuild the
-//!   baseline instead of panicking; a huge wall-clock gap with ~no byte delta
-//!   is dropped as a stale frame.
+//! - Interface set changes (add/remove/unplug) rebuild the baseline instead
+//!   of panicking.
+//! - A tick gap far larger than any configured interval means the machine
+//!   slept or the process was stalled: the frame is dropped as stale (CPU
+//!   re-primes from raw, network reports NaN) so no sleep-spanning rate
+//!   reaches the display or the history ([`STALE_GAP_SECS`]).
 //! - Only selected physical NICs are aggregated; loopback / VPN / virtual
 //!   adapters are excluded by default, with a user override to pin a list.
-//! - CPU percent is optionally exponentially smoothed and clamped.
+//! - CPU percent is exponentially smoothed with the `sample.cpu_smoothing`
+//!   history weight (0 disables) and clamped.
 
 mod cpu;
 mod mem;
 mod net;
 
 pub use cpu::CpuSampler;
-pub use mem::MemSampler;
 pub use net::{NetSampler, NetSelection};
+
+pub use cpu::STALE_GAP_SECS;
 
 use std::time::Instant;
 
@@ -46,8 +51,11 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    /// Build a sampler and seed the first cumulative-counter / memory baselines.
-    pub fn new(interfaces: NetSelection) -> Self {
+    /// Build a sampler and seed the first cumulative-counter / memory
+    /// baselines. `cpu_smoothing` is the `sample.cpu_smoothing` history
+    /// weight (0 disables smoothing); it is fixed for the process lifetime —
+    /// the config poller treats it as a startup-only debug setting.
+    pub fn new(interfaces: NetSelection, cpu_smoothing: f64) -> Self {
         let system = System::new_with_specifics(
             RefreshKind::nothing()
                 .with_cpu(CpuRefreshKind::everything())
@@ -58,15 +66,9 @@ impl Sampler {
             system,
             networks,
             net: NetSampler::new(interfaces),
-            cpu: CpuSampler::default(),
+            cpu: CpuSampler::new(cpu_smoothing),
             last_tick: None,
         }
-    }
-
-    /// Change the NIC policy and rebuild network baselines so the next frame
-    /// is measured against the new selection.
-    pub fn set_interfaces(&mut self, interfaces: NetSelection) {
-        self.net = NetSampler::new(interfaces);
     }
 
     /// Take one reading. The first call returns CPU/MEM with NaN network rates
@@ -100,13 +102,5 @@ impl Sampler {
             up_bps: up,
             down_bps: down,
         }
-    }
-
-    /// Force the next `sample()` to re-establish all baselines (call after
-    /// waking from sleep, where counters and the monotonic clock resume oddly).
-    pub fn reset_baseline(&mut self) {
-        self.net.reset();
-        self.cpu.reset();
-        self.last_tick = None;
     }
 }

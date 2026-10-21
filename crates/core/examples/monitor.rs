@@ -16,7 +16,7 @@ fn main() {
     let mut cfg = Config::default();
     cfg.sanitize(); // exercise validation; defaults are already valid
 
-    let mut sampler = Sampler::new(NetSelection::Auto);
+    let mut sampler = Sampler::new(NetSelection::Auto, cfg.sample.cpu_smoothing);
     let tick = Duration::from_millis(cfg.sample.interval_ms);
 
     println!("SysVitals core monitor (Ctrl-C to stop) — single row, then dual row\n");

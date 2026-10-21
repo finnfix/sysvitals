@@ -98,6 +98,10 @@ pub type CounterFrame = Vec<Counters>;
 /// Rules:
 /// - `elapsed_secs <= 0` → `(NaN, NaN)` (no time to measure), but the baseline
 ///   is still refreshed so the next tick is correct.
+/// - A gap larger than [`STALE_GAP_SECS`] (sleep / stalled process) → same
+///   `(NaN, NaN)` drop: averaging bytes accumulated across a multi-minute
+///   freeze into one instantaneous rate would be a lie; the baseline re-seeds
+///   so the next normal tick is accurate.
 /// - First frame (empty baseline) → `(NaN, NaN)`: seed the baseline only.
 /// - Per interface: a counter that went *down* (wrap or driver reset) makes
 ///   that interface contribute nothing this frame and re-baselines it, instead
@@ -138,9 +142,10 @@ pub fn compute_rates(
         baseline.insert(name.clone(), (*rx, *tx));
     }
 
-    if elapsed_secs <= 0.0 || !valid_any {
-        // No usable interval, or no interface had a valid diff (all new, or
-        // all wrapped, or the very first frame) → report "no data".
+    if elapsed_secs <= 0.0 || elapsed_secs > super::cpu::STALE_GAP_SECS || !valid_any {
+        // No usable interval, a stale sleep-spanning gap, or no interface had
+        // a valid diff (all new, or all wrapped, or the very first frame) →
+        // report "no data".
         return (f64::NAN, f64::NAN);
     }
 
@@ -332,6 +337,26 @@ mod tests {
         compute_rates(&mut base, &[("eth0".to_string(), 0, 0)], secs(1000));
         let (up, down) = compute_rates(&mut base, &[("eth0".to_string(), 1000, 1000)], 0.0);
         assert!(up.is_nan() && down.is_nan());
+    }
+
+    #[test]
+    fn stale_gap_is_dropped_as_no_data() {
+        // A gap beyond STALE_GAP_SECS (the machine slept) must not divide the
+        // bytes accumulated across the freeze into a bogus instantaneous rate.
+        let mut base = HashMap::new();
+        compute_rates(&mut base, &[("eth0".to_string(), 0, 0)], secs(1000));
+        let stale = super::super::cpu::STALE_GAP_SECS + 30.0;
+        let (up, down) = compute_rates(&mut base, &[("eth0".to_string(), 100000, 100000)], stale);
+        assert!(up.is_nan() && down.is_nan(), "stale gap → no data");
+        // Baseline still re-seeded so the next normal tick is correct.
+        assert_eq!(base.get("eth0"), Some(&(100000, 100000)));
+        let (up, down) = compute_rates(
+            &mut base,
+            &[("eth0".to_string(), 102000, 100000)],
+            secs(2000),
+        );
+        assert_eq!(down, 1000.0);
+        assert!(up.is_nan() || up == 0.0);
     }
 
     #[test]

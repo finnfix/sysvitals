@@ -16,21 +16,6 @@ pub fn percent_used(used: u64, total: u64) -> f64 {
     pct.clamp(0.0, 100.0)
 }
 
-/// Stateless wrapper kept for symmetry with CPU/NET sub-samplers and so the
-/// display layer can hold one sampler object per metric if it wants.
-#[derive(Debug, Clone, Default)]
-pub struct MemSampler;
-
-impl MemSampler {
-    pub fn new() -> Self {
-        MemSampler
-    }
-
-    pub fn percent(&self, used: u64, total: u64) -> f64 {
-        percent_used(used, total)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
