@@ -24,14 +24,20 @@ mod macos {
     use objc2::runtime::AnyObject;
     use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventType, NSMenu, NSMenuItem,
-        NSScreen, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+        NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventType, NSFont, NSMenu,
+        NSMenuItem, NSScreen, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
     };
     use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimer};
 
     use sysvitals_core::config::config_path;
     use sysvitals_core::format::format_frame;
     use sysvitals_core::{Config, NetSelection, Sampler};
+
+    /// Font-size factor for the dual-row layout: the menu bar has a fixed
+    /// height, so two lines only fit with the system menu-bar font scaled
+    /// down (≈0.75 — the same factor the Windows overlay uses, see the
+    /// `dual_row` note in core config).
+    const DUAL_ROW_FONT_FACTOR: f64 = 0.75;
 
     thread_local! {
         static SAMPLER: RefCell<Option<Sampler>> = const { RefCell::new(None) };
@@ -119,8 +125,20 @@ mod macos {
 
         let row = format_frame(&snapshot, &cfg);
 
+        // Dual-row: stack the two formatted lines into one two-line title.
+        // The menu bar height is fixed, so both lines only fit with the font
+        // scaled down (0.75 of the system menu-bar size — the same factor the
+        // Windows overlay uses for the 2x2 quadrant).
+        let dual = cfg.display.dual_row && row.lines.len() > 1;
+
         // Build the display text from the formatted row.
-        let text = if row.items.is_empty() {
+        let text = if dual {
+            row.lines
+                .iter()
+                .map(|l| l.render().trim_end().to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else if row.items.is_empty() {
             row.lines
                 .iter()
                 .map(|l| {
@@ -138,10 +156,27 @@ mod macos {
 
         let title = NSString::from_str(&text);
         let mtm = mtm();
+        // Single-row strictly follows the system menu-bar font (size 0 =
+        // standard); dual-row uses the 0.75-scaled variant. `menuBarFontOfSize`
+        // is the canonical menu-bar face at the requested size, so this only
+        // changes the size, never the family.
+        let font = if dual {
+            let base = NSFont::menuBarFontOfSize(0.0);
+            let scaled = (base.pointSize() * DUAL_ROW_FONT_FACTOR).max(1.0);
+            NSFont::menuBarFontOfSize(scaled)
+        } else {
+            NSFont::menuBarFontOfSize(0.0)
+        };
         STATUS_ITEM.with(|si| {
             if let Some(item) = si.borrow().as_ref() {
                 if let Some(button) = item.button(mtm) {
                     button.setTitle(&title);
+                    button.setFont(Some(&font));
+                    // The two-line title only renders as two lines when the
+                    // cell wraps; single-line titles are unaffected.
+                    if let Some(cell) = button.cell() {
+                        cell.setWraps(dual);
+                    }
                 }
             }
         });
