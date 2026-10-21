@@ -116,6 +116,21 @@ mod win {
     /// two rounded widths do not match exactly, so without slack the last
     /// characters get clipped.
     const WIDTH_SLACK_PX: i32 = 8;
+    /// Font size for the vertical (left/right) taskbar layout, as a fraction of
+    /// the system UI size expressed in tenths. On a vertical taskbar the bar's
+    /// *thickness* — not its length — is the width budget: a typical bar is
+    /// ~48 logical px wide, while the longest rate string (`1023 M/s`) rendered
+    /// at the system UI size with a CJK face needs more than that, so the
+    /// system size would clip. The stacked label/value column plus this
+    /// reduction keeps every line inside the bar. Horizontal taskbars are
+    /// limited by height, not width, so they keep the system size untouched.
+    const VERTICAL_FONT_TENTHS: i32 = 6;
+    /// Horizontal padding for the vertical layout: the thickness is the binding
+    /// constraint, so the text keeps a tighter margin than on horizontal bars.
+    const VERTICAL_PAD_PX: i32 = 3;
+    /// Width slack for the vertical layout (same rounding compensation as
+    /// `WIDTH_SLACK_PX`, trimmed because every pixel counts against the bar).
+    const VERTICAL_WIDTH_SLACK_PX: i32 = 4;
     const THEME_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
     const THEME_VALUE: &str = "SystemUsesLightTheme";
     const TASKBAR_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced";
@@ -350,13 +365,47 @@ mod win {
             .clone()
     }
 
+    /// Effective glyph height in pixels for the current taskbar orientation:
+    /// the system UI size on a horizontal bar, reduced by
+    /// `VERTICAL_FONT_TENTHS` on a vertical (left/right) bar where the bar's
+    /// thickness — not its length — is the width budget.
+    fn effective_font_height() -> i32 {
+        let (height, _) = ui_font();
+        if TASKBAR_VERTICAL.load(Ordering::Relaxed) {
+            // `height` is a negative character height; clamp the reduction so a
+            // tiny system font can never produce 0 (which CreateFontW would
+            // silently interpret as "default font").
+            (height * VERTICAL_FONT_TENTHS / 10).min(-1)
+        } else {
+            height
+        }
+    }
+
+    /// Horizontal padding for the current orientation.
+    fn pad_px() -> i32 {
+        if TASKBAR_VERTICAL.load(Ordering::Relaxed) {
+            VERTICAL_PAD_PX
+        } else {
+            PAD_PX
+        }
+    }
+
+    /// Width slack for the current orientation.
+    fn width_slack_px() -> i32 {
+        if TASKBAR_VERTICAL.load(Ordering::Relaxed) {
+            VERTICAL_WIDTH_SLACK_PX
+        } else {
+            WIDTH_SLACK_PX
+        }
+    }
+
     /// Overlay font: the system UI face at the system UI size, grayscale AA.
     /// Antialiased (not ClearType) because the glyphs are composited
     /// per-pixel-alpha over the taskbar.
     unsafe fn make_font() -> HFONT {
-        let (height, face) = ui_font();
+        let (_, face) = ui_font();
         CreateFontW(
-            height,
+            effective_font_height(),
             0,
             0,
             0,
@@ -376,9 +425,9 @@ mod win {
     /// Overlay font at an integer supersample multiplier. Used to render at a
     /// supersampled scale (2x) before downsampling.
     unsafe fn make_font_at(scale: i32) -> HFONT {
-        let (height, face) = ui_font();
+        let (_, face) = ui_font();
         CreateFontW(
-            height * scale.max(1),
+            effective_font_height() * scale.max(1),
             0,
             0,
             0,
@@ -401,6 +450,10 @@ mod win {
     struct TaskbarInfo {
         rect: RECT,
         vertical: bool,
+        /// True when a vertical bar is docked to the *left* screen edge. The
+        /// placement code uses it to pick which edge the indicator must never
+        /// run past when its column is wider than the bar's thickness.
+        left_edge: bool,
     }
 
     /// Taskbar geometry, or `None` when the taskbar is not currently on screen
@@ -422,7 +475,11 @@ mod win {
             return None;
         }
         let vertical = abd.uEdge == ABE_LEFT || abd.uEdge == ABE_RIGHT;
-        Some(TaskbarInfo { rect: r, vertical })
+        Some(TaskbarInfo {
+            rect: r,
+            vertical,
+            left_edge: abd.uEdge == ABE_LEFT,
+        })
     }
 
     /// Move-only placement. Visibility follows the taskbar alone: as long as
@@ -459,8 +516,19 @@ mod win {
         let h = WIN_H.load(Ordering::Relaxed);
 
         let (x, y) = if info.vertical {
-            // Vertical taskbar: horizontally centered, anchored top or bottom.
-            let x = bar.left + (bar.right - bar.left - w) / 2;
+            // Vertical taskbar: horizontally centered within the bar thickness,
+            // anchored top or bottom. When the stacked column is wider than the
+            // bar's thickness, centering would push the window past the screen
+            // edge it is docked to and clip it. Clamp so the overflow goes into
+            // the desktop instead: keep the left edge on-screen for a
+            // left-docked bar, the right edge on-screen for a right-docked bar.
+            let center_x = bar.left + (bar.right - bar.left - w) / 2;
+            let screen_w = GetSystemMetrics(SM_CXSCREEN);
+            let x = if info.left_edge {
+                center_x.max(0)
+            } else {
+                center_x.min(screen_w - w).max(0)
+            };
             let left_anchor =
                 cfg.windows.anchor == sysvitals_core::Anchor::Left && win11_centered_taskbar();
             let y = if left_anchor {
@@ -620,7 +688,7 @@ mod win {
             return;
         }
         let line_h = m.line_h + 2;
-        let want_w = m.want_w + PAD_PX * 2 + WIDTH_SLACK_PX;
+        let want_w = m.want_w + pad_px() * 2 + width_slack_px();
         let want_h = line_h * row.lines.len() as i32 + 2;
         WIN_W.fetch_max(want_w, Ordering::Relaxed);
         WIN_H.store(want_h, Ordering::Relaxed);
@@ -761,6 +829,9 @@ mod win {
 
         let ss_line_h = sh / row.lines.len().max(1) as i32;
         let spacing_px = config().display.item_spacing as i32;
+        // Padding follows the orientation so the vertical layout can use its
+        // tighter margin; measurement and rendering must agree on it.
+        let pad = pad_px() * SS;
         let fm = measure_frame(mem_dc, &row, spacing_px * SS);
         for (i, line) in row.lines.iter().enumerate() {
             let top = i as i32 * ss_line_h;
@@ -790,9 +861,9 @@ mod win {
             } else if let Some(right_x) = fm.right_x {
                 // Dual-row: left column left-aligned, right column at offset.
                 let mut left_rc = RECT {
-                    left: PAD_PX * SS,
+                    left: pad,
                     top,
-                    right: PAD_PX * SS + right_x,
+                    right: pad + right_x,
                     bottom,
                 };
                 let mut lbuf = utf16(&line.left);
@@ -804,9 +875,9 @@ mod win {
                 );
                 if !line.right.is_empty() {
                     let mut right_rc = RECT {
-                        left: PAD_PX * SS + right_x,
+                        left: pad + right_x,
                         top,
-                        right: sw - PAD_PX * SS,
+                        right: sw - pad,
                         bottom,
                     };
                     let mut rbuf = utf16(&line.right);
@@ -821,9 +892,9 @@ mod win {
                 // Multi-line single column: left-aligned.
                 let text = row_text(line);
                 let mut line_rc = RECT {
-                    left: PAD_PX * SS,
+                    left: pad,
                     top,
-                    right: sw - PAD_PX * SS,
+                    right: sw - pad,
                     bottom,
                 };
                 let mut buf = utf16(&text);
