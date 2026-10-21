@@ -16,6 +16,12 @@ publish.workspace = true
 sysvitals-core = { workspace = true }
 gpui-kit = { workspace = true }
 
+# Windows-only: the settings window reads the same registry flag as the
+# overlay (HKCU Explorer\Advanced\TaskbarAl) to decide whether to offer the
+# taskbar anchor choices.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+
 [target.'cfg(windows)'.build-dependencies]
 winres = "=0.1.12"
 

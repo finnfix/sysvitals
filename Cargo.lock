@@ -215,6 +215,7 @@ version = "0.0.0"
 dependencies = [
  "gpui-kit",
  "sysvitals-core",
+ "windows 0.62.2",
  "winres",
 ]
 
