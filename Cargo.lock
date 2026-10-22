@@ -195,6 +195,7 @@ dependencies = [
  "chrono",
  "gpui-kit",
  "sysvitals-core",
+ "windows 0.62.2",
  "winres",
 ]
 

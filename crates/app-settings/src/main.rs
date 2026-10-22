@@ -5,6 +5,11 @@
 //! every change back atomically as it happens: there are no dialog buttons,
 //! the overlay watches the config file and hot-reloads it. The window itself
 //! is closed with the system title-bar close button.
+//!
+//! Visual theme: light/dark follows the user's config preference (auto
+//! mirrors the OS appearance and re-syncs on a live system flip), and on
+//! Windows the primary button color is derived from the OS accent color so
+//! the segmented controls match what the rest of the shell uses.
 
 // A GUI child process must not allocate a console window on Windows: without
 // this attribute the binary is built as a console subsystem executable and a
@@ -22,6 +27,7 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::theme::{Theme as UiTheme, ThemeMode};
 use gpui_kit::component::*;
 // `.when(cond, |b| ...)` on builders comes from this trait; the glob above
 // does not re-export it (app-history imports it the same way).
@@ -103,6 +109,118 @@ fn layout_available() -> bool {
     false
 }
 
+/// The system accent color packed as `0x00RRGGBB`, or `None` when it cannot
+/// be read.
+///
+/// Windows exposes the accent picker's choice through
+/// `DwmGetColorizationColor`, which returns an ARGB DWORD. The opaque flag
+/// is ignored: even when translucency effects are on, the RGB channels are
+/// the same accent the Settings app paints with. Non-Windows hosts have no
+/// equivalent single knob, and callers fall back to the library default.
+#[cfg(windows)]
+fn system_accent_hex() -> Option<u32> {
+    use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
+    let mut argb = 0u32;
+    // The opaque-blend flag is not read (the accent color is meaningful
+    // whether or not translucency effects are on). Written via
+    // `Default::default()` so the code does not name the `BOOL` type: in
+    // windows-core 0.62 that is a plain `pub type BOOL = i32` alias, and
+    // naming it as `BOOL(0)` would compile as a tuple-struct constructor
+    // (E0423). `Default` covers both aliases and newtypes.
+    let opaque_result = unsafe { DwmGetColorizationColor(&mut argb, &mut Default::default()) };
+    opaque_result.ok()?;
+    Some(argb & 0x00FF_FFFF)
+}
+
+#[cfg(not(windows))]
+fn system_accent_hex() -> Option<u32> {
+    None
+}
+
+/// Convert a packed 24-bit RGB hex to GPUI's `Hsla` (h in 0..1, s/l/a in
+/// 0..1). Hand-rolled so this code path does not depend on whether the
+/// current gpui-kit re-export exposes `rgb` and `Rgba`; only `hsla`, `Hsla`,
+/// and `f32` math are required, all of which are already used in this file.
+fn rgb_hex_to_hsla(hex: u32) -> Hsla {
+    let r = ((hex >> 16) & 0xFF) as f32 / 255.0;
+    let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
+    let b = (hex & 0xFF) as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) * 0.5;
+    if (max - min).abs() < 1e-6 {
+        return hsla(0.0, 0.0, l, 1.0);
+    }
+    let d = max - min;
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
+    let h = if (max - r).abs() < 1e-6 {
+        ((g - b) / d + if g < b { 6.0 } else { 0.0 }) / 6.0
+    } else if (max - g).abs() < 1e-6 {
+        ((b - r) / d + 2.0) / 6.0
+    } else {
+        ((r - g) / d + 4.0) / 6.0
+    };
+    hsla(h, s, l, 1.0)
+}
+
+/// Push the OS accent color into the GPUI theme so every primary-tinted
+/// control (segmented tiles, switches, focus rings, the Select popup's
+/// active row) matches the Windows "Personalization / Colors" choice.
+///
+/// The library's default `ThemeColor.button_primary` is a fixed brand blue
+/// that does NOT derive from `ThemeColor.primary`, so both fields are
+/// written; the hover/active variants are derived by shifting lightness
+/// around the accent, and `ring` follows so the focus outline agrees with
+/// the button. Foreground colors (near-white on the default palette) are
+/// left untouched — Windows accent colors are always dark enough that a
+/// white foreground stays readable. A no-op on hosts with no accent source
+/// or when the DWM call fails: the library's default palette is preferable
+/// to a half-set theme.
+fn apply_accent(cx: &mut App) {
+    let Some(hex) = system_accent_hex() else {
+        return;
+    };
+    let base = rgb_hex_to_hsla(hex);
+    UiTheme::update(cx, |theme| {
+        let shift = |dl: f32| Hsla {
+            l: (base.l + dl).clamp(0.05, 0.95),
+            ..base
+        };
+        theme.colors.primary = base;
+        theme.colors.button_primary = base;
+        theme.colors.primary_hover = shift(0.06);
+        theme.colors.button_primary_hover = shift(0.06);
+        theme.colors.primary_active = shift(-0.06);
+        theme.colors.button_primary_active = shift(-0.06);
+        theme.colors.ring = base;
+    });
+}
+
+/// Apply the user's theme preference (from the shared config) to the GPUI
+/// theme. `auto` mirrors the OS appearance; `light`/`dark` override it.
+/// Idempotent and safe to call at startup, on config reload, and on a live
+/// system appearance change.
+fn apply_theme_preference(cx: &mut App, theme: Theme) {
+    match theme {
+        Theme::Light => UiTheme::change(ThemeMode::Light, None, cx),
+        Theme::Dark => UiTheme::change(ThemeMode::Dark, None, cx),
+        Theme::Auto => UiTheme::sync_system_appearance(None, cx),
+    }
+}
+
+/// Re-apply the theme preference and the accent override together.
+/// `Theme::change` (and `sync_system_appearance`, which calls it) loads the
+/// registered palette for the mode, which overwrites every color field —
+/// an accent applied earlier is wiped, so it must follow every theme change.
+fn apply_theme_and_accent(cx: &mut App, theme: Theme) {
+    apply_theme_preference(cx, theme);
+    apply_accent(cx);
+}
+
 // ---------------------------------------------------------------------------
 // Dropdown item builders
 // ---------------------------------------------------------------------------
@@ -162,6 +280,11 @@ struct SettingsView {
     /// so a prefix typed right before closing with the title-bar button is
     /// not lost (its field may never have received an explicit blur).
     _deactivation: Option<Subscription>,
+    /// Kept alive so the appearance observer is not cancelled: a live OS
+    /// light/dark flip re-applies the user's theme preference (which mirrors
+    /// the OS only under `auto`; under an explicit light/dark override the
+    /// re-apply is a no-op that reloads the same palette).
+    _appearance: Option<Subscription>,
 }
 
 impl SettingsView {
@@ -303,11 +426,24 @@ impl SettingsView {
             layout_available: layout_available(),
             _subscriptions,
             _deactivation: None,
+            _appearance: None,
         }
     }
 
     fn current_lang(&self) -> Language {
         Language::ALL[self.lang_idx]
+    }
+
+    /// The theme preference the segmented tile currently encodes. Used by
+    /// the live appearance observer, which must re-apply the user's choice
+    /// (not the raw OS appearance) so an explicit light/dark override
+    /// survives a system flip.
+    fn theme_pref(&self) -> Theme {
+        match self.theme_idx {
+            1 => Theme::Light,
+            2 => Theme::Dark,
+            _ => Theme::Auto,
+        }
     }
 
     /// Enforce "at least one indicator group stays on": when the user turns
@@ -411,6 +547,21 @@ impl Render for SettingsView {
             self._deactivation = Some(sub);
         }
 
+        // Live OS appearance flip (registered once): re-apply the user's
+        // theme preference so an `auto` window follows the system light/dark
+        // change while open, and an explicit override stays pinned to its
+        // chosen palette. Same first-render registration pattern as the
+        // activation observer (never from a paint-phase API — the root
+        // view's empty active-node stack would panic the unwrap inside
+        // `window.on_key_event`).
+        if self._appearance.is_none() {
+            let sub = cx.observe_window_appearance(window, |this: &mut Self, _w, cx| {
+                apply_theme_and_accent(cx, this.theme_pref());
+                cx.notify();
+            });
+            self._appearance = Some(sub);
+        }
+
         // Every label comes from the core i18n table, keyed on the
         // *currently selected* language, so switching language repaints the
         // whole window immediately instead of only after saving.
@@ -490,6 +641,13 @@ impl Render for SettingsView {
                               _: &mut Window,
                               cx: &mut Context<Self>| {
                             this.theme_idx = i;
+                            // Apply the chosen theme immediately so the
+                            // window repaints in the new colors (the config
+                            // write tells the overlay, but only the theme
+                            // call updates this GPUI process's own palette),
+                            // and re-apply the accent since changing the
+                            // mode reloads the whole palette.
+                            apply_theme_and_accent(cx, this.theme_pref());
                             this.save(cx);
                             cx.notify();
                         },
@@ -647,15 +805,27 @@ fn main() {
     //
     // Windows has no equivalent: a headless windowing request there refuses to
     // open windows, so the default windowed startup is left untouched there.
+    //
+    // `with_assets(Assets)` registers the bundled Lucide icon catalog as the
+    // GPUI asset source. Without it, the default source (`()`) returns
+    // `Ok(None)` for every path, so every `IconName` — including the Select
+    // dropdown's ChevronDown arrow — renders as blank.
     #[cfg(target_os = "macos")]
     let app = gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
         .with_windowing(WindowingRequest::Headless)
         .with_quit_mode(QuitMode::LastWindowClosed);
     #[cfg(not(target_os = "macos"))]
-    let app = gpui_kit::application();
+    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
 
     app.run(move |cx| {
         gpui_kit::init(cx);
+        // `gpui_component::theme::init` hardcodes `Theme::change(Light)`, so
+        // the user's saved preference must be re-applied before the window
+        // is opened — otherwise a dark-mode desktop shows a light settings
+        // panel for the first frame. The OS accent override comes with it
+        // (both are theme-color writes and must be sequenced together).
+        apply_theme_and_accent(cx, cfg.display.theme);
 
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(420.), px(640.)), cx)),
