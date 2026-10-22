@@ -16,6 +16,9 @@ use crate::model::{Metric, Snapshot};
 
 /// Bytes-per-second unit thresholds on the 1024 base. Four adaptive tiers:
 /// `B/s` below 1 KB/s, `K/s` below 1 MB/s, `M/s` below 1 GB/s, `G/s` above.
+/// The vertical taskbar layout uses the same four tiers without the `/s`
+/// suffix (see [`format_rate_compact`]), because there the bar's thickness
+/// rather than its length is the width budget.
 pub const KB: f64 = 1024.0;
 pub const MB: f64 = 1024.0 * KB;
 pub const GB: f64 = 1024.0 * MB;
@@ -37,15 +40,27 @@ pub fn format_percent(value: f64) -> String {
 ///   1.20 M/s   (<10   -> 2 decimals)
 /// ```
 pub fn format_rate(bps: f64) -> String {
+    format_rate_with(bps, true)
+}
+
+/// Same tiering and decimal rules as [`format_rate`], but the unit is only
+/// the tier letter with no `/s` suffix (`314 B`, `12.5 K`, `1.20 M`). Used by
+/// the vertical taskbar layout, where the bar's thickness caps the width and
+/// the direction is already implied by the metric label above the value.
+pub fn format_rate_compact(bps: f64) -> String {
+    format_rate_with(bps, false)
+}
+
+fn format_rate_with(bps: f64, with_per_sec: bool) -> String {
     let bps = if bps < 0.0 || bps.is_nan() { 0.0 } else { bps };
-    let (scaled, unit) = if bps < KB {
-        (bps, "B/s")
+    let (scaled, letter) = if bps < KB {
+        (bps, "B")
     } else if bps < MB {
-        (bps / KB, "K/s")
+        (bps / KB, "K")
     } else if bps < GB {
-        (bps / MB, "M/s")
+        (bps / MB, "M")
     } else {
-        (bps / GB, "G/s")
+        (bps / GB, "G")
     };
     let decimals = if scaled >= 100.0 {
         0
@@ -54,7 +69,12 @@ pub fn format_rate(bps: f64) -> String {
     } else {
         2
     };
-    format!("{scaled:.decimals$} {unit}")
+    let value = format!("{scaled:.decimals$}");
+    if with_per_sec {
+        format!("{value} {letter}/s")
+    } else {
+        format!("{value} {letter}")
+    }
 }
 
 /// Combine a user prefix with an already-formatted value, inserting exactly
@@ -197,6 +217,16 @@ fn shown(metric: Metric, cfg: &Config) -> bool {
 
 /// Format a single metric value to its display string (no prefix).
 pub fn format_value(metric: Metric, snapshot: &Snapshot) -> String {
+    format_value_impl(metric, snapshot, true)
+}
+
+/// The same value rendered without the `/s` suffix on network rates. Used by
+/// the vertical taskbar layout, where the bar thickness caps the width.
+pub fn format_value_compact(metric: Metric, snapshot: &Snapshot) -> String {
+    format_value_impl(metric, snapshot, false)
+}
+
+fn format_value_impl(metric: Metric, snapshot: &Snapshot, with_per_sec: bool) -> String {
     match metric {
         Metric::Cpu | Metric::Mem => {
             let v = snapshot.value(metric);
@@ -211,7 +241,7 @@ pub fn format_value(metric: Metric, snapshot: &Snapshot) -> String {
             if v.is_nan() {
                 "--".to_string()
             } else {
-                format_rate(v)
+                format_rate_with(v, with_per_sec)
             }
         }
     }
@@ -335,6 +365,12 @@ fn cell_at(cells: &[(Metric, String)], idx: usize, width: usize) -> String {
 /// line. A metric whose prefix is empty gets just its value line (an empty
 /// label would be indistinguishable from a block separator).
 ///
+/// Network rates drop the `/s` suffix here: the block label already names the
+/// direction and the thickness budget is tight, so the shorter unit buys
+/// room for a larger font. The display layer renders the blank separator line
+/// at the configured `item_spacing` height rather than a full text line, so
+/// the vertical block gap matches the horizontal metric gap.
+///
 /// The prefix is emitted verbatim: it already carries whatever punctuation the
 /// user configured (the built-in defaults end with `:`), and it stays
 /// independent of the UI language.
@@ -349,7 +385,7 @@ pub fn format_frame_vertical(snapshot: &Snapshot, cfg: &Config) -> FormattedRow 
         if !prefix.is_empty() {
             lines.push(Line::single(prefix.to_string()));
         }
-        lines.push(Line::single(format_value(*m, snapshot)));
+        lines.push(Line::single(format_value_compact(*m, snapshot)));
     }
     // Vertical layout stacks lines and blanks; pixel item spacing does not
     // apply, so `items` stays empty.
@@ -405,6 +441,20 @@ mod tests {
     fn rate_nan_and_negative_become_zero() {
         assert_eq!(format_rate(f64::NAN), "0.00 B/s");
         assert_eq!(format_rate(-5.0), "0.00 B/s");
+    }
+
+    #[test]
+    fn rate_compact_drops_per_sec_suffix() {
+        // Same tiering and decimal rules as `format_rate`, only the unit
+        // differs: no `/s` suffix. This is what the vertical taskbar layout
+        // renders, where the bar thickness caps the width.
+        assert_eq!(format_rate_compact(314.0), "314 B");
+        assert_eq!(format_rate_compact(0.0), "0.00 B");
+        assert_eq!(format_rate_compact(1024.0), "1.00 K");
+        assert_eq!(format_rate_compact(12.0 * KB + 512.0), "12.5 K");
+        assert_eq!(format_rate_compact(1.2 * MB), "1.20 M");
+        assert_eq!(format_rate_compact(1.5 * GB), "1.50 G");
+        assert_eq!(format_rate_compact(f64::NAN), "0.00 B");
     }
 
     #[test]
@@ -567,7 +617,7 @@ mod tests {
         let texts: Vec<&str> = f.lines.iter().map(|l| l.left.as_str()).collect();
         assert_eq!(
             texts,
-            vec!["CPU:", "29%", "", "MEM:", "68%", "", "U:", "1.20 M/s", "", "D:", "314 K/s"]
+            vec!["CPU:", "29%", "", "MEM:", "68%", "", "U:", "1.20 M", "", "D:", "314 K"]
         );
         assert!(f.items.is_empty());
     }
@@ -577,12 +627,14 @@ mod tests {
         // The whole point of the stacked layout: on a vertical taskbar the bar
         // thickness limits the width, so no line may be wider than the value
         // alone (the old joined "U: 1.20 M/s" line was the cause of clipping).
+        // The value is now the compact form (no `/s`), so the width bound
+        // tightens accordingly.
         let cfg = Config::default();
         let f = format_frame_vertical(&snap(90.0, 60.0, 1.56 * MB, 100.0 * KB), &cfg);
         for l in &f.lines {
             assert!(
-                display_width(&l.left) <= display_width("1.56 M/s"),
-                "line {:?} exceeds the value-only width",
+                display_width(&l.left) <= display_width("1.56 M"),
+                "line {:?} exceeds the compact value-only width",
                 l.left
             );
         }
@@ -607,7 +659,25 @@ mod tests {
         let texts: Vec<&str> = f.lines.iter().map(|l| l.left.as_str()).collect();
         assert_eq!(
             texts,
-            vec!["29%", "", "MEM:", "68%", "", "U:", "1.00 K/s", "", "D:", "2.00 K/s"]
+            vec!["29%", "", "MEM:", "68%", "", "U:", "1.00 K", "", "D:", "2.00 K"]
         );
+    }
+
+    #[test]
+    fn format_value_compact_matches_vertical_frame_values() {
+        // The compact value helper is what the vertical frame uses for the
+        // numeric line; keep the two entry points consistent.
+        let s = snap(37.0, 61.0, 2.0 * KB, 3.0 * MB);
+        assert_eq!(format_value_compact(Metric::Cpu, &s), "37%");
+        assert_eq!(format_value_compact(Metric::Mem, &s), "61%");
+        assert_eq!(format_value_compact(Metric::Up, &s), "2.00 K");
+        assert_eq!(format_value_compact(Metric::Down, &s), "3.00 M");
+        // Full-suffix path is unchanged for the horizontal layout.
+        assert_eq!(format_value(Metric::Up, &s), "2.00 K/s");
+        assert_eq!(format_value(Metric::Down, &s), "3.00 M/s");
+        // NaN still shows the placeholder, identical to the full form.
+        let nan = snap(f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+        assert_eq!(format_value_compact(Metric::Up, &nan), "--");
+        assert_eq!(format_value_compact(Metric::Cpu, &nan), "--%");
     }
 }
