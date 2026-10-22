@@ -52,6 +52,10 @@ pub fn t(lang: Language, key: &str) -> &str {
         (Language::Zh, "settings.language") => "语言",
         (Language::En, "settings.theme") => "Theme",
         (Language::Zh, "settings.theme") => "主题",
+        (Language::En, "settings.theme_hint") =>
+            "Affects the indicator only. The settings window and history chart always follow the system theme.",
+        (Language::Zh, "settings.theme_hint") =>
+            "仅作用于指示器。设置窗口与走势图始终跟随系统主题。",
         (Language::En, "theme.auto") => "Follow system",
         (Language::Zh, "theme.auto") => "跟随系统",
         (Language::En, "theme.light") => "Light",
@@ -122,6 +126,17 @@ pub fn t(lang: Language, key: &str) -> &str {
         (Language::Zh, "menu.settings") => "设置",
         (Language::En, "menu.show_history") => "Show history",
         (Language::Zh, "menu.show_history") => "查看走势",
+        // Right-click menu entry that launches the per-platform system
+        // resource viewer. Previously reachable only via double-click on the
+        // indicator, which forced every left-click on the indicator to wait
+        // the full system double-click threshold before opening the trend
+        // chart; moving this to the context menu lets the left click fire
+        // instantly. Two locale-neutral names because the two OSes ship
+        // under different labels.
+        (Language::En, "menu.task_manager") => "Task Manager",
+        (Language::Zh, "menu.task_manager") => "任务管理器",
+        (Language::En, "menu.activity_monitor") => "Activity Monitor",
+        (Language::Zh, "menu.activity_monitor") => "活动监视器",
         (Language::En, "menu.restart") => "Restart",
         (Language::Zh, "menu.restart") => "重启",
         (Language::En, "menu.quit") => "Quit",
@@ -161,6 +176,17 @@ mod tests {
         assert_eq!(t(Language::En, "csv.header.cpu"), "cpu_pct");
         assert_eq!(t(Language::Zh, "csv.header.cpu"), "CPU占用");
         assert_eq!(t(Language::Zh, "csv.header.timestamp"), "时间");
+    }
+
+    #[test]
+    fn menu_task_viewers_localized() {
+        // Context-menu labels for the per-platform system resource viewer.
+        // Both locales must resolve (no key-passthrough), and the two OSes
+        // ship under different names so both pairs need their own keys.
+        assert_eq!(t(Language::En, "menu.task_manager"), "Task Manager");
+        assert_eq!(t(Language::Zh, "menu.task_manager"), "任务管理器");
+        assert_eq!(t(Language::En, "menu.activity_monitor"), "Activity Monitor");
+        assert_eq!(t(Language::Zh, "menu.activity_monitor"), "活动监视器");
     }
 
     #[test]

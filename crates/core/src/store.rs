@@ -139,17 +139,42 @@ impl Store {
     /// Return the average CPU and memory per `bucket_secs`-wide bucket in
     /// `[from, to]`, ordered by bucket start. This is what the trend chart
     /// renders for long ranges: a bounded number of points regardless of how
-    /// many raw samples exist.
+    /// many raw samples exist. Bucket boundaries align to the UNIX epoch
+    /// (UTC midnight). Callers that need buckets on a wall-clock grid —
+    /// local midnight, hour boundaries, etc. — pass an offset through
+    /// [`Self::buckets_offset`].
     pub fn buckets(&self, from: i64, to: i64, bucket_secs: i64) -> anyhow::Result<Vec<Bucket>> {
+        self.buckets_offset(from, to, bucket_secs, 0)
+    }
+
+    /// The same aggregation with an explicit timezone offset: bucket
+    /// boundaries align to the wall clock of a timezone whose UTC offset is
+    /// `offset_secs` (i.e. boundaries are `(ts + off) div b * b - off`).
+    /// A chart showing 5-day buckets in a +8h zone (offset 28800 s) gets
+    /// boundaries at local midnight; the plain epoch-aligned call would
+    /// instead put them at local 08:00, which reads as an off-by-hours grid
+    /// on the axis.
+    ///
+    /// All real samples have positive unix seconds and offsets are bounded
+    /// by ±14 hours, so `ts + off` stays positive and SQLite's integer
+    /// division truncation ("toward zero") equals Euclidean floor here. No
+    /// negative-side hazard.
+    pub fn buckets_offset(
+        &self,
+        from: i64,
+        to: i64,
+        bucket_secs: i64,
+        offset_secs: i64,
+    ) -> anyhow::Result<Vec<Bucket>> {
         let bucket = bucket_secs.max(1);
         let mut stmt = self.conn.prepare(
-            "SELECT (ts / ?3) * ?3 AS b, AVG(cpu), AVG(mem)
+            "SELECT ((ts + ?4) / ?3) * ?3 - ?4 AS b, AVG(cpu), AVG(mem)
              FROM samples
              WHERE ts >= ?1 AND ts <= ?2
              GROUP BY b
              ORDER BY b",
         )?;
-        let rows = stmt.query_map(params![from, to, bucket], |row| {
+        let rows = stmt.query_map(params![from, to, bucket, offset_secs], |row| {
             Ok(Bucket {
                 ts: row.get(0)?,
                 cpu: row.get(1)?,
@@ -284,11 +309,42 @@ mod tests {
     }
 
     #[test]
+    fn buckets_align_to_epoch_by_default() {
+        let s = Store::in_memory().unwrap();
+        // One sample near the start of each of three 10-wide buckets.
+        s.insert(3, 10.0, 10.0).unwrap();
+        s.insert(13, 20.0, 20.0).unwrap();
+        s.insert(23, 30.0, 30.0).unwrap();
+        let b = s.buckets(0, 30, 10).unwrap();
+        let starts: Vec<i64> = b.iter().map(|x| x.ts).collect();
+        // Epoch-aligned: boundaries are multiples of the bucket width.
+        assert_eq!(starts, vec![0, 10, 20]);
+    }
+
+    #[test]
+    fn buckets_offset_shifts_boundary_to_wall_clock() {
+        let s = Store::in_memory().unwrap();
+        // A +8h zone (28800 s) with a day-wide (86400) bucket: a sample at
+        // 02:00 UTC belongs to the day that started at 16:00 UTC the prior
+        // day, which is 00:00 local (+8) — the local-midnight grid.
+        let utc_day_1_0200 = 86_400 + 2 * 3600; // 93600
+        s.insert(utc_day_1_0200, 42.0, 42.0).unwrap();
+        let offset = s.buckets_offset(0, 200_000, 86_400, 28_800).unwrap();
+        // Boundary ts = ((93600 + 28800)/86400)*86400 - 28800 = 86400 - 28800
+        // = 57600, i.e. the local midnight that opened this bucket.
+        assert_eq!(offset[0].ts, 57_600);
+        // Without the offset the same sample buckets to 86400 (UTC midnight).
+        let plain = s.buckets(0, 200_000, 86_400).unwrap();
+        assert_eq!(plain[0].ts, 86_400);
+    }
+
+    #[test]
     fn empty_store_returns_none_and_empty() {
         let s = Store::in_memory().unwrap();
         assert!(s.latest().unwrap().is_none());
         assert!(s.range(0, 100).unwrap().is_empty());
         assert!(s.buckets(0, 100, 10).unwrap().is_empty());
+        assert!(s.buckets_offset(0, 100, 10, 3600).unwrap().is_empty());
         assert_eq!(s.count().unwrap(), 0);
     }
 }
