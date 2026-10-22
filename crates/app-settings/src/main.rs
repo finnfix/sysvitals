@@ -27,7 +27,7 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::theme::{Theme as UiTheme, ThemeMode};
+use gpui_kit::component::theme::Theme as UiTheme;
 use gpui_kit::component::*;
 // `.when(cond, |b| ...)` on builders comes from this trait; the glob above
 // does not re-export it (app-history imports it the same way).
@@ -200,24 +200,22 @@ fn apply_accent(cx: &mut App) {
     });
 }
 
-/// Apply the user's theme preference (from the shared config) to the GPUI
-/// theme. `auto` mirrors the OS appearance; `light`/`dark` override it.
-/// Idempotent and safe to call at startup, on config reload, and on a live
-/// system appearance change.
-fn apply_theme_preference(cx: &mut App, theme: Theme) {
-    match theme {
-        Theme::Light => UiTheme::change(ThemeMode::Light, None, cx),
-        Theme::Dark => UiTheme::change(ThemeMode::Dark, None, cx),
-        Theme::Auto => UiTheme::sync_system_appearance(None, cx),
-    }
+/// Sync the window's palette to the OS light/dark appearance. The panel
+/// always follows the system, independent of the user's `display.theme`
+/// setting (which now governs only the resident indicator). `Theme::change`
+/// (which `sync_system_appearance` calls under the hood) reloads the whole
+/// palette, so this must be followed by [`apply_accent`] — see
+/// [`apply_theme_and_accent`].
+fn apply_system_theme(cx: &mut App) {
+    UiTheme::sync_system_appearance(None, cx);
 }
 
-/// Re-apply the theme preference and the accent override together.
+/// Re-apply the theme palette and the accent override together.
 /// `Theme::change` (and `sync_system_appearance`, which calls it) loads the
 /// registered palette for the mode, which overwrites every color field —
 /// an accent applied earlier is wiped, so it must follow every theme change.
-fn apply_theme_and_accent(cx: &mut App, theme: Theme) {
-    apply_theme_preference(cx, theme);
+fn apply_theme_and_accent(cx: &mut App) {
+    apply_system_theme(cx);
     apply_accent(cx);
 }
 
@@ -434,18 +432,6 @@ impl SettingsView {
         Language::ALL[self.lang_idx]
     }
 
-    /// The theme preference the segmented tile currently encodes. Used by
-    /// the live appearance observer, which must re-apply the user's choice
-    /// (not the raw OS appearance) so an explicit light/dark override
-    /// survives a system flip.
-    fn theme_pref(&self) -> Theme {
-        match self.theme_idx {
-            1 => Theme::Light,
-            2 => Theme::Dark,
-            _ => Theme::Auto,
-        }
-    }
-
     /// Enforce "at least one indicator group stays on": when the user turns
     /// off the last remaining group, re-enable the other one instead, so the
     /// indicator is never left with nothing to show.
@@ -547,16 +533,16 @@ impl Render for SettingsView {
             self._deactivation = Some(sub);
         }
 
-        // Live OS appearance flip (registered once): re-apply the user's
-        // theme preference so an `auto` window follows the system light/dark
-        // change while open, and an explicit override stays pinned to its
-        // chosen palette. Same first-render registration pattern as the
+        // Live OS appearance flip (registered once): the settings panel
+        // always mirrors the system light/dark theme (the `display.theme`
+        // setting is indicator-only), so a system flip repaints this window
+        // immediately. Same first-render registration pattern as the
         // activation observer (never from a paint-phase API — the root
         // view's empty active-node stack would panic the unwrap inside
         // `window.on_key_event`).
         if self._appearance.is_none() {
-            let sub = cx.observe_window_appearance(window, |this: &mut Self, _w, cx| {
-                apply_theme_and_accent(cx, this.theme_pref());
+            let sub = cx.observe_window_appearance(window, |_this: &mut Self, _w, cx| {
+                apply_theme_and_accent(cx);
                 cx.notify();
             });
             self._appearance = Some(sub);
@@ -641,13 +627,12 @@ impl Render for SettingsView {
                               _: &mut Window,
                               cx: &mut Context<Self>| {
                             this.theme_idx = i;
-                            // Apply the chosen theme immediately so the
-                            // window repaints in the new colors (the config
-                            // write tells the overlay, but only the theme
-                            // call updates this GPUI process's own palette),
-                            // and re-apply the accent since changing the
-                            // mode reloads the whole palette.
-                            apply_theme_and_accent(cx, this.theme_pref());
+                            // The choice is persisted for the indicator to
+                            // hot-reload. It deliberately does NOT re-theme
+                            // this window or the history popup: those always
+                            // follow the system appearance, so changing it
+                            // must not restyle the panels the user is
+                            // looking at.
                             this.save(cx);
                             cx.notify();
                         },
@@ -674,6 +659,12 @@ impl Render for SettingsView {
                 t(lang, "settings.theme").to_string(),
                 theme_row,
             ))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(faint)
+                    .child(t(lang, "settings.theme_hint").to_string()),
+            )
             // --- Display ---
             .child(divider(border))
             .child(section_label(t(lang, "settings.display").to_string(), dim))
@@ -821,11 +812,13 @@ fn main() {
     app.run(move |cx| {
         gpui_kit::init(cx);
         // `gpui_component::theme::init` hardcodes `Theme::change(Light)`, so
-        // the user's saved preference must be re-applied before the window
-        // is opened — otherwise a dark-mode desktop shows a light settings
-        // panel for the first frame. The OS accent override comes with it
-        // (both are theme-color writes and must be sequenced together).
-        apply_theme_and_accent(cx, cfg.display.theme);
+        // the panel must sync to the system appearance before the window is
+        // opened — otherwise a dark-mode desktop shows a light settings
+        // panel for the first frame. The panel always follows the system,
+        // independent of `display.theme` (which now only governs the
+        // indicator). The OS accent override comes with it (both are
+        // theme-color writes and must be sequenced together).
+        apply_theme_and_accent(cx);
 
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(420.), px(640.)), cx)),
