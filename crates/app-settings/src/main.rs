@@ -626,7 +626,7 @@ impl Render for SettingsView {
                 Button::new(format!("theme-{i}"))
                     .small()
                     .when(active, |b| b.primary())
-                    .icon(THEME_ICONS[i])
+                    .icon(THEME_ICONS[i].clone())
                     .tooltip(tip)
                     .on_click(cx.listener(
                         move |this: &mut Self,
