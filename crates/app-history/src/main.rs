@@ -909,17 +909,40 @@ fn main() {
         };
         let anchored = anchor.is_some();
 
+        // Anchored popups behave like a menu: no title bar, no shadow of
+        // a normal window, cannot be dragged or resized. When no anchor
+        // was passed, fall back to a plain titled window so the process
+        // is still usable if the indicator failed to compute a rect.
+        //
+        // macOS needs the anchored case to pass `titlebar: None`. The
+        // transparent-titlebar path keeps `NSClosableWindowMask` while adding
+        // `NSFullSizeContentViewWindowMask`, so AppKit still renders the
+        // traffic-light buttons on top of content that now spans the whole
+        // window — they collided with the chart's top-left. Dropping the
+        // titlebar options removes the closable bit from the style mask, so no
+        // window buttons are created. The library's only other lever,
+        // `traffic_light_position`, merely relocates the buttons rather than
+        // removing them. Windows ignores this field for its borderless popup,
+        // so that platform keeps the previous options unchanged.
+        #[cfg(target_os = "macos")]
+        let titlebar = if anchored {
+            None
+        } else {
+            Some(TitlebarOptions {
+                title: Some("SysVitals History".into()),
+                ..Default::default()
+            })
+        };
+        #[cfg(not(target_os = "macos"))]
+        let titlebar = Some(TitlebarOptions {
+            title: Some("SysVitals History".into()),
+            appears_transparent: anchored,
+            ..Default::default()
+        });
+
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(window_bounds)),
-            // Anchored popups behave like a menu: no title bar, no shadow of
-            // a normal window, cannot be dragged or resized. When no anchor
-            // was passed, fall back to a plain titled window so the process
-            // is still usable if the indicator failed to compute a rect.
-            titlebar: Some(TitlebarOptions {
-                title: Some("SysVitals History".into()),
-                appears_transparent: anchored,
-                ..Default::default()
-            }),
+            titlebar,
             kind: if anchored {
                 WindowKind::PopUp
             } else {
