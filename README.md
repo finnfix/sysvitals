@@ -2,6 +2,10 @@
 
 [English](#english) | [中文](#中文)
 
+<p align="center">
+  <img src="logo/sysvitals_logo_1024.png" alt="SysVitals logo" width="160" />
+</p>
+
 ## English
 
 A lightweight CPU / memory / network monitor living in your taskbar (Windows) and menu bar (macOS).
