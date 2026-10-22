@@ -832,13 +832,20 @@ fn main() {
         .and_then(|p| Config::load(&p).map(|(c, _)| c))
         .unwrap_or_default();
 
-    // macOS: launch as a regular (foreground) application so the Dock shows
-    // the SysVitals icon while the settings window is open, and quit with the
-    // last window so closing the window does not leave an invisible process
-    // behind. The Dock icon itself comes from the enclosing `SysVitals.app`
-    // bundle's CFBundleIconFile: AppKit ignores an unbundled binary's icon
-    // for Dock purposes, so the user-facing flow (launch from the bundle) is
-    // what produces the icon.
+    // macOS: run as a regular foreground app so opening the settings window
+    // puts an icon in the Dock (user requirement), and quit with the last
+    // window so closing it leaves no invisible process behind. Two platform
+    // mechanics make this work: the binary lives inside
+    // `SysVitals.app/Contents/MacOS`, so `+[NSBundle mainBundle]` resolves the
+    // enclosing bundle and AppKit reads its `CFBundleIconFile` (AppIcon.icns)
+    // for the Dock tile; and the default `Regular` policy is re-applied via
+    // `setActivationPolicy_` at `did_finish_launching`, which overrides the
+    // bundle's `LSUIElement` agent default at runtime. Whether the tile shows
+    // the app icon or a generic one is an on-device check.
+    //
+    // The history popup deliberately keeps the headless request (Accessory
+    // policy = no Dock icon): a transient chart panel should not announce
+    // itself in the Dock.
     //
     // Windows has no equivalent concerns: the default windowed startup
     // already gives the window a taskbar entry via the icon embedded by the
