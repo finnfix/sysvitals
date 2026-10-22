@@ -45,6 +45,17 @@ desktops.
   rows; the popup closes on click-away or Esc
 - English and Chinese UI (switchable; prefixes are independent of language)
 
+### Footprint
+
+Measured on real machines with the release build running normally (all
+indicator groups on, default 1 s sampling, no popup open):
+
+- Windows 11 taskbar indicator: **~8 MB** resident
+- macOS 27 (Apple Silicon) menu-bar indicator: **~18 MB** resident
+
+The settings window and history chart are separate processes and are only
+alive while their windows are open; closing them returns that memory.
+
 ### Building the core
 
 Requirements: a stable Rust toolchain (`rust-toolchain.toml` pins it).
@@ -112,6 +123,15 @@ DPI 自适应，点击状态栏项可弹出 CPU / 内存历史走势图。目标
 - 点击指示器在其旁弹出 CPU / 内存走势图（5 分钟 / 1 小时 / 1 天 / 1 个月），历史最长保留一个月，
   一键复制当前可视范围数据（可直接粘贴进表格）；弹窗点击别处或按 Esc 自动关闭
 - 中英文界面（可切换；前缀不受语言影响）
+
+### 资源占用
+
+真机实测，release 构建正常运行状态（指标全开、默认 1 秒采样、无弹窗打开）：
+
+- Windows 11 任务栏指示器：常驻内存 **约 8 MB**
+- macOS 27（Apple Silicon）菜单栏指示器：常驻内存 **约 18 MB**
+
+设置窗口与走势图是独立进程，只在窗口打开期间存活，关闭即释放对应内存。
 
 ### 构建核心层
 

@@ -349,6 +349,14 @@ mod macos {
         // standard); dual-row uses the 0.75-scaled variant. `menuBarFontOfSize`
         // is the canonical menu-bar face at the requested size, so this only
         // changes the size, never the family.
+        //
+        // `display.theme` is deliberately not consulted: an `NSStatusItem`
+        // title is drawn by AppKit, which picks the foreground color from the
+        // system menu-bar appearance and offers no public per-item color hook.
+        // The user's theme override therefore has no effect here, and the
+        // settings window hides the picker on macOS so a dead control is not
+        // presented (the Windows overlay honors it with hard-coded white /
+        // black glyphs).
         let font = if dual {
             let base = NSFont::menuBarFontOfSize(0.0);
             let scaled = (base.pointSize() * DUAL_ROW_FONT_FACTOR).max(1.0);

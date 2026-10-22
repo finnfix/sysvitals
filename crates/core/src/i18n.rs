@@ -50,12 +50,8 @@ pub fn t(lang: Language, key: &str) -> &str {
         (Language::Zh, "settings.display") => "显示",
         (Language::En, "settings.language") => "Language",
         (Language::Zh, "settings.language") => "语言",
-        (Language::En, "settings.theme") => "Theme",
-        (Language::Zh, "settings.theme") => "主题",
-        (Language::En, "settings.theme_hint") =>
-            "Affects the indicator only. The settings window and history chart always follow the system theme.",
-        (Language::Zh, "settings.theme_hint") =>
-            "仅作用于指示器。设置窗口与走势图始终跟随系统主题。",
+        (Language::En, "settings.theme") => "Indicator theme",
+        (Language::Zh, "settings.theme") => "指示器主题",
         (Language::En, "theme.auto") => "Follow system",
         (Language::Zh, "theme.auto") => "跟随系统",
         (Language::En, "theme.light") => "Light",

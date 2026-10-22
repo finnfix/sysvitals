@@ -662,16 +662,18 @@ impl Render for SettingsView {
                 t(lang, "settings.sample_interval").to_string(),
                 interval_row,
             ))
-            .child(labeled_row(
-                t(lang, "settings.theme").to_string(),
-                theme_row,
-            ))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(faint)
-                    .child(t(lang, "settings.theme_hint").to_string()),
-            )
+            .when(cfg!(not(target_os = "macos")), |this| {
+                // Offered only where the choice is actually honored. On
+                // macOS the indicator title is drawn by AppKit, which picks
+                // its own color from the menu-bar appearance; the `theme`
+                // field is read there by nothing but the startup log line, so
+                // the picker would be a dead control. The Windows overlay
+                // repaints pure white / pure black glyphs from it directly.
+                this.child(labeled_row(
+                    t(lang, "settings.theme").to_string(),
+                    theme_row,
+                ))
+            })
             // --- Display ---
             .child(divider(border))
             .child(section_label(t(lang, "settings.display").to_string(), dim))
@@ -788,8 +790,31 @@ impl Render for SettingsView {
                     .text_color(faint)
                     .child(t(lang, "settings.prefix_hint").to_string()),
             )
+            // --- Version footer: pinned to the bottom of the scrollable
+            // column (mt_auto absorbs the leftover space when the content is
+            // shorter than the window). Built from `SV_BUILD_ID`, injected by
+            // this crate's build script as `v{semver}_{short-hash} (dev)` for
+            // a git checkout, or plain `v{semver}` once `git describe`
+            // resolves a tag (release builds). Dev shells built with
+            // SV_BUILD_ID unset show the bare crate version.
+            .child(
+                div()
+                    .mt_auto()
+                    .pt_2()
+                    .text_xs()
+                    .text_color(faint)
+                    .text_center()
+                    .child(SV_BUILD_ID),
+            )
     }
 }
+
+/// Version banner shown in the settings footer — see the footer for how it
+/// is produced by the build script.
+const SV_BUILD_ID: &str = match option_env!("SV_BUILD_ID") {
+    Some(id) => id,
+    None => concat!("v", env!("CARGO_PKG_VERSION")),
+};
 
 /// One prefix cell of the settings 2x2 grid: a dim caption above a flexible
 /// text input. Takes the entity by reference so the render borrow survives
@@ -807,17 +832,17 @@ fn main() {
         .and_then(|p| Config::load(&p).map(|(c, _)| c))
         .unwrap_or_default();
 
-    // macOS: this process is a transient panel of a menu-bar utility, so it
-    // must not own foreground application UI (a Dock icon and a menu bar named
-    // after the process). Requesting the headless windowing mode maps to the
-    // AppKit accessory activation policy before the run loop starts, which
-    // still opens windows normally. The default quit mode on macOS is explicit
-    // (the process survives its last window), which would leave an invisible
-    // accessory process running after the user closes this window, so the
-    // process is asked to quit with its last window instead.
+    // macOS: launch as a regular (foreground) application so the Dock shows
+    // the SysVitals icon while the settings window is open, and quit with the
+    // last window so closing the window does not leave an invisible process
+    // behind. The Dock icon itself comes from the enclosing `SysVitals.app`
+    // bundle's CFBundleIconFile: AppKit ignores an unbundled binary's icon
+    // for Dock purposes, so the user-facing flow (launch from the bundle) is
+    // what produces the icon.
     //
-    // Windows has no equivalent: a headless windowing request there refuses to
-    // open windows, so the default windowed startup is left untouched there.
+    // Windows has no equivalent concerns: the default windowed startup
+    // already gives the window a taskbar entry via the icon embedded by the
+    // build script.
     //
     // `with_assets(Assets)` registers the bundled Lucide icon catalog as the
     // GPUI asset source. Without it, the default source (`()`) returns
@@ -826,7 +851,6 @@ fn main() {
     #[cfg(target_os = "macos")]
     let app = gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
-        .with_windowing(WindowingRequest::Headless)
         .with_quit_mode(QuitMode::LastWindowClosed);
     #[cfg(not(target_os = "macos"))]
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
