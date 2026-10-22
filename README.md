@@ -31,8 +31,11 @@ desktops.
 - Taskbar (Windows) / menu bar (macOS) indicator for CPU, memory, upload and download
 - Configurable prefixes, single-line or dual-row layout, tray-adjacent or far-left anchoring on
   Windows, vertical-taskbar support
-- Binary (1024-base) units with adaptive `B/s` / `K/s` / `M/s` / `G/s` rate formatting
-- Light / dark theme following the system
+- Binary (1024-base) units with adaptive `B/s` / `K/s` / `M/s` / `G/s` rate formatting (the
+  compact no-`/s` form is used on a vertical taskbar, where the bar's thickness caps the width)
+- Light / dark theme following the system across the indicator, the settings window and the
+  history chart; on Windows the settings window's primary color follows the system accent color
+  (Settings → Personalization → Colors), while the chart series colors stay stable
 - Click the indicator to open a CPU / memory history chart beside it (5 min / 1 h / 1 d / 1 mo),
   retained for up to a month, with one-click copy of the visible data as spreadsheet-friendly
   rows; the popup closes on click-away or Esc
@@ -99,8 +102,9 @@ DPI 自适应，点击状态栏项可弹出 CPU / 内存历史走势图。目标
 
 - 任务栏（Windows）/ 菜单栏（macOS）指示器：CPU、内存、上行、下行
 - 前缀可自定义，单行 / 双行布局，Windows 上可选托盘旁或最左侧锚位，支持垂直任务栏
-- 1024 进制，网速按 `B/s` / `K/s` / `M/s` / `G/s` 四档自适应
-- 亮 / 暗主题跟随系统
+- 1024 进制，网速按 `B/s` / `K/s` / `M/s` / `G/s` 四档自适应（垂直任务栏下用去掉 `/s` 的紧凑形式，任务栏厚度限制宽度）
+- 亮 / 暗主题跟随系统，指示器、设置窗口与走势图三处同步；Windows 上设置窗主色跟随系统主题色
+  （设置 → 个性化 → 颜色），走势图两系列颜色保持稳定
 - 点击指示器在其旁弹出 CPU / 内存走势图（5 分钟 / 1 小时 / 1 天 / 1 个月），历史最长保留一个月，
   一键复制当前可视范围数据（可直接粘贴进表格）；弹窗点击别处或按 Esc 自动关闭
 - 中英文界面（可切换；前缀不受语言影响）
