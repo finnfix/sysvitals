@@ -7,8 +7,8 @@
 //!
 //! Interaction model (matches Windows):
 //! - Single-click: open history trend chart popup
-//! - Double-click: open Activity Monitor (macOS task manager)
-//! - Right-click: context menu (History / Settings / Restart / Quit)
+//! - Right-click: context menu (Activity Monitor / History / Settings /
+//!   Restart / Quit)
 //!
 //! Architecture: pure objc2 + AppKit for the indicator itself. The GPUI
 //! settings window (app-settings) and history chart (app-history) are
