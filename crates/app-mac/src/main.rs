@@ -24,10 +24,11 @@ mod macos {
     use objc2::runtime::AnyObject;
     use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventType, NSFont, NSMenu,
-        NSMenuItem, NSScreen, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+        NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventMask, NSEventType, NSFont,
+        NSMenu, NSMenuItem, NSScreen, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+        NSView,
     };
-    use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimer};
+    use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSString, NSTimer};
 
     use sysvitals_core::config::{config_path, history_path};
     use sysvitals_core::format::format_frame;
@@ -61,6 +62,11 @@ mod macos {
         // duplicated (a second spawn is a no-op until the first exits).
         static SETTINGS_CHILD: RefCell<Option<Child>> = const { RefCell::new(None) };
         static HISTORY_CHILD: RefCell<Option<Child>> = const { RefCell::new(None) };
+        // The button/menu action target. Kept addressable so context-menu items
+        // can name it explicitly: the handler lives outside the responder chain
+        // (nothing inserts it there), so a nil target would leave AppKit's
+        // automatic enabling unable to find a receiver and gray the items out.
+        static ACTION_HANDLER: RefCell<Option<Retained<ActionHandler>>> = const { RefCell::new(None) };
     }
 
     /// Screen rectangle (left, top, right, bottom) in GPUI's global top-left,
@@ -384,6 +390,10 @@ mod macos {
     /// Show the context menu at the status item position.
     fn show_context_menu() {
         let mtm = mtm();
+        let target = ACTION_HANDLER.with(|h| h.borrow().clone());
+        let Some(target) = target.as_ref() else {
+            return;
+        };
         STATUS_ITEM.with(|si| {
             let si_borrow = si.borrow();
             let Some(item) = si_borrow.as_ref() else {
@@ -407,6 +417,8 @@ mod macos {
             activity_item.setTitle(&activity_title);
             // SAFETY: setting a valid selector on a menu item.
             unsafe { activity_item.setAction(Some(sel!(showActivityMonitor:))) };
+            // SAFETY: `target` is the live ActionHandler kept in ACTION_HANDLER.
+            unsafe { activity_item.setTarget(Some(target)) };
             menu.addItem(&activity_item);
 
             let history_title = NSString::from_str(t(lang, "menu.show_history"));
@@ -414,18 +426,24 @@ mod macos {
             history_item.setTitle(&history_title);
             // SAFETY: setting a valid selector on a menu item.
             unsafe { history_item.setAction(Some(sel!(showHistory:))) };
+            // SAFETY: `target` is the live ActionHandler kept in ACTION_HANDLER.
+            unsafe { history_item.setTarget(Some(target)) };
             menu.addItem(&history_item);
 
             let settings_title = NSString::from_str(t(lang, "menu.settings"));
             let settings_item = NSMenuItem::new(mtm);
             settings_item.setTitle(&settings_title);
             unsafe { settings_item.setAction(Some(sel!(showSettings:))) };
+            // SAFETY: `target` is the live ActionHandler kept in ACTION_HANDLER.
+            unsafe { settings_item.setTarget(Some(target)) };
             menu.addItem(&settings_item);
 
             let restart_title = NSString::from_str(t(lang, "menu.restart"));
             let restart_item = NSMenuItem::new(mtm);
             restart_item.setTitle(&restart_title);
             unsafe { restart_item.setAction(Some(sel!(restartApp:))) };
+            // SAFETY: `target` is the live ActionHandler kept in ACTION_HANDLER.
+            unsafe { restart_item.setTarget(Some(target)) };
             menu.addItem(&restart_item);
 
             menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -434,13 +452,22 @@ mod macos {
             let quit_item = NSMenuItem::new(mtm);
             quit_item.setTitle(&quit_title);
             unsafe { quit_item.setAction(Some(sel!(terminate:))) };
+            // Quit goes through NSApplication itself: `terminate:` is resolved
+            // down the responder chain to the shared app, so this item keeps a
+            // nil target on purpose (the handler does not implement it).
             menu.addItem(&quit_item);
 
-            // Pop up the menu at the button's position.
-            item.setMenu(Some(&menu));
-            // SAFETY: performing a click on a valid button to show the menu.
-            unsafe { button.performClick(None) };
-            item.setMenu(None);
+            // Pop the menu directly at the button's lower-left corner. The
+            // previous approach (attach with `setMenu`, then `performClick`,
+            // then detach) is unreliable once the item lives in the notch
+            // overflow panel: `performClick` there highlights the button but
+            // does not pop the attached menu, so a right-click looked like it
+            // did nothing. `popUpMenuPositioningItem` shows the menu against
+            // the button view regardless of how the item is positioned, and it
+            // runs a nested tracking loop that returns once the menu closes.
+            let view: &NSView = &button;
+            let location = NSPoint::new(0.0, button.bounds().size.height);
+            let _ = menu.popUpMenuPositioningItem_atLocation_inView(None, location, Some(view));
         });
     }
 
@@ -536,16 +563,25 @@ mod macos {
         // Action handler (kept alive for the process lifetime).
         let handler = ActionHandler::new(mtm);
 
-        // Wire button action (handles single/double/right click).
+        // Wire button action (single click opens the chart, right click opens
+        // the context menu).
         if let Some(button) = status_item.button(mtm) {
             // SAFETY: setting a valid target and selector on the button.
             unsafe {
                 button.setTarget(Some(&handler));
                 button.setAction(Some(sel!(buttonClicked:)));
             }
+            // Status-item buttons default to firing on mouse-down only, so a
+            // right-click never reaches the action and the context menu could
+            // not be raised from `buttonClicked:`. Subscribe explicitly to both
+            // mouse-up events (Apple's documented pattern for status items).
+            let mask = NSEventMask::LeftMouseUp | NSEventMask::RightMouseUp;
+            let _ = button.sendActionOn(mask);
         }
 
-        // Keep the handler alive.
+        // Keep the handler alive for the process lifetime, addressable so the
+        // context menu can name it as the action target (see ACTION_HANDLER).
+        ACTION_HANDLER.with(|h| *h.borrow_mut() = Some(handler.clone()));
         std::mem::forget(handler);
 
         // Store the status item for the tick callback.
