@@ -71,6 +71,7 @@ mod win {
     };
     use windows::Win32::System::SystemInformation::GetLocalTime;
     use windows::Win32::System::Threading::CreateMutexW;
+    use windows::Win32::System::Threading::TerminateProcess;
     use windows::Win32::System::Threading::WaitForSingleObject;
     use windows::Win32::UI::HiDpi::{
         GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -1234,6 +1235,43 @@ mod win {
         }
     }
 
+    /// Terminate the history popup's process if it is still running: the
+    /// click-to-toggle half of `WM_LBUTTONUP`. The child's handle is closed and
+    /// the slot cleared either way (an already-exited child is reaped), so the
+    /// next click opens a fresh popup. Returns `true` only when a live popup
+    /// was terminated — `false` means nothing was running and the caller
+    /// should open a new one.
+    ///
+    /// This is a hard process kill rather than a polite "please close": the
+    /// popup's own blur-close cannot be relied on here because the click that
+    /// toggles it lands on the indicator, and on Windows the overlay receives
+    /// that click while the popup is foreground — the popup then blurs and
+    /// starts dying on its own, racing this kill. Terminating the handle is
+    /// deterministic and idempotent (already-dead handles are reaped).
+    fn close_history() -> bool {
+        HISTORY_PROCESS.with(|slot| {
+            let mut borrow = slot.borrow_mut();
+            let Some(handle) = borrow.as_ref() else {
+                return false;
+            };
+            if handle.is_invalid() {
+                *borrow = None;
+                return false;
+            }
+            // Already exited: reap quietly, treat as "nothing to close".
+            if unsafe { WaitForSingleObject(*handle, 0) } != WAIT_TIMEOUT {
+                let _ = unsafe { CloseHandle(*handle) };
+                *borrow = None;
+                return false;
+            }
+            let _ = unsafe { TerminateProcess(*handle, 0) };
+            let _ = unsafe { CloseHandle(*handle) };
+            *borrow = None;
+            log_event("INFO", "history popup closed by indicator click");
+            true
+        })
+    }
+
     /// Launch a sibling executable from the current exe directory, keeping one
     /// live instance per target: if a previously spawned process is still
     /// running, this is a no-op. Extra argv (e.g. the `--anchor` geometry) is
@@ -1535,12 +1573,15 @@ mod win {
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
-                // Open the trend chart immediately. There is no deferral
-                // here: the class style dropped `CS_DBLCLKS`, so Windows
-                // does not synthesize a `WM_LBUTTONDBLCLK`, and Task Manager
-                // has moved into the right-click menu. Any left click is a
+                // Toggle the trend chart. A live popup (child still running)
+                // is closed; otherwise a new one opens immediately. There is
+                // no deferral: the class style dropped `CS_DBLCLKS`, so
+                // Windows does not synthesize a `WM_LBUTTONDBLCLK`, and Task
+                // Manager lives in the right-click menu. Any left click is a
                 // left click.
-                launch_history(hwnd);
+                if !close_history() {
+                    launch_history(hwnd);
+                }
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
