@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Local};
 use gpui_kit::component::button::*;
 use gpui_kit::component::chart::AreaChart;
-use gpui_kit::component::theme::{Theme as UiTheme, ThemeMode};
+use gpui_kit::component::theme::Theme as UiTheme;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -26,7 +26,6 @@ use gpui_kit::*;
 use sysvitals_core::config::{config_path, history_path, Config, CsvScope};
 use sysvitals_core::i18n::{t, Language};
 use sysvitals_core::store::{Bucket, Store};
-use sysvitals_core::Theme;
 
 /// Screen rectangle of the indicator, passed by the overlay in GPUI's
 /// global logical pixel space (top-left origin, y growing downward).
@@ -139,7 +138,9 @@ impl TimeRange {
         }
     }
 
-    /// Bucket width in seconds for aggregation.
+    /// Bucket width in seconds for CSV export: fine enough to preserve
+    /// resolution at each range while staying bounded (a month is ~720
+    /// rows, not 1.3M). The chart uses a separate, coarser bucket grid.
     fn bucket_secs(self) -> i64 {
         match self {
             TimeRange::Min5 => 2,
@@ -147,6 +148,36 @@ impl TimeRange {
             TimeRange::Day1 => 120,
             TimeRange::Month1 => 3600,
         }
+    }
+
+    /// Chart bucket width, chosen so every bucket start lands on a clean
+    /// wall-clock unit and the six labeled ticks all read as round times
+    /// (the range picks the step, hence "auto per range"):
+    ///   5 min    = 60 s       (every local minute)
+    ///   1 hour   = 600 s      (every :10 / :20 / ... local ten-minute mark)
+    ///   1 day    = 7 200 s    (every 2 h at 00/02/.../22 in a whole-hour zone)
+    ///   1 month  = 432 000 s  (every 5 days at local midnight, offset-aligned)
+    /// `x_tick_count(6)` then picks 6 of those evenly spread; because every
+    /// data point sits on a clean boundary, the visible labels always read
+    /// as round times. Boundaries are offset-aligned for the month range
+    /// (see [`Store::buckets_offset`]) so "5 days" starts at local midnight
+    /// rather than the epoch's UTC-midnight grid.
+    fn chart_bucket_secs(self) -> i64 {
+        match self {
+            TimeRange::Min5 => 60,
+            TimeRange::Hour1 => 600,
+            TimeRange::Day1 => 7_200,
+            TimeRange::Month1 => 432_000,
+        }
+    }
+
+    /// Whether this range's chart buckets must be aligned to local midnight
+    /// rather than UTC midnight. Only the month view needs it (5-day
+    /// buckets); the shorter ranges' bucket widths (60/600/7200 s) all
+    /// divide evenly into every real UTC offset, so their epoch-aligned
+    /// buckets already land on clean local times.
+    fn chart_needs_offset(self) -> bool {
+        matches!(self, TimeRange::Month1)
     }
 
     fn label(self, lang: Language) -> &'static str {
@@ -199,7 +230,6 @@ fn transparent_color() -> Hsla {
 struct HistoryView {
     lang: Language,
     range: TimeRange,
-    theme_pref: Theme,
     buckets: Vec<Bucket>,
     csv_scope: CsvScope,
     copied: bool,
@@ -211,9 +241,10 @@ struct HistoryView {
     /// Kept alive so the activation observer is not cancelled; dropped when
     /// the view is released.
     _activation: Option<Subscription>,
-    /// Kept alive so the appearance observer is not cancelled. A live OS
-    /// light/dark flip re-applies the user's preference (see
-    /// `observe_appearance`).
+    /// Kept alive so the appearance observer is not cancelled. The panel
+    /// always mirrors the OS light/dark theme (independent of the user's
+    /// `display.theme` setting, which now only governs the indicator), so
+    /// a live OS flip repaints this window too — see `observe_appearance`.
     _appearance: Option<Subscription>,
     /// Kept alive so the Esc observer is not cancelled. Esc closes the popup.
     /// This is an app-level keystroke observer, not a window paint-phase
@@ -227,11 +258,10 @@ struct HistoryView {
 }
 
 impl HistoryView {
-    fn new(lang: Language, theme_pref: Theme, csv_scope: CsvScope, cx: &mut Context<Self>) -> Self {
+    fn new(lang: Language, csv_scope: CsvScope, cx: &mut Context<Self>) -> Self {
         let mut view = Self {
             lang,
             range: TimeRange::Hour1,
-            theme_pref,
             buckets: Vec::new(),
             csv_scope,
             copied: false,
@@ -268,8 +298,12 @@ impl HistoryView {
         if self._appearance.is_some() {
             return;
         }
-        let subscription = cx.observe_window_appearance(window, |view: &mut Self, _w, cx| {
-            apply_theme_and_accent(cx, view.theme_pref);
+        let subscription = cx.observe_window_appearance(window, |_view: &mut Self, _w, cx| {
+            // The popup always mirrors the OS light/dark appearance; a
+            // live system flip repaints it with the same palette that the
+            // rest of the desktop is now using. Accent override must be
+            // re-applied because a palette reload replaces every field.
+            apply_theme_and_accent(cx);
             cx.notify();
         });
         self._appearance = Some(subscription);
@@ -327,71 +361,61 @@ impl HistoryView {
 
         if let Ok(path) = history_path() {
             if let Ok(store) = Store::open(&path) {
+                // The chart buckets on the clean wall-clock grid (see
+                // `chart_bucket_secs`); the month range shifts the grid to
+                // local midnight with the machine's current UTC offset so
+                // five-day buckets start at "00:00", not "08:00" (+8 zones).
+                let offset = if self.range.chart_needs_offset() {
+                    Local::now().offset().local_minus_utc() as i64
+                } else {
+                    0
+                };
                 self.buckets = store
-                    .buckets(from, now, self.range.bucket_secs())
+                    .buckets_offset(from, now, self.range.chart_bucket_secs(), offset)
                     .unwrap_or_default();
             }
         }
     }
 
     fn points(&self) -> Vec<ChartPoint> {
-        // Sparse x-axis labels, six of them, chosen by the same evenly spaced
-        // rule the chart's `x_tick_count` applies internally: index
-        // `round(k * (len-1) / 5)` for k in 0..6. We replicate it here only to
-        // decide which of those visible labels must carry a date; the chart
-        // itself still picks the ticks, and if the library ever changes its
-        // selection the labels degrade to time-only without breaking.
-        let len = self.buckets.len();
+        // One point per bucket, each carrying a tick label. The chart shows
+        // exactly 6 of them (`x_tick_count(6)`) spread first→last, and
+        // because every bucket starts on a clean wall-clock boundary, all
+        // six labels read as round times.
+        //
+        // Day-crossing: a bucket whose local calendar day differs from the
+        // previous bucket's carries "MM-DD HH:MM" so the midnight crossing
+        // is visible on the axis; the month view labels every point with
+        // just "MM-DD" (a whole month of HH:MM ticks would be meaningless).
         let month_view = self.range == TimeRange::Month1;
-        let shown: Vec<bool> = if month_view || len < 2 {
-            // Every label in the month view is a plain date; short views do
-            // not care about day boundaries because they rarely cross one,
-            // and when they do the first-of-day rule still applies below.
-            vec![false; len]
-        } else {
-            let mut v = vec![false; len];
-            for k in 0..6usize {
-                let ix = (k as f32 * (len - 1) as f32 / 5.0).round() as usize;
-                if ix < len {
-                    v[ix] = true;
-                }
-            }
-            v
-        };
-        // The date anchor for a visible label: the first visible tick of the
-        // window, plus every visible tick that starts a new calendar day
-        // relative to the previous visible tick. That is what marks the day
-        // change on ranges that cross midnight (1h near midnight, 1d, and the
-        // month view's date-only labels).
-        let mut labels: Vec<String> = Vec::with_capacity(len);
         let mut prev_day: Option<String> = None;
-        for (i, b) in self.buckets.iter().enumerate() {
-            if month_view {
-                labels.push(fmt_date(b.ts));
-                continue;
-            }
-            if !shown[i] {
-                // Non-visible labels still need text: use the plain time.
-                labels.push(fmt_time(b.ts));
-                continue;
-            }
-            let day = day_of(b.ts);
-            let with_date = prev_day.as_deref().map(|d| d != day).unwrap_or(true);
-            prev_day = Some(day);
-            labels.push(if with_date {
-                fmt_date_time(b.ts)
-            } else {
-                fmt_time(b.ts)
-            });
-        }
         self.buckets
             .iter()
-            .zip(labels)
-            .map(|(b, label)| ChartPoint {
-                ts: b.ts,
-                label,
-                cpu: b.cpu,
-                mem: b.mem,
+            .map(|b| {
+                let label = if month_view {
+                    fmt_date(b.ts)
+                } else {
+                    let day = day_of(b.ts);
+                    // Date the tick that anchors the window start (the
+                    // first bucket) and every bucket that opens a new
+                    // local calendar day. So a 5-minute view reads all
+                    // HH:MM except its opening tick (which shows "10-22
+                    // 14:00" to date the start), and a 1-day view marks
+                    // the midnight crossing exactly once.
+                    let crosses = prev_day.as_ref().map_or(true, |p| *p != day);
+                    prev_day = Some(day);
+                    if crosses {
+                        fmt_date_time(b.ts)
+                    } else {
+                        fmt_time(b.ts)
+                    }
+                };
+                ChartPoint {
+                    ts: b.ts,
+                    label,
+                    cpu: b.cpu,
+                    mem: b.mem,
+                }
             })
             .collect()
     }
@@ -485,14 +509,16 @@ fn fmt_date_time(ts: i64) -> String {
         .unwrap_or_default()
 }
 
-/// Full local date and time for the hover tooltip: on a range where the
-/// sparse axis labels are terse, the tooltip is the one place the user can
-/// read the exact timestamp, so it always carries date and time.
+/// Full local date and time (with seconds) for the hover tooltip: the axis
+/// labels are deliberately terse (HH:MM or MM-DD HH:MM) and the popup's
+/// point of existence is to give exact per-point reading, so the tooltip
+/// carries the wall clock down to the second — matching the CSV export's
+/// timestamp format.
 fn fmt_full(ts: i64) -> String {
     DateTime::from_timestamp(ts, 0)
         .map(|dt| {
             dt.with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M")
+                .format("%Y-%m-%d %H:%M:%S")
                 .to_string()
         })
         .unwrap_or_default()
@@ -593,21 +619,22 @@ impl Render for HistoryView {
         // per `y`/`stroke`/`fill`/`name` call in order, so two of each give
         // two lines; the zero-alpha fills keep the look of plain lines.
         // Percentages share one 0..=100 axis, which is what makes merging
-        // sane. The x axis stays on (sparse tick labels read as a time
-        // reference) while the hover tooltip carries the exact value with
-        // two decimals and a percent sign.
+        // sane.
         //
         // `appear(false)`: the library's default 1s left-to-right draw-in
         // is what the user experiences as "slow to show" — the popup's
         // job is to be readable the instant it opens, so the sweep is off.
-        // The chart is repainted by the 3s refresh loop anyway, and without
-        // an appear key the sweep would only run once per process anyway;
-        // cutting it makes every open instant.
+        //
+        // `x_tick_count(6)` + `y_tick_count(6)`: six ticks each. The y
+        // domain is 0..=100 and the library's `format_tick` prints integral
+        // values with no decimals, so the y axis renders "0 / 20 / 40 / 60
+        // / 80 / 100" as the user asked. The x ticks fall on the six evenly
+        // spread data buckets (see `points`), all of which start on a clean
+        // wall-clock unit, so every x label reads as a round time.
         //
         // `tooltip_title` overrides the axis label with the full
-        // `YYYY-MM-DD HH:MM`: on the month view the axis shows only `MM-DD`
-        // and on the short views it only shows `HH:MM`, but the user
-        // hovering a point wants both.
+        // `YYYY-MM-DD HH:MM:SS` (with seconds), because the axis labels are
+        // deliberately terse and a hover should give exact timing.
         let merged_chart = div().flex_1().child(
             AreaChart::new(points)
                 .x(|p: &ChartPoint| p.label.clone())
@@ -623,6 +650,7 @@ impl Render for HistoryView {
                 .x_axis(true)
                 .x_tick_count(6)
                 .y_axis(true)
+                .y_tick_count(6)
                 .grid(true)
                 .appear(false)
                 .tooltip_title(|p: &ChartPoint| fmt_full(p.ts).into())
@@ -738,24 +766,22 @@ fn rgb_hex_to_hsla(hex: u32) -> Hsla {
     hsla(h, s, l, 1.0)
 }
 
-/// Apply the user's theme preference (from the shared config) to the GPUI
-/// theme. `auto` mirrors the OS appearance; `light`/`dark` override it. The
-/// popup also re-applies on a live system appearance change while its `auto`
-/// preference is in effect (see `HistoryView::observe_appearance`), so the
-/// user watching a trend chart flips colors with the rest of the desktop.
-fn apply_theme_preference(cx: &mut App, theme: Theme) {
-    match theme {
-        Theme::Light => UiTheme::change(ThemeMode::Light, None, cx),
-        Theme::Dark => UiTheme::change(ThemeMode::Dark, None, cx),
-        Theme::Auto => UiTheme::sync_system_appearance(None, cx),
-    }
+/// Sync the popup's palette to the OS light/dark appearance. The user's
+/// `display.theme` setting is deliberately not consulted here: the trend
+/// chart panel always follows the system, and only the resident indicator
+/// honors the "light/dark override" side of that config. `Theme::change`
+/// (which `sync_system_appearance` calls under the hood) reloads the whole
+/// palette, so this must be followed by [`apply_accent`] whenever the
+/// Windows primary-color override is wanted — see [`apply_theme_and_accent`].
+fn apply_system_theme(cx: &mut App) {
+    UiTheme::sync_system_appearance(None, cx);
 }
 
-/// Theme preference and accent override applied together: changing the mode
-/// reloads the palette and wipes the accent override, so an accent must
-/// follow every theme change, never precede it.
-fn apply_theme_and_accent(cx: &mut App, theme: Theme) {
-    apply_theme_preference(cx, theme);
+/// Theme sync and accent override applied together: a palette reload wipes
+/// the accent override, so the accent must follow every theme change, never
+/// precede it.
+fn apply_theme_and_accent(cx: &mut App) {
+    apply_system_theme(cx);
     apply_accent(cx);
 }
 
@@ -766,7 +792,6 @@ fn main() {
 
     let lang = cfg.display.language;
     let csv_scope = cfg.history.csv_scope;
-    let theme_pref = cfg.display.theme;
 
     // Register the bundled icon asset source before the run loop starts.
     // Without this the GPUI default asset source (`()`) returns `Ok(None)`
@@ -794,11 +819,13 @@ fn main() {
 
     app.run(move |cx| {
         gpui_kit::init(cx);
-        // gpui-component's init forces the light theme; re-apply the user's
-        // preference (or mirror the OS) before the window opens so the first
-        // paint already has the correct colors. The Windows accent override
-        // comes with it — palette reloads wipe it, so both must be sequenced.
-        apply_theme_and_accent(cx, theme_pref);
+        // gpui-component's `theme::init` forces the light palette; sync
+        // to the OS appearance before the window opens so the first paint
+        // already has the right colors (the popup always follows the
+        // system, independent of `display.theme`, which is indicator-only
+        // now). The Windows accent override comes after, because a palette
+        // reload wipes it.
+        apply_theme_and_accent(cx);
 
         // Popup geometry in GPUI logical pixels. Height cut 25% (520 -> 390):
         // a 3x shorter vertical span is still readable for a two-line trend,
@@ -850,7 +877,7 @@ fn main() {
         // app-level keystroke observer set up in `HistoryView::new`. The
         // build closure only needs to create the view.
         gpui_kit::open_window(window_options, cx, move |_window, cx| {
-            cx.new(|cx| HistoryView::new(lang, theme_pref, csv_scope, cx))
+            cx.new(|cx| HistoryView::new(lang, csv_scope, cx))
         })
         .expect("Failed to open history window");
     });
