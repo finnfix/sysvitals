@@ -61,10 +61,6 @@ mod macos {
         // duplicated (a second spawn is a no-op until the first exits).
         static SETTINGS_CHILD: RefCell<Option<Child>> = const { RefCell::new(None) };
         static HISTORY_CHILD: RefCell<Option<Child>> = const { RefCell::new(None) };
-        // Deferred single-click: armed on a single press, cancelled if a
-        // double-click arrives within the system double-click interval.
-        static PENDING_SINGLE_CLICK: RefCell<Option<Retained<NSTimer>>> =
-            const { RefCell::new(None) };
     }
 
     /// Screen rectangle (left, top, right, bottom) in GPUI's global top-left,
@@ -366,43 +362,6 @@ mod macos {
             .spawn();
     }
 
-    /// Cancel any deferred single-click so a double-click does not also fire
-    /// the single-click action.
-    fn cancel_pending_single_click() {
-        PENDING_SINGLE_CLICK.with(|p| {
-            if let Some(timer) = p.borrow_mut().take() {
-                timer.invalidate();
-            }
-        });
-    }
-
-    /// Defer the single-click action by the system double-click interval. If a
-    /// double-click arrives first, [`cancel_pending_single_click`] drops it.
-    fn schedule_single_click() {
-        let delay = {
-            let d = NSEvent::doubleClickInterval();
-            if d <= 0.0 {
-                0.1
-            } else {
-                d as f64
-            }
-        };
-        cancel_pending_single_click();
-        let block = block2::RcBlock::new(|_timer: std::ptr::NonNull<NSTimer>| {
-            PENDING_SINGLE_CLICK.with(|p| {
-                *p.borrow_mut() = None;
-            });
-            launch_history();
-        });
-        // SAFETY: the block captures nothing non-Send and the timer fires on
-        // the main run loop.
-        let timer =
-            unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(delay, false, &block) };
-        PENDING_SINGLE_CLICK.with(|p| {
-            *p.borrow_mut() = Some(timer);
-        });
-    }
-
     /// Restart: schedule a delayed relaunch, then exit.
     fn restart_self() {
         // Prefer the enclosing .app bundle; fall back to the bare executable
@@ -438,6 +397,17 @@ mod macos {
             // Menu labels follow the configured language, like the Windows
             // overlay's tray menu (previously hardcoded English here).
             let lang = CONFIG.with(|c| c.borrow().display.language);
+
+            // Activity Monitor first: it used to be the double-click action,
+            // and moving it to the top of the context menu is what freed the
+            // left click to open the trend chart instantly (mirrors the
+            // Windows overlay's Task Manager entry).
+            let activity_title = NSString::from_str(t(lang, "menu.activity_monitor"));
+            let activity_item = NSMenuItem::new(mtm);
+            activity_item.setTitle(&activity_title);
+            // SAFETY: setting a valid selector on a menu item.
+            unsafe { activity_item.setAction(Some(sel!(showActivityMonitor:))) };
+            menu.addItem(&activity_item);
 
             let history_title = NSString::from_str(t(lang, "menu.show_history"));
             let history_item = NSMenuItem::new(mtm);
@@ -483,34 +453,26 @@ mod macos {
         struct ActionHandler;
 
         impl ActionHandler {
-            /// Called when the status item button is clicked.
-            /// Distinguishes single-click, double-click, and right-click
-            /// using NSApplication.currentEvent. The single-click action is
-            /// deferred so a double-click can cancel it (otherwise both the
-            /// history popup and Activity Monitor would open).
+            /// Called when the status item button is clicked. A right click
+            /// opens the context menu; any other click opens the trend chart
+            /// immediately. There is no double-click handling — Activity
+            /// Monitor lives in the context menu, so a left click never waits
+            /// for a possible second press.
             #[unsafe(method(buttonClicked:))]
             fn button_clicked(&self, _sender: Option<&AnyObject>) {
                 let mtm = mtm();
                 let app = NSApplication::sharedApplication(mtm);
                 let event = app.currentEvent();
-                let Some(event) = event else {
-                    // Fallback: treat as single click.
-                    launch_history();
-                    return;
-                };
-
-                match event.r#type() {
-                    NSEventType::RightMouseUp | NSEventType::RightMouseDown => {
+                match event.as_ref().map(|e| e.r#type()) {
+                    Some(NSEventType::RightMouseUp) | Some(NSEventType::RightMouseDown) => {
                         show_context_menu();
                     }
-                    _ => {
-                        if event.clickCount() >= 2 {
-                            cancel_pending_single_click();
-                            open_activity_monitor();
-                        } else {
-                            schedule_single_click();
-                        }
-                    }
+                    // Any non-right click opens the trend chart immediately.
+                    // There is no double-click branch and no deferral: the
+                    // Activity Monitor launcher moved to the context menu's
+                    // first item, so a left click never has to wait for a
+                    // possible second press (matching the Windows overlay).
+                    _ => launch_history(),
                 }
             }
 
@@ -522,6 +484,15 @@ mod macos {
             #[unsafe(method(showHistory:))]
             fn show_history(&self, _sender: Option<&AnyObject>) {
                 launch_history();
+            }
+
+            /// Menu-item action: opens Activity Monitor. Used to be the
+            /// double-click target on the status item; moved here so the
+            /// left click can open the trend chart instantly without a
+            /// deferral window.
+            #[unsafe(method(showActivityMonitor:))]
+            fn show_activity_monitor(&self, _sender: Option<&AnyObject>) {
+                open_activity_monitor();
             }
 
             #[unsafe(method(restartApp:))]
