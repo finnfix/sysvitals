@@ -83,14 +83,14 @@ mod win {
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
         DispatchMessageW, FindWindowExW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics,
-        GetWindowRect, IsWindowVisible, KillTimer, MoveWindow, PostMessageW, PostQuitMessage,
-        RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, SystemParametersInfoW,
-        TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW,
-        HWND_TOPMOST, MF_STRING, MSG, NONCLIENTMETRICSW, SM_CXSCREEN, SM_CYSCREEN,
-        SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
+        GetWindowLongPtrW, GetWindowRect, IsWindowVisible, KillTimer, MoveWindow, PostMessageW,
+        PostQuitMessage, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow,
+        SystemParametersInfoW, TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, CS_HREDRAW,
+        CS_VREDRAW, GWL_EXSTYLE, HWND_TOPMOST, MF_STRING, MSG, NONCLIENTMETRICSW, SM_CXSCREEN,
+        SM_CYSCREEN, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
         SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
         WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
-        WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
+        WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     };
 
     // ------------------------------------------------------------------ consts
@@ -476,6 +476,75 @@ mod win {
         })
     }
 
+    /// How many times the topmost band was found lost between two ticks.
+    /// Logged on the first loss and every 60th so a hostile z-order partner
+    /// cannot spam the log.
+    static TOPMOST_LOST_COUNT: AtomicU32 = AtomicU32::new(0);
+    /// Set while the right-click menu is being tracked. `TrackPopupMenu` runs
+    /// a modal loop that still dispatches our `WM_TIMER`, and the menu lives
+    /// in the topmost band — re-asserting the indicator's band during tracking
+    /// would lift the tiny overlay back above the open menu. Skip those ticks.
+    static MENU_TRACKING: AtomicBool = AtomicBool::new(false);
+
+    /// Keep the overlay at the very top of the topmost band, every tick.
+    ///
+    /// Why: the topmost band is not an exclusive seat — shell flyouts (Start
+    /// Menu, Task View, Action Center and the tray popups) and third-party
+    /// always-on-top overlays are topmost too, and asserting their own band
+    /// position re-sorts everyone else inside it. Field diagnosis on a live
+    /// install caught the indicator with its `WS_EX_TOPMOST` style bit gone
+    /// entirely and the window re-banded below a dozen ordinary windows; even
+    /// when the bit survives, a flyout that asserts after us sits on top. A
+    /// single startup assertion cannot hold, so the tick re-asserts the band
+    /// position. `HWND_TOPMOST` with `SWP_NOMOVE | SWP_NOSIZE |
+    /// SWP_NOACTIVATE` only re-inserts the window at the top of the band: no
+    /// repaint, no move, no focus steal.
+    ///
+    /// Diagnostic: count how often the bit was found lost before re-assertion
+    /// (first loss, then every 60th, so a hostile z-order partner cannot spam
+    /// the log).
+    ///
+    /// Skip while our Settings/History child process is alive: the trend
+    /// popup is meant to sit above the indicator, and lifting the band
+    /// position mid-flight would fight it. The tick immediately after the
+    /// popup exits (its process handle reaped by `child_alive`) re-asserts,
+    /// so closing the popup also brings the indicator back without needing a
+    /// click elsewhere — the recovery the user asked for.
+    ///
+    /// Skip while the right-click menu is tracking: `TrackPopupMenu` runs a
+    /// modal loop that still dispatches our WM_TIMER, and the menu itself
+    /// lives in the topmost band — re-asserting now would lift the indicator
+    /// above the menu the user is reading.
+    unsafe fn maintain_topmost(hwnd: HWND) {
+        if MENU_TRACKING.load(Ordering::Relaxed) {
+            return;
+        }
+        let child_running = SETTINGS_PROCESS.with(|slot| child_alive(slot))
+            || HISTORY_PROCESS.with(|slot| child_alive(slot));
+        if child_running {
+            return;
+        }
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if (ex & WS_EX_TOPMOST.0 as isize) == 0 {
+            let n = TOPMOST_LOST_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n % 60 == 0 {
+                log_event(
+                    "INFO",
+                    &format!("topmost band lost before re-assertion (count={n})"),
+                );
+            }
+        }
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+
     /// Move-only placement. Visibility follows the taskbar alone: as long as
     /// the taskbar is on screen the indicator stays visible. It hides only
     /// when the taskbar itself is gone (auto-hide or a true fullscreen app
@@ -491,6 +560,9 @@ mod win {
             let _ = ShowWindow(hwnd, SW_HIDE);
             return;
         };
+        // Taskbar is on screen: keep the indicator in the topmost band (it can
+        // be re-banded below shell flyouts between ticks; see maintain_topmost).
+        maintain_topmost(hwnd);
         let bar = info.rect;
 
         // Track orientation changes: reset grow-only width when the taskbar
@@ -1352,6 +1424,9 @@ mod win {
         );
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
+        // Keep maintain_topmost from lifting the overlay above the menu while
+        // it is open (its modal loop still dispatches our WM_TIMER).
+        MENU_TRACKING.store(true, Ordering::Relaxed);
         let choice = TrackPopupMenu(
             menu,
             TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
@@ -1362,6 +1437,7 @@ mod win {
             None,
         )
         .0 as u32;
+        MENU_TRACKING.store(false, Ordering::Relaxed);
         let _ = DestroyMenu(menu);
         match choice {
             id if id == IDM_TASKMGR as u32 => launch_taskmgr(),
