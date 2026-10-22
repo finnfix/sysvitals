@@ -6,9 +6,8 @@
 //! the status item title.
 //!
 //! Interaction model (matches Windows):
-//! - Single-click: open history trend chart popup
-//! - Right-click: context menu (Activity Monitor / History / Settings /
-//!   Restart / Quit)
+//! - Single-click: toggle the history trend chart popup
+//! - Right-click: context menu (Activity Monitor / Settings / Restart / Quit)
 //!
 //! Architecture: pure objc2 + AppKit for the indicator itself. The GPUI
 //! settings window (app-settings) and history chart (app-history) are
@@ -17,9 +16,11 @@
 #[cfg(target_os = "macos")]
 mod macos {
     use std::cell::RefCell;
+    use std::os::fd::AsRawFd;
     use std::process::Child;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use chrono::Local;
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
     use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
@@ -39,6 +40,94 @@ mod macos {
     /// down (≈0.75 — the same factor the Windows overlay uses, see the
     /// `dual_row` note in core config).
     const DUAL_ROW_FONT_FACTOR: f64 = 0.75;
+
+    // ------------------------------------------------------------- diagnostics
+
+    /// Local date (`YYYY-MM-DD`) and time (`HH:MM:SS`) for the log stamp, from
+    /// chrono's local clock (the macOS counterpart of the Windows overlay's
+    /// `GetLocalTime`-based `local_now`).
+    fn local_now() -> (String, String) {
+        let now = Local::now();
+        (
+            now.format("%Y-%m-%d").to_string(),
+            now.format("%H:%M:%S").to_string(),
+        )
+    }
+
+    /// Append one line to today's log under the data dir (mirrors the Windows
+    /// overlay: `core::logger` is platform-neutral, only the clock differs).
+    /// Logging must never break the indicator, so failures are ignored.
+    fn log_event(level: &str, message: &str) {
+        let Ok(dir) = sysvitals_core::config::data_dir() else {
+            return;
+        };
+        let (date, time) = local_now();
+        sysvitals_core::logger::log_line(&dir, &date, &time, level, message);
+    }
+
+    /// Remove log files older than the retention window. Run once at startup.
+    fn prune_old_logs() {
+        let Ok(dir) = sysvitals_core::config::data_dir() else {
+            return;
+        };
+        let (date, _) = local_now();
+        sysvitals_core::logger::prune_logs(
+            &dir,
+            &date,
+            sysvitals_core::logger::DEFAULT_RETENTION_DAYS,
+        );
+    }
+
+    /// Rust panic hook writing the panic to the log before the process dies.
+    /// The macOS counterpart of the Windows crash diagnostics minus the Win32
+    /// unhandled-exception filter (a SEH-only API; a mach-exception port
+    /// handler was judged out of scope — panics and normal exits are covered).
+    fn install_panic_hook() {
+        std::panic::set_hook(Box::new(|info| {
+            let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            let loc = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "unknown location".to_string());
+            log_event("FATAL", &format!("panic at {loc}: {msg}"));
+        }));
+    }
+
+    /// Single-instance guard: an exclusive, non-blocking `flock` on
+    /// `<data_dir>/sysvitals.lock`. Returns `true` when this process now holds
+    /// the lock; a second launch finds it taken and exits. The file is
+    /// deliberately leaked (`mem::forget`) because `flock` locks live on the
+    /// open file description — keeping the fd open for the process lifetime is
+    /// what keeps the lock held, and process exit releases it (no stale lock).
+    /// Every failure to even open the file returns `true`: a broken data dir
+    /// must never block the indicator from starting.
+    fn acquire_single_instance() -> bool {
+        let Ok(dir) = sysvitals_core::config::data_dir() else {
+            return true;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(dir.join("sysvitals.lock"))
+        else {
+            return true;
+        };
+        // SAFETY: `flock` on our own freshly opened fd; LOCK_EX|LOCK_NB never
+        // blocks and only fails when another holder exists.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return false;
+        }
+        std::mem::forget(file);
+        true
+    }
 
     thread_local! {
         static SAMPLER: RefCell<Option<Sampler>> = const { RefCell::new(None) };
@@ -170,8 +259,19 @@ mod macos {
                         let _ = std::fs::create_dir_all(parent);
                     }
                     match sysvitals_core::Store::open(&path) {
-                        Ok(store) => *guard = Some(store),
-                        Err(_) => *guard = None,
+                        Ok(store) => {
+                            log_event("INFO", &format!("history store opened: {}", path.display()));
+                            *guard = Some(store);
+                        }
+                        Err(e) => {
+                            // One-shot: the trend popup would stay empty, so
+                            // this must be diagnosable from the log.
+                            log_event(
+                                "WARN",
+                                &format!("history store open failed: {} — {e}", path.display()),
+                            );
+                            *guard = None;
+                        }
                     }
                 }
             }
@@ -321,14 +421,22 @@ mod macos {
             return;
         }
         let Some(dir) = exe_dir() else {
+            log_event("WARN", "launch_settings: cannot determine exe directory");
             return;
         };
         let settings = dir.join("SysVitalsSettings");
         if !settings.exists() {
+            log_event(
+                "WARN",
+                &format!("launch_settings: not found: {}", settings.display()),
+            );
             return;
         }
-        if let Ok(child) = std::process::Command::new(settings).spawn() {
-            SETTINGS_CHILD.with(|slot| *slot.borrow_mut() = Some(child));
+        match std::process::Command::new(settings).spawn() {
+            Ok(child) => {
+                SETTINGS_CHILD.with(|slot| *slot.borrow_mut() = Some(child));
+            }
+            Err(e) => log_event("WARN", &format!("launch_settings: spawn failed: {e}")),
         }
     }
 
@@ -340,10 +448,15 @@ mod macos {
             return;
         }
         let Some(dir) = exe_dir() else {
+            log_event("WARN", "launch_history: cannot determine exe directory");
             return;
         };
         let history = dir.join("SysVitalsHistory");
         if !history.exists() {
+            log_event(
+                "WARN",
+                &format!("launch_history: not found: {}", history.display()),
+            );
             return;
         }
         let mut cmd = std::process::Command::new(history);
@@ -356,9 +469,44 @@ mod macos {
                 &b.to_string(),
             ]);
         }
-        if let Ok(child) = cmd.spawn() {
-            HISTORY_CHILD.with(|slot| *slot.borrow_mut() = Some(child));
+        match cmd.spawn() {
+            Ok(child) => {
+                HISTORY_CHILD.with(|slot| *slot.borrow_mut() = Some(child));
+            }
+            Err(e) => log_event("WARN", &format!("launch_history: spawn failed: {e}")),
         }
+    }
+
+    /// Close the trend popup if one is running: the click-to-toggle half of
+    /// `button_clicked:`. Kills the child and reaps it (`wait`) so no zombie
+    /// lingers under the long-running indicator. Returns `true` when a live
+    /// popup was closed; `false` when nothing was running (or it had already
+    /// exited, which is reaped here so the slot is free for the next open).
+    fn close_history() -> bool {
+        let closed = HISTORY_CHILD.with(|slot| {
+            let mut borrow = slot.borrow_mut();
+            match borrow.as_mut() {
+                Some(child) => match child.try_wait() {
+                    Ok(Some(_status)) => {
+                        *borrow = None;
+                        false
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        // The kill guarantees a prompt exit, so this wait
+                        // cannot block meaningfully; it only reaps.
+                        let _ = child.wait();
+                        *borrow = None;
+                        true
+                    }
+                },
+                None => false,
+            }
+        });
+        if closed {
+            log_event("INFO", "history popup closed by indicator click");
+        }
+        closed
     }
 
     /// Open Activity Monitor (macOS equivalent of Task Manager).
@@ -420,15 +568,6 @@ mod macos {
             // SAFETY: `target` is the live ActionHandler kept in ACTION_HANDLER.
             unsafe { activity_item.setTarget(Some(target)) };
             menu.addItem(&activity_item);
-
-            let history_title = NSString::from_str(t(lang, "menu.show_history"));
-            let history_item = NSMenuItem::new(mtm);
-            history_item.setTitle(&history_title);
-            // SAFETY: setting a valid selector on a menu item.
-            unsafe { history_item.setAction(Some(sel!(showHistory:))) };
-            // SAFETY: `target` is the live ActionHandler kept in ACTION_HANDLER.
-            unsafe { history_item.setTarget(Some(target)) };
-            menu.addItem(&history_item);
 
             let settings_title = NSString::from_str(t(lang, "menu.settings"));
             let settings_item = NSMenuItem::new(mtm);
@@ -494,23 +633,23 @@ mod macos {
                     Some(NSEventType::RightMouseUp) | Some(NSEventType::RightMouseDown) => {
                         show_context_menu();
                     }
-                    // Any non-right click opens the trend chart immediately.
-                    // There is no double-click branch and no deferral: the
-                    // Activity Monitor launcher moved to the context menu's
-                    // first item, so a left click never has to wait for a
-                    // possible second press (matching the Windows overlay).
-                    _ => launch_history(),
+                    // Any non-right click toggles the trend chart: a live
+                    // popup is closed, otherwise a new one opens (matching the
+                    // Windows overlay). There is no double-click branch and no
+                    // deferral — Activity Monitor lives in the context menu's
+                    // first item, so a left click never waits for a possible
+                    // second press.
+                    _ => {
+                        if !close_history() {
+                            launch_history();
+                        }
+                    }
                 }
             }
 
             #[unsafe(method(showSettings:))]
             fn show_settings(&self, _sender: Option<&AnyObject>) {
                 launch_settings();
-            }
-
-            #[unsafe(method(showHistory:))]
-            fn show_history(&self, _sender: Option<&AnyObject>) {
-                launch_history();
             }
 
             /// Menu-item action: opens Activity Monitor. Used to be the
@@ -542,6 +681,16 @@ mod macos {
     }
 
     pub fn run() {
+        // Crash diagnostics and the single-instance guard run before anything
+        // else, mirroring the Windows overlay's startup sequence. A second
+        // launch exits quietly; the lock is held via an fd that is deliberately
+        // leaked (see `acquire_single_instance`).
+        install_panic_hook();
+        if !acquire_single_instance() {
+            eprintln!("app-mac: another instance is already running; exiting");
+            return;
+        }
+
         // Get MainThreadMarker — must be on main thread.
         let mtm = MainThreadMarker::new().expect("must run on main thread");
         MTM.with(|m| *m.borrow_mut() = Some(mtm));
@@ -593,6 +742,27 @@ mod macos {
                 CONFIG.with(|c| *c.borrow_mut() = cfg);
             }
         }
+
+        // Daily-file logging: prune stale logs once, then stamp the start and
+        // the effective config (same shape as the Windows overlay's startup
+        // log, so a user can just send this file when something looks wrong).
+        prune_old_logs();
+        let cfg = CONFIG.with(|c| c.borrow().clone());
+        log_event("INFO", "SysVitals (mac) starting");
+        log_event(
+            "INFO",
+            &format!(
+                "config loaded: interval={}ms language={:?} theme={:?} dual_row={} \
+                 show_resources={} show_network={} item_spacing={}px",
+                cfg.sample.interval_ms,
+                cfg.display.language,
+                cfg.display.theme,
+                cfg.display.dual_row,
+                cfg.display.show_resources,
+                cfg.display.show_network,
+                cfg.display.item_spacing,
+            ),
+        );
 
         // Initial tick — also primes the repeating sample timer (see
         // `reschedule_if_interval_changed`).

@@ -124,8 +124,6 @@ pub fn t(lang: Language, key: &str) -> &str {
 
         (Language::En, "menu.settings") => "Settings",
         (Language::Zh, "menu.settings") => "设置",
-        (Language::En, "menu.show_history") => "Show history",
-        (Language::Zh, "menu.show_history") => "查看走势",
         // Right-click menu entry that launches the per-platform system
         // resource viewer. Previously reachable only via double-click on the
         // indicator, which forced every left-click on the indicator to wait
