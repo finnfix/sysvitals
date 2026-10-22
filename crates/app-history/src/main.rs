@@ -12,6 +12,7 @@
 // terminal flashes up beside the history window every time it launches.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+use std::collections::HashSet;
 use std::env;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,7 +26,7 @@ use gpui_kit::*;
 
 use sysvitals_core::config::{config_path, history_path, Config, CsvScope};
 use sysvitals_core::i18n::{t, Language};
-use sysvitals_core::store::{Bucket, Store};
+use sysvitals_core::store::{floor_to_grid, spread_label_indices, Bucket, Store};
 
 /// Screen rectangle of the indicator, passed by the overlay in GPUI's
 /// global logical pixel space (top-left origin, y growing downward).
@@ -138,9 +139,11 @@ impl TimeRange {
         }
     }
 
-    /// Bucket width in seconds for CSV export: fine enough to preserve
-    /// resolution at each range while staying bounded (a month is ~720
-    /// rows, not 1.3M). The chart uses a separate, coarser bucket grid.
+    /// Fine bucket width shared by the chart curve and the CSV export:
+    /// detailed enough to preserve resolution at each range while staying
+    /// bounded (a month is ~720 rows, not 1.3M). The curve draws one point
+    /// per fine bucket; only the sparse axis *labels* use the coarser clean
+    /// step from [`Self::label_step_secs`].
     fn bucket_secs(self) -> i64 {
         match self {
             TimeRange::Min5 => 2,
@@ -150,19 +153,20 @@ impl TimeRange {
         }
     }
 
-    /// Chart bucket width, chosen so every bucket start lands on a clean
-    /// wall-clock unit and the six labeled ticks all read as round times
-    /// (the range picks the step, hence "auto per range"):
+    /// The clean wall-clock step the x-axis labels are floored to — the
+    /// range picks the step so every label reads as a round time:
     ///   5 min    = 60 s       (every local minute)
     ///   1 hour   = 600 s      (every :10 / :20 / ... local ten-minute mark)
     ///   1 day    = 7 200 s    (every 2 h at 00/02/.../22 in a whole-hour zone)
     ///   1 month  = 432 000 s  (every 5 days at local midnight, offset-aligned)
-    /// `x_tick_count(6)` then picks 6 of those evenly spread; because every
-    /// data point sits on a clean boundary, the visible labels always read
-    /// as round times. Boundaries are offset-aligned for the month range
-    /// (see [`Store::buckets_offset`]) so "5 days" starts at local midnight
-    /// rather than the epoch's UTC-midnight grid.
-    fn chart_bucket_secs(self) -> i64 {
+    /// The curve is NOT drawn at this step: it uses [`Self::bucket_secs`] so
+    /// the line keeps its detail. Each label point floors its own timestamp
+    /// to this grid, so the six spread ticks read as clean times while the
+    /// line stays fine-grained. Every value is an integer multiple of the
+    /// range's fine bucket width, and the query window start is aligned down
+    /// to this grid (see [`floor_to_grid`]), so the first bucket sits exactly
+    /// on a clean boundary and the first label dates the window start.
+    fn label_step_secs(self) -> i64 {
         match self {
             TimeRange::Min5 => 60,
             TimeRange::Hour1 => 600,
@@ -171,12 +175,12 @@ impl TimeRange {
         }
     }
 
-    /// Whether this range's chart buckets must be aligned to local midnight
-    /// rather than UTC midnight. Only the month view needs it (5-day
-    /// buckets); the shorter ranges' bucket widths (60/600/7200 s) all
-    /// divide evenly into every real UTC offset, so their epoch-aligned
-    /// buckets already land on clean local times.
-    fn chart_needs_offset(self) -> bool {
+    /// Whether this range's label grid must be aligned to local midnight
+    /// rather than UTC midnight. Only the month view needs it (5-day grid);
+    /// the shorter ranges' steps (60/600/7200 s) all divide evenly into
+    /// every real UTC offset, so their epoch-aligned grid already lands on
+    /// clean local times.
+    fn label_needs_offset(self) -> bool {
         matches!(self, TimeRange::Month1)
     }
 
@@ -190,12 +194,13 @@ impl TimeRange {
     }
 }
 
-/// A single timestamped sample pair for the merged chart: one bucket renders
-/// as one x position carrying both series values, which is why CPU and memory
-/// live in one struct instead of two point lists. `label` is the sparse x-axis
-/// tick text (range-aware: clock time, date, or both); `ts` is kept so the
-/// hover tooltip can show the full date and time regardless of how terse the
-/// axis label is.
+/// A single timestamped sample pair for the merged chart: one fine bucket
+/// renders as one x position carrying both series values, which is why CPU
+/// and memory live in one struct instead of two point lists. `label` is the
+/// sparse x-axis tick text — only clean wall-clock points (per
+/// [`TimeRange::label_step_secs`]) carry a non-empty label, the rest stay
+/// empty so the curve stays detailed while the axis stays readable. `ts` is
+/// kept so the hover tooltip can show the full date and time for any point.
 #[derive(Debug, Clone)]
 struct ChartPoint {
     ts: i64,
@@ -208,6 +213,11 @@ struct ChartPoint {
 /// indicator writes samples every sample interval, so redrawing every few
 /// seconds makes the chart follow the indicator in near real time.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How many x-axis tick labels the chart shows, spread evenly across the fine
+/// data points (the value given to the chart's `x_tick_count`, and mirrored
+/// by [`spread_label_indices`] when deciding which points carry label text).
+const X_TICK_COUNT: usize = 6;
 
 /// Chart stroke colors shared by the series, their fills, and the legend.
 const CPU_HUE: f32 = 210.0;
@@ -357,67 +367,89 @@ impl HistoryView {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let from = now - self.range.seconds();
+        let step = self.range.label_step_secs();
+        // The label grid is offset-aligned only for the month range (see
+        // `label_needs_offset`); the fine curve buckets divide every real
+        // UTC offset, so a zero offset keeps their epoch grid for the rest.
+        let offset = if self.range.label_needs_offset() {
+            Local::now().offset().local_minus_utc() as i64
+        } else {
+            0
+        };
+        // Align the window start down to the clean grid: the label step is a
+        // multiple of the fine bucket width, so the first bucket sits exactly
+        // on a wall-clock boundary and the first x label dates the start.
+        let from = floor_to_grid(now - self.range.seconds(), step, offset);
 
         if let Ok(path) = history_path() {
             if let Ok(store) = Store::open(&path) {
-                // The chart buckets on the clean wall-clock grid (see
-                // `chart_bucket_secs`); the month range shifts the grid to
-                // local midnight with the machine's current UTC offset so
-                // five-day buckets start at "00:00", not "08:00" (+8 zones).
-                let offset = if self.range.chart_needs_offset() {
-                    Local::now().offset().local_minus_utc() as i64
-                } else {
-                    0
-                };
+                // The curve draws at the fine CSV bucket width; axis labels
+                // floor each point's timestamp to the clean grid (see
+                // `points`). One query serves both — no coarse pass anymore.
                 self.buckets = store
-                    .buckets_offset(from, now, self.range.chart_bucket_secs(), offset)
+                    .buckets_offset(from, now, self.range.bucket_secs(), offset)
                     .unwrap_or_default();
             }
         }
     }
 
     fn points(&self) -> Vec<ChartPoint> {
-        // One point per bucket, each carrying a tick label. The chart shows
-        // exactly 6 of them (`x_tick_count(6)`) spread first→last, and
-        // because every bucket starts on a clean wall-clock boundary, all
-        // six labels read as round times.
+        // One point per fine bucket: the curve keeps its full resolution.
+        // Only the indices the axis paints labels at (`spread_label_indices`,
+        // mirroring the library's selection rule) carry label text, floored to
+        // the range's clean grid (60/600/7200/432000 s) so every visible tick
+        // reads as a round time. A labeled point's pixel position may sit up
+        // to one fine bucket off that clean boundary — under 1% of the window
+        // — which is the cost of keeping the line detailed; the label text,
+        // not the geometry, carries the roundness.
         //
-        // Day-crossing: a bucket whose local calendar day differs from the
-        // previous bucket's carries "MM-DD HH:MM" so the midnight crossing
-        // is visible on the axis; the month view labels every point with
-        // just "MM-DD" (a whole month of HH:MM ticks would be meaningless).
+        // Day-crossing: the first labeled point, and any whose floored local
+        // day differs from the previous labeled point's, carries "MM-DD HH:MM"
+        // so a midnight crossing is visible; within one day the label is just
+        // HH:MM. The month view labels with MM-DD only. A freshly started
+        // indicator can floor two labeled points to the same wall-clock string
+        // — painting it twice reads as broken, so only the first keeps it.
         let month_view = self.range == TimeRange::Month1;
+        let step = self.range.label_step_secs();
+        let offset = if month_view {
+            Local::now().offset().local_minus_utc() as i64
+        } else {
+            0
+        };
+        let labeled: HashSet<usize> = spread_label_indices(self.buckets.len(), X_TICK_COUNT)
+            .into_iter()
+            .collect();
+        let mut points = Vec::with_capacity(self.buckets.len());
         let mut prev_day: Option<String> = None;
-        self.buckets
-            .iter()
-            .map(|b| {
-                let label = if month_view {
-                    fmt_date(b.ts)
+        let mut last_shown: Option<String> = None;
+        for (i, b) in self.buckets.iter().enumerate() {
+            let mut label = String::new();
+            if labeled.contains(&i) {
+                let clean = floor_to_grid(b.ts, step, offset);
+                let day = day_of(clean);
+                let crosses = prev_day.as_ref().map_or(true, |p| *p != day);
+                prev_day = Some(day);
+                label = if month_view {
+                    fmt_date(clean)
+                } else if crosses {
+                    fmt_date_time(clean)
                 } else {
-                    let day = day_of(b.ts);
-                    // Date the tick that anchors the window start (the
-                    // first bucket) and every bucket that opens a new
-                    // local calendar day. So a 5-minute view reads all
-                    // HH:MM except its opening tick (which shows "10-22
-                    // 14:00" to date the start), and a 1-day view marks
-                    // the midnight crossing exactly once.
-                    let crosses = prev_day.as_ref().map_or(true, |p| *p != day);
-                    prev_day = Some(day);
-                    if crosses {
-                        fmt_date_time(b.ts)
-                    } else {
-                        fmt_time(b.ts)
-                    }
+                    fmt_time(clean)
                 };
-                ChartPoint {
-                    ts: b.ts,
-                    label,
-                    cpu: b.cpu,
-                    mem: b.mem,
+                if last_shown.as_deref() == Some(label.as_str()) {
+                    label = String::new();
+                } else {
+                    last_shown = Some(label.clone());
                 }
-            })
-            .collect()
+            }
+            points.push(ChartPoint {
+                ts: b.ts,
+                label,
+                cpu: b.cpu,
+                mem: b.mem,
+            });
+        }
+        points
     }
 
     fn copy_csv(&mut self) {
@@ -625,12 +657,20 @@ impl Render for HistoryView {
         // is what the user experiences as "slow to show" — the popup's
         // job is to be readable the instant it opens, so the sweep is off.
         //
-        // `x_tick_count(6)` + `y_tick_count(6)`: six ticks each. The y
-        // domain is 0..=100 and the library's `format_tick` prints integral
-        // values with no decimals, so the y axis renders "0 / 20 / 40 / 60
-        // / 80 / 100" as the user asked. The x ticks fall on the six evenly
-        // spread data buckets (see `points`), all of which start on a clean
-        // wall-clock unit, so every x label reads as a round time.
+        // Y axis: `y_domain(0, 100)` + `y_tick_count(6)` + `y_padding(0, 0)`.
+        // The library spaces the ticks evenly over the *full* plot height but
+        // maps the pinned domain only into the height shrunk by the top
+        // padding (10 px default), so the labels would read the padded
+        // positions (e.g. 20.8 / 41.6 / ... instead of 20 / 40 / ...). With
+        // zero padding the tick grid and the domain grid coincide and the
+        // six labels land exactly on 0 / 20 / 40 / 60 / 80 / 100; the series
+        // clips at the domain edges as before (pinned-plot mask).
+        //
+        // X axis: `x_tick_count(X_TICK_COUNT)` picks that many data indices
+        // evenly spread first→last; only those indices carry label text, each
+        // its own bucket time floored to the range's clean grid (see
+        // `points` and `spread_label_indices`), so every visible label reads as a
+        // round time while the curve keeps the fine per-bucket shape.
         //
         // `tooltip_title` overrides the axis label with the full
         // `YYYY-MM-DD HH:MM:SS` (with seconds), because the axis labels are
@@ -647,8 +687,9 @@ impl Render for HistoryView {
                 .fill(transparent_color())
                 .name(t(lang, "chart.mem").to_string())
                 .y_domain(0.0, 100.0)
+                .y_padding(0.0, 0.0)
                 .x_axis(true)
-                .x_tick_count(6)
+                .x_tick_count(X_TICK_COUNT)
                 .y_axis(true)
                 .y_tick_count(6)
                 .grid(true)

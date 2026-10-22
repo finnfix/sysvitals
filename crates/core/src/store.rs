@@ -39,6 +39,44 @@ pub struct Store {
     conn: Connection,
 }
 
+/// Floor `ts` down to the nearest boundary of a wall-clock grid whose spacing
+/// is `step` seconds and whose zero sits at UTC offset `offset` (0 for the
+/// epoch/UTC-midnight grid, the machine's local offset for a local-midnight
+/// grid). This is the same alignment [`Store::buckets_offset`] applies to
+/// bucket starts, exposed standalone so chart code can align a query window
+/// or floor a label timestamp onto the identical grid.
+///
+/// `div_euclid` keeps the floor semantics for negative timestamps (samples
+/// before 1970 or negative offsets), where plain integer division truncating
+/// toward zero would land on the wrong side of the boundary.
+pub fn floor_to_grid(ts: i64, step: i64, offset: i64) -> i64 {
+    let step = step.max(1);
+    (ts + offset).div_euclid(step) * step - offset
+}
+
+/// Which of `len` evenly-spaced data points a chart should label, when it
+/// wants exactly `count` labels spread from the first point to the last:
+/// indices `round(k * (len - 1) / (count - 1))` for `k` in `0..count`. Fewer
+/// points than labels returns every index; `count == 1` returns just the
+/// first. Mirrors the shape the trend chart's axis uses so a caller can
+/// decide, per point, whether its own label text will actually be painted.
+pub fn spread_label_indices(len: usize, count: usize) -> Vec<usize> {
+    match count {
+        0 => Vec::new(),
+        1 => {
+            if len == 0 {
+                Vec::new()
+            } else {
+                vec![0]
+            }
+        }
+        count if count >= len => (0..len).collect(),
+        count => (0..count)
+            .map(|k| (k as f32 * (len - 1) as f32 / (count - 1) as f32).round() as usize)
+            .collect(),
+    }
+}
+
 impl Store {
     /// Open (or create) the database at `path` and ensure the schema exists.
     /// Uses WAL with `synchronous=NORMAL` so steady 1–3s inserts stay cheap and
@@ -346,5 +384,45 @@ mod tests {
         assert!(s.buckets(0, 100, 10).unwrap().is_empty());
         assert!(s.buckets_offset(0, 100, 10, 3600).unwrap().is_empty());
         assert_eq!(s.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn floor_to_grid_snaps_down_to_the_wall_clock_grid() {
+        // Epoch grid (+0 offset): 3 725 s lands on the minute 3 720 s below.
+        assert_eq!(floor_to_grid(3_725, 60, 0), 3_720);
+        // Already on a boundary: unchanged.
+        assert_eq!(floor_to_grid(3_660, 60, 0), 3_660);
+        // Local grid (+8h): boundaries are local midnight multiples, i.e.
+        // 57 600 = 16:00 UTC of the prior day is 00:00 local. 93 600 (02:00
+        // UTC) floors to it — the same sample the buckets_offset test pins.
+        assert_eq!(floor_to_grid(93_600, 86_400, 28_800), 57_600);
+        // Negative timestamps floor downward, not toward zero: -5 with a
+        // step of 10 belongs to the boundary -10, while truncating division
+        // would wrongly give 0.
+        assert_eq!(floor_to_grid(-5, 10, 0), -10);
+        // A zero/garbage step is clamped to 1, never a division by zero.
+        assert_eq!(floor_to_grid(42, 0, 0), 42);
+    }
+
+    #[test]
+    fn spread_label_indices_pins_ends_and_stays_unique() {
+        // 6 of 15 points: first and last are always labeled, indices advance.
+        let idx = spread_label_indices(15, 6);
+        assert_eq!(idx.len(), 6);
+        assert_eq!(idx.first(), Some(&0));
+        assert_eq!(idx.last(), Some(&14));
+        let mut sorted = idx.clone();
+        sorted.dedup();
+        assert_eq!(sorted.len(), idx.len(), "no index repeats");
+        // Fewer points than labels: every point gets a label.
+        assert_eq!(spread_label_indices(3, 6), vec![0, 1, 2]);
+        // Degenerate inputs never panic and never invent an index.
+        assert_eq!(spread_label_indices(0, 6), Vec::<usize>::new());
+        assert_eq!(spread_label_indices(10, 0), Vec::<usize>::new());
+        assert_eq!(spread_label_indices(10, 1), vec![0]);
+        // Every returned index is inside the data range.
+        for i in spread_label_indices(100, 6) {
+            assert!(i < 100);
+        }
     }
 }

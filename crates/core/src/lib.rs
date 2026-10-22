@@ -24,4 +24,4 @@ pub use format::{format_frame, format_frame_vertical, FormattedRow, Line};
 pub use i18n::{t, Language};
 pub use model::{Anchor, Metric, Snapshot, Theme};
 pub use sampler::{CpuSampler, NetSampler, NetSelection, Sampler};
-pub use store::{Bucket, Sample, Store};
+pub use store::{floor_to_grid, spread_label_indices, Bucket, Sample, Store};
