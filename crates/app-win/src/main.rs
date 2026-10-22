@@ -76,7 +76,6 @@ mod win {
         GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
-    use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
     use windows::Win32::UI::Shell::{
         SHAppBarMessage, ShellExecuteExW, ShellExecuteW, ABE_LEFT, ABE_RIGHT, ABM_GETTASKBARPOS,
         APPBARDATA, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
@@ -86,12 +85,12 @@ mod win {
         DispatchMessageW, FindWindowExW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics,
         GetWindowRect, IsWindowVisible, KillTimer, MoveWindow, PostMessageW, PostQuitMessage,
         RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, SystemParametersInfoW,
-        TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
+        TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW,
         HWND_TOPMOST, MF_STRING, MSG, NONCLIENTMETRICSW, SM_CXSCREEN, SM_CYSCREEN,
         SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
         SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
-        WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONUP,
-        WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
+        WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
+        WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
     // ------------------------------------------------------------------ consts
@@ -144,14 +143,10 @@ mod win {
     const IDM_SETTINGS: usize = 901;
     const IDM_QUIT: usize = 902;
     const IDM_RESTART: usize = 903;
-
-    /// Timer id: deferred single-click action (opens history). Armed on
-    /// WM_LBUTTONUP and cancelled by WM_LBUTTONDBLCLK, so a double-click does
-    /// not also fire the single-click action.
-    const TIMER_SINGLECLICK: usize = 0x518;
-    /// Safety net: if the system double-click interval reads as zero, still
-    /// delay single clicks by this much so double-clicks stay suppressible.
-    const MIN_SINGLECLICK_DELAY_MS: u32 = 100;
+    /// Right-click menu entry that launches Task Manager. This used to be the
+    /// double-click action on the indicator; moving it here is what lets the
+    /// left click fire the trend chart immediately (see `WM_LBUTTONUP`).
+    const IDM_TASKMGR: usize = 904;
 
     // ----------------------------------------------------------------- statics
 
@@ -186,12 +181,6 @@ mod win {
         // instance and avoid stacking duplicate windows.
         static SETTINGS_PROCESS: RefCell<Option<HANDLE>> = const { RefCell::new(None) };
         static HISTORY_PROCESS: RefCell<Option<HANDLE>> = const { RefCell::new(None) };
-        // Double-click suppression. The single-click action is deferred by a
-        // timer; a following WM_LBUTTONDBLCLK cancels it. Windows then
-        // delivers one more WM_LBUTTONUP, which this flag marks as swallowed
-        // so the deferred action is not re-armed. The flag is cleared on every
-        // WM_LBUTTONDOWN, so a lost up can never break later clicks.
-        static SWALLOW_NEXT_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     // ------------------------------------------------------------ config access
@@ -1306,14 +1295,43 @@ mod win {
 
     // -------------------------------------------------------------------- menu
 
+    /// Launch the system resource viewer (Task Manager). This action used to
+    /// live on a double-click of the indicator; putting it in the context
+    /// menu is what lets the left click open the trend chart immediately,
+    /// without waiting for a possible second press.
+    unsafe fn launch_taskmgr() {
+        let verb = utf16("open");
+        let target = utf16("taskmgr.exe");
+        let _ = ShellExecuteW(
+            None,
+            windows::core::PCWSTR(verb.as_ptr()),
+            windows::core::PCWSTR(target.as_ptr()),
+            windows::core::PCWSTR::null(),
+            windows::core::PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+
     unsafe fn show_context_menu(hwnd: HWND) {
         let Ok(menu) = CreatePopupMenu() else {
             return;
         };
         let lang = config().display.language;
+        // Order: system resource viewer first (most actionable when the
+        // indicator is in the way), then Settings, Restart, Quit. Task
+        // Manager sits at the top because opening it is the reason the
+        // indicator used to double-click — moving it here is what freed the
+        // left click to open the chart instantly.
+        let taskmgr = utf16(t(lang, "menu.task_manager"));
         let settings = utf16(t(lang, "menu.settings"));
         let restart = utf16(t(lang, "menu.restart"));
         let quit = utf16(t(lang, "menu.quit"));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_TASKMGR,
+            windows::core::PCWSTR(taskmgr.as_ptr()),
+        );
         let _ = AppendMenuW(
             menu,
             MF_STRING,
@@ -1346,13 +1364,13 @@ mod win {
         .0 as u32;
         let _ = DestroyMenu(menu);
         match choice {
+            id if id == IDM_TASKMGR as u32 => launch_taskmgr(),
             id if id == IDM_SETTINGS as u32 => launch_settings(),
             id if id == IDM_RESTART as u32 => restart_self(hwnd),
             id if id == IDM_QUIT as u32 => {
                 let _ = KillTimer(Some(hwnd), TIMER_SAMPLE);
                 let _ = KillTimer(Some(hwnd), TIMER_MOVE);
                 let _ = KillTimer(Some(hwnd), TIMER_CONFIG);
-                let _ = KillTimer(Some(hwnd), TIMER_SINGLECLICK);
                 let _ = DestroyWindow(hwnd);
             }
             _ => {}
@@ -1373,12 +1391,6 @@ mod win {
                     id if id == TIMER_SAMPLE => sample_now(hwnd),
                     id if id == TIMER_MOVE => reposition(hwnd),
                     id if id == TIMER_CONFIG => poll_config_change(hwnd),
-                    id if id == TIMER_SINGLECLICK => {
-                        // The double-click window elapsed: this was a true
-                        // single click. Open the history trend chart popup.
-                        let _ = KillTimer(Some(hwnd), TIMER_SINGLECLICK);
-                        launch_history(hwnd);
-                    }
                     _ => {}
                 }
                 LRESULT(0)
@@ -1412,45 +1424,13 @@ mod win {
                 reposition(hwnd);
                 LRESULT(0)
             }
-            WM_LBUTTONDOWN => {
-                // Fresh press: any previously swallowed-up state is stale.
-                SWALLOW_NEXT_UP.with(|c| c.set(false));
-                DefWindowProcW(hwnd, msg, wparam, lparam)
-            }
             WM_LBUTTONUP => {
-                // The trailing up of a double-click is swallowed (the
-                // double-click already acted). Otherwise defer the single-click
-                // action so a quick second press can cancel it.
-                if SWALLOW_NEXT_UP.with(|c| c.replace(false)) {
-                    return LRESULT(0);
-                }
-                let delay = {
-                    let d = GetDoubleClickTime();
-                    if d == 0 {
-                        MIN_SINGLECLICK_DELAY_MS
-                    } else {
-                        d
-                    }
-                };
-                SetTimer(Some(hwnd), TIMER_SINGLECLICK, delay, None);
-                LRESULT(0)
-            }
-            WM_LBUTTONDBLCLK => {
-                // Cancel the deferred single-click and swallow the up that
-                // Windows delivers after this message.
-                let _ = KillTimer(Some(hwnd), TIMER_SINGLECLICK);
-                SWALLOW_NEXT_UP.with(|c| c.set(true));
-                // Double-click opens Task Manager.
-                let verb = utf16("open");
-                let target = utf16("taskmgr.exe");
-                let _ = ShellExecuteW(
-                    None,
-                    windows::core::PCWSTR(verb.as_ptr()),
-                    windows::core::PCWSTR(target.as_ptr()),
-                    windows::core::PCWSTR::null(),
-                    windows::core::PCWSTR::null(),
-                    SW_SHOWNORMAL,
-                );
+                // Open the trend chart immediately. There is no deferral
+                // here: the class style dropped `CS_DBLCLKS`, so Windows
+                // does not synthesize a `WM_LBUTTONDBLCLK`, and Task Manager
+                // has moved into the right-click menu. Any left click is a
+                // left click.
+                launch_history(hwnd);
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
@@ -1598,7 +1578,14 @@ mod win {
             let class_name = utf16("SysVitalsOverlay");
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
+                // No `CS_DBLCLKS`: the indicator's left click now opens the
+                // trend chart immediately, and the system resource viewer
+                // (Task Manager) lives in the right-click menu. Keeping
+                // `CS_DBLCLKS` would let Windows synthesize a
+                // `WM_LBUTTONDBLCLK` after the trailing `WM_LBUTTONUP`,
+                // which we no longer handle; dropping it here makes the
+                // click pipeline honestly single-click only.
+                style: CS_HREDRAW | CS_VREDRAW,
                 lpfnWndProc: Some(wndproc),
                 hInstance: hmodule.into(),
                 hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH::default(),
