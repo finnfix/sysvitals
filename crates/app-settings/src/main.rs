@@ -611,16 +611,23 @@ impl Render for SettingsView {
             );
         }
 
+        // Theme choices render as icons (globe = follow system, sun = light,
+        // moon = dark) with the translated name kept as the tooltip. All
+        // three glyphs live in the bundled default asset set, so they paint
+        // through the registered `Assets` source — a catalog name outside
+        // that set (e.g. Monitor) would silently render blank.
         const THEME_KEYS: [&str; 3] = ["theme.auto", "theme.light", "theme.dark"];
-        let mut theme_row = h_flex().gap_1().flex_wrap();
+        const THEME_ICONS: [IconName; 3] = [IconName::Globe, IconName::Sun, IconName::Moon];
+        let mut theme_row = h_flex().gap_1();
         for i in 0..THEME_KEYS.len() {
             let active = i == self.theme_idx;
-            let text = t(lang, THEME_KEYS[i]).to_string();
+            let tip = t(lang, THEME_KEYS[i]).to_string();
             theme_row = theme_row.child(
                 Button::new(format!("theme-{i}"))
                     .small()
                     .when(active, |b| b.primary())
-                    .label(text)
+                    .icon(THEME_ICONS[i])
+                    .tooltip(tip)
                     .on_click(cx.listener(
                         move |this: &mut Self,
                               _: &ClickEvent,
@@ -736,40 +743,44 @@ impl Render for SettingsView {
                     div().w(px(160.)).child(Select::new(&self.margin_select)),
                 ))
             })
-            // --- Prefixes ---
+            // --- Prefixes: a 2x2 grid (CPU / MEM on the first row, upload /
+            // download on the second). Each cell is a labelled field column:
+            // caption above, input below. Inputs flex to their column so the
+            // grid fills the window width; row/cell gaps keep it airy without
+            // wasting vertical space.
             .child(divider(border))
             .child(section_label(t(lang, "settings.prefixes").to_string(), dim))
             .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .py_1()
-                    .child(t(lang, "settings.cpu").to_string())
-                    .child(Input::new(&self.prefix_cpu).w(px(180.))),
-            )
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .py_1()
-                    .child(t(lang, "settings.mem").to_string())
-                    .child(Input::new(&self.prefix_mem).w(px(180.))),
-            )
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .py_1()
-                    .child(t(lang, "settings.upload").to_string())
-                    .child(Input::new(&self.prefix_up).w(px(180.))),
-            )
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .py_1()
-                    .child(t(lang, "settings.download").to_string())
-                    .child(Input::new(&self.prefix_down).w(px(180.))),
+                v_flex()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .gap_4()
+                            .child(prefix_cell(
+                                t(lang, "settings.cpu").to_string(),
+                                &self.prefix_cpu,
+                                faint,
+                            ))
+                            .child(prefix_cell(
+                                t(lang, "settings.mem").to_string(),
+                                &self.prefix_mem,
+                                faint,
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_4()
+                            .child(prefix_cell(
+                                t(lang, "settings.upload").to_string(),
+                                &self.prefix_up,
+                                faint,
+                            ))
+                            .child(prefix_cell(
+                                t(lang, "settings.download").to_string(),
+                                &self.prefix_down,
+                                faint,
+                            )),
+                    ),
             )
             .child(
                 div()
@@ -778,6 +789,17 @@ impl Render for SettingsView {
                     .child(t(lang, "settings.prefix_hint").to_string()),
             )
     }
+}
+
+/// One prefix cell of the settings 2x2 grid: a dim caption above a flexible
+/// text input. Takes the entity by reference so the render borrow survives
+/// the child call.
+fn prefix_cell(label: String, input: &Entity<InputState>, faint: Hsla) -> impl IntoElement {
+    v_flex()
+        .flex_1()
+        .gap_1()
+        .child(div().text_xs().text_color(faint).child(label))
+        .child(Input::new(input).w_full())
 }
 
 fn main() {
