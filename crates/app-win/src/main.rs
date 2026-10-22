@@ -119,12 +119,17 @@ mod win {
     /// Font size for the vertical (left/right) taskbar layout, as a fraction of
     /// the system UI size expressed in tenths. On a vertical taskbar the bar's
     /// *thickness* — not its length — is the width budget: a typical bar is
-    /// ~48 logical px wide, while the longest rate string (`1023 M/s`) rendered
-    /// at the system UI size with a CJK face needs more than that, so the
-    /// system size would clip. The stacked label/value column plus this
-    /// reduction keeps every line inside the bar. Horizontal taskbars are
-    /// limited by height, not width, so they keep the system size untouched.
-    const VERTICAL_FONT_TENTHS: i32 = 6;
+    /// ~48 logical px wide, while the longest rate string rendered at the
+    /// system UI size with a CJK face needs more than that, so the system
+    /// size would clip. The stacked label/value column plus this reduction
+    /// keeps every line inside the bar. Horizontal taskbars are limited by
+    /// height, not width, so they keep the system size untouched.
+    ///
+    /// 0.7× (was 0.6× before the vertical layout dropped the `/s` suffix):
+    /// removing `/s` from the numeric line frees roughly two character cells
+    /// of width, which buys back the size step for legibility at the same
+    /// thickness budget.
+    const VERTICAL_FONT_TENTHS: i32 = 7;
     /// Horizontal padding for the vertical layout: the thickness is the binding
     /// constraint, so the text keeps a tighter margin than on horizontal bars.
     const VERTICAL_PAD_PX: i32 = 3;
@@ -597,12 +602,28 @@ mod win {
         right_x: Option<i32>,
         multi_line: bool,
         item_widths: Option<Vec<i32>>,
+        /// Vertical layout only: height of each line slot in pixels, in line
+        /// order. Blank separator lines take `item_spacing` (the same gap the
+        /// horizontal single-row layout puts between metrics) instead of a
+        /// full text line, so both layouts use one consistent block gap and
+        /// the column stays short. Empty for the other layouts, where every
+        /// line slot has the uniform `line_h`.
+        line_heights: Vec<i32>,
+    }
+
+    /// Whether a blank line is the vertical layout's inter-block separator
+    /// rather than content. The vertical frame is the only multi-line,
+    /// single-column frame whose lines can be empty (the stacked builder
+    /// inserts one blank line between metric blocks).
+    fn is_vertical_separator(line: &sysvitals_core::Line) -> bool {
+        line.left.is_empty() && line.right.is_empty()
     }
 
     unsafe fn measure_frame(
         hdc: windows::Win32::Graphics::Gdi::HDC,
         row: &FormattedRow,
         spacing_px: i32,
+        vertical: bool,
     ) -> FrameMetrics {
         let multi_line = row.lines.len() > 1;
         let has_right_col = row.lines.iter().any(|l| !l.right.is_empty());
@@ -638,6 +659,7 @@ mod win {
                 right_x: None,
                 multi_line: false,
                 item_widths: Some(item_widths),
+                line_heights: Vec::new(),
             };
         }
 
@@ -646,12 +668,30 @@ mod win {
             for line in &row.lines {
                 want_w = want_w.max(text_w(&row_text(line)));
             }
+            // Vertical layout: separator lines shrink to the configured block
+            // gap so it matches the horizontal single-row metric gap; content
+            // lines keep the measured text height + breathing room.
+            let line_heights: Vec<i32> = if vertical {
+                row.lines
+                    .iter()
+                    .map(|l| {
+                        if is_vertical_separator(l) {
+                            spacing_px.max(1)
+                        } else {
+                            line_h + 2
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             return FrameMetrics {
                 line_h,
                 want_w,
                 right_x: None,
                 multi_line,
                 item_widths: None,
+                line_heights,
             };
         }
         let mut left_col_w = 0i32;
@@ -669,27 +709,34 @@ mod win {
             right_x: Some(right_x),
             multi_line,
             item_widths: None,
+            line_heights: Vec::new(),
         }
     }
 
     /// Measure the formatted rows and grow the window to fit. Width only
-    /// ever grows; height follows the row count.
+    /// ever grows; height follows the row count, and in the vertical layout
+    /// the per-line slot heights from [`measure_frame`] (separator lines
+    /// sized to `item_spacing`, not a full text line).
     unsafe fn resize_to_content(hwnd: HWND, row: &FormattedRow) {
         let cfg = config();
         let spacing_px = cfg.display.item_spacing as i32;
+        let vertical = TASKBAR_VERTICAL.load(Ordering::Relaxed);
         let hdc = GetDC(Some(hwnd));
         let font = make_font();
         let old = SelectObject(hdc, font.into());
-        let m = measure_frame(hdc, row, spacing_px);
+        let m = measure_frame(hdc, row, spacing_px, vertical);
         SelectObject(hdc, old);
         let _ = DeleteObject(font.into());
         let _ = ReleaseDC(Some(hwnd), hdc);
         if m.line_h == 0 {
             return;
         }
-        let line_h = m.line_h + 2;
         let want_w = m.want_w + pad_px() * 2 + width_slack_px();
-        let want_h = line_h * row.lines.len() as i32 + 2;
+        let want_h = if m.line_heights.is_empty() {
+            (m.line_h + 2) * row.lines.len() as i32 + 2
+        } else {
+            m.line_heights.iter().sum::<i32>() + 2
+        };
         WIN_W.fetch_max(want_w, Ordering::Relaxed);
         WIN_H.store(want_h, Ordering::Relaxed);
         let w = WIN_W.load(Ordering::Relaxed);
@@ -828,15 +875,31 @@ mod win {
             *ss_px.add(i) = 0;
         }
 
-        let ss_line_h = sh / row.lines.len().max(1) as i32;
         let spacing_px = config().display.item_spacing as i32;
         // Padding follows the orientation so the vertical layout can use its
         // tighter margin; measurement and rendering must agree on it.
         let pad = pad_px() * SS;
-        let fm = measure_frame(mem_dc, &row, spacing_px * SS);
+        let vertical = TASKBAR_VERTICAL.load(Ordering::Relaxed);
+        let fm = measure_frame(mem_dc, &row, spacing_px * SS, vertical);
+        // Line slot tops in supersampled pixels. Uniform division works for
+        // the horizontal layouts; the vertical layout has per-line heights
+        // (separator lines sized to `item_spacing`, content lines sized to
+        // the text height + breathing), so tops accumulate from that table.
+        let ss_line_h = sh / row.lines.len().max(1) as i32;
+        let mut tops: Vec<(i32, i32)> = Vec::with_capacity(row.lines.len());
+        if fm.line_heights.is_empty() {
+            for i in 0..row.lines.len() {
+                tops.push((i as i32 * ss_line_h, (i as i32 + 1) * ss_line_h));
+            }
+        } else {
+            let mut acc = 0i32;
+            for h in &fm.line_heights {
+                tops.push((acc, acc + h));
+                acc += h;
+            }
+        }
         for (i, line) in row.lines.iter().enumerate() {
-            let top = i as i32 * ss_line_h;
-            let bottom = (i as i32 + 1) * ss_line_h;
+            let (top, bottom) = tops.get(i).copied().unwrap_or((0, sh));
             if let Some(ref item_widths) = fm.item_widths {
                 // Single-row pixel-spacing layout.
                 let gap = spacing_px * SS;
