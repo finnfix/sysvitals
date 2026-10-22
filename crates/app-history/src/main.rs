@@ -332,6 +332,24 @@ impl HistoryView {
         if window.is_window_active() {
             self.ever_active = true;
         }
+        // On Windows the popup can open *without* ever being activated: the
+        // indicator overlay was the foreground process when it launched this
+        // child, and the foreground-lock rules can reject the startup
+        // activation attempt — then `ever_active` never flips and a click away
+        // never closes the window (the reported bug: a fast double click opens
+        // the popup but clicking elsewhere leaves it stuck; a single click
+        // usually activates fine). When the first-frame seed found the window
+        // inactive, claim activation through GPUI's own `activate_window` path
+        // (reassert placement + inject an Alt press so `SetForegroundWindow`
+        // is permitted). The resulting WM_ACTIVATE edge flows through the
+        // observer below and arms the blur-close. macOS is deliberately
+        // untouched: its panel is an accessory app's window with its own
+        // key-window lifecycle, unverified at runtime, and the bug was only
+        // ever reproduced on Windows.
+        #[cfg(windows)]
+        if !self.ever_active {
+            window.activate_window();
+        }
         let subscription = cx.observe_window_activation(window, |view, window, _| {
             if window.is_window_active() {
                 view.ever_active = true;

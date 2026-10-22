@@ -480,11 +480,21 @@ mod win {
     /// Logged on the first loss and every 60th so a hostile z-order partner
     /// cannot spam the log.
     static TOPMOST_LOST_COUNT: AtomicU32 = AtomicU32::new(0);
-    /// Set while the right-click menu is being tracked. `TrackPopupMenu` runs
-    /// a modal loop that still dispatches our `WM_TIMER`, and the menu lives
+    /// Set while a context menu is being tracked. `TrackPopupMenu` runs a
+    /// modal loop that still dispatches our `WM_TIMER`, and the menu lives
     /// in the topmost band — re-asserting the indicator's band during tracking
     /// would lift the tiny overlay back above the open menu. Skip those ticks.
     static MENU_TRACKING: AtomicBool = AtomicBool::new(false);
+    /// Re-entrancy guard for `launch_child`. The single-instance check reads
+    /// the process handle slot, but `ShellExecuteExW` only writes it *after*
+    /// the launch completes — and the Shell execute path can pump messages
+    /// internally (shell extensions, auto-approval). A fast double click on
+    /// the indicator can therefore dispatch the second `WM_LBUTTONUP` while
+    /// the first launch is still in flight, find the slot empty, and spawn a
+    /// duplicate child (two trend popups stacked at the same anchor, only
+    /// one of them ever activated). This flag spans the whole launch call:
+    /// the second click sees "launching" and no-ops.
+    static LAUNCHING: AtomicBool = AtomicBool::new(false);
 
     /// Keep the overlay at the very top of the topmost band, every tick.
     ///
@@ -1228,6 +1238,13 @@ mod win {
     /// live instance per target: if a previously spawned process is still
     /// running, this is a no-op. Extra argv (e.g. the `--anchor` geometry) is
     /// passed through verbatim.
+    ///
+    /// The liveness check reads the process handle slot, but that slot is only
+    /// written *after* `ShellExecuteExW` returns — and Shell execute can pump
+    /// messages on its own thread-reentrant path, so a second click landing
+    /// mid-launch would see an empty slot and spawn a duplicate. The `LAUNCHING`
+    /// flag spans the whole launch (checked + set before, cleared after) so the
+    /// overlapping click no-ops instead. See the `LAUNCHING` note above.
     fn launch_child(
         exe_name: &str,
         args: Option<&str>,
@@ -1240,6 +1257,23 @@ mod win {
             );
             return false;
         }
+        if LAUNCHING.swap(true, Ordering::SeqCst) {
+            log_event(
+                "INFO",
+                &format!("launch_child {exe_name}: launch already in flight, skipped"),
+            );
+            return false;
+        }
+        let result = launch_child_inner(exe_name, args, slot);
+        LAUNCHING.store(false, Ordering::SeqCst);
+        result
+    }
+
+    fn launch_child_inner(
+        exe_name: &str,
+        args: Option<&str>,
+        slot: &std::cell::RefCell<Option<HANDLE>>,
+    ) -> bool {
         let Some(dir) = current_exe_dir() else {
             log_event(
                 "WARN",
