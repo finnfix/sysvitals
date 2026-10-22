@@ -58,14 +58,16 @@ jobs:
       - name: Build GPUI history chart
         run: cargo build --release -p app-history
       # Portable (green) distribution: overlay exe plus the settings/history
-      # exes when present. Package name: SysVitals_Windows_x64_{version}.zip
+      # exes when present. Package name: SysVitals_Windows_x64_{version}_dev.zip
       # (Windows ships x64 only); the version is read from the workspace
-      # Cargo.toml (single source of truth).
+      # Cargo.toml (single source of truth). The `_dev` suffix marks a
+      # development-phase build: these artifacts are not releases, and the
+      # suffix is dropped when the first tagged version is published.
       - name: Package Windows portable zip
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          $zip = "SysVitals_Windows_x64_$version.zip"
+          $zip = "SysVitals_Windows_x64_${version}_dev.zip"
           $files = @("target/release/SysVitals.exe")
           if (Test-Path "target/release/SysVitalsSettings.exe") { $files += "target/release/SysVitalsSettings.exe" }
           if (Test-Path "target/release/SysVitalsHistory.exe") { $files += "target/release/SysVitalsHistory.exe" }
@@ -98,7 +100,9 @@ jobs:
       # One bundle, not three apps: the indicator is the declared
       # CFBundleExecutable, and the settings/history binaries are sibling
       # executables it launches from Contents/MacOS. Package name:
-      # SysVitals_macOS_arm64_{version}.zip (macOS ships Apple Silicon only).
+      # SysVitals_macOS_arm64_{version}_dev.zip (macOS ships Apple Silicon
+      # only). The `_dev` suffix marks a development-phase build and is
+      # dropped at the first tagged release (mirrors the Windows step).
       - name: Package macOS app bundle
         run: |
           version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
@@ -114,8 +118,8 @@ jobs:
           fi
           cp crates/app-mac/assets/Info.plist "$app/Contents/Info.plist"
           cp crates/app-mac/assets/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
-          zip -qr "SysVitals_macOS_arm64_$version.zip" "$app"
-          echo "Packaged SysVitals_macOS_arm64_$version.zip"
+          zip -qr "SysVitals_macOS_arm64_${version}_dev.zip" "$app"
+          echo "Packaged SysVitals_macOS_arm64_${version}_dev.zip"
       - name: Upload macOS app bundle
         uses: actions/upload-artifact@v4
         with:
