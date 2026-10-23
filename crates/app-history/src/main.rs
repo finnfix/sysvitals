@@ -53,6 +53,9 @@ fn parse_anchor() -> Option<AnchorRect> {
         for slot in nums.iter_mut() {
             *slot = args.next()?.trim().parse().ok()?;
         }
+        if !nums.iter().all(|n| n.is_finite()) {
+            return None;
+        }
         let [left, top, right, bottom] = nums;
         return (right > left && bottom > top).then_some(AnchorRect {
             left,
@@ -155,18 +158,20 @@ impl TimeRange {
     }
 
     /// The clean wall-clock step the x-axis labels are floored to — the
-    /// range picks the step so every label reads as a round time:
+    /// range picks the step so every label reads as a round local time:
     ///   5 min    = 60 s       (every local minute)
     ///   1 hour   = 600 s      (every :10 / :20 / ... local ten-minute mark)
-    ///   1 day    = 7 200 s    (every 2 h at 00/02/.../22 in a whole-hour zone)
-    ///   1 month  = 432 000 s  (every 5 days at local midnight, offset-aligned)
+    ///   1 day    = 7 200 s    (every 2 h at 00/02/.../22 local time)
+    ///   1 month  = 432 000 s  (every 5 days at local midnight)
+    /// Every grid is offset-aligned to the machine's local time zone; steps
+    /// like 7200 s do not divide every real UTC offset (e.g. +5:30), so a
+    /// zero-offset grid would read :30 instead of the intended marks.
     /// The curve is NOT drawn at this step: it uses [`Self::bucket_secs`] so
     /// the line keeps its detail. Each label point floors its own timestamp
     /// to this grid, so the six spread ticks read as clean times while the
-    /// line stays fine-grained. Every value is an integer multiple of the
-    /// range's fine bucket width, and the query window start is aligned down
-    /// to this grid (see [`floor_to_grid`]), so the first bucket sits exactly
-    /// on a clean boundary and the first label dates the window start.
+    /// line stays fine-grained. The query window start is aligned down to
+    /// this grid (see [`floor_to_grid`]), so the first label dates the window
+    /// start.
     fn label_step_secs(self) -> i64 {
         match self {
             TimeRange::Min5 => 60,
@@ -174,15 +179,6 @@ impl TimeRange {
             TimeRange::Day1 => 7_200,
             TimeRange::Month1 => 432_000,
         }
-    }
-
-    /// Whether this range's label grid must be aligned to local midnight
-    /// rather than UTC midnight. Only the month view needs it (5-day grid);
-    /// the shorter ranges' steps (60/600/7200 s) all divide evenly into
-    /// every real UTC offset, so their epoch-aligned grid already lands on
-    /// clean local times.
-    fn label_needs_offset(self) -> bool {
-        matches!(self, TimeRange::Month1)
     }
 
     fn label(self, lang: Language) -> &'static str {
@@ -244,6 +240,10 @@ struct HistoryView {
     buckets: Vec<Bucket>,
     csv_scope: CsvScope,
     copied: bool,
+    copy_failed: bool,
+    /// Last config mtime applied, in nanoseconds; the popup keeps language and
+    /// CSV-scope settings live instead of freezing them at launch.
+    config_mtime: u64,
     /// Guards blur-close: only close after the window has been active at
     /// least once, so a transient "inactive" signal at open time (a macOS
     /// nonactivating panel that has not become key yet) cannot close the
@@ -281,6 +281,8 @@ impl HistoryView {
             buckets: Vec::new(),
             csv_scope,
             copied: false,
+            copy_failed: false,
+            config_mtime: 0,
             ever_active: false,
             _activation: None,
             _appearance: None,
@@ -315,7 +317,13 @@ impl HistoryView {
                         return true;
                     }
                     view.last_accent = current;
-                    apply_accent(cx);
+                    if current.is_some() {
+                        apply_accent(cx);
+                    } else {
+                        // The OS moved back to "multicolor": reload the palette
+                        // so the old accent override is removed.
+                        apply_theme_and_accent(cx);
+                    }
                     cx.notify();
                     true
                 })
@@ -340,11 +348,12 @@ impl HistoryView {
         self._escape = Some(subscription);
     }
 
-    /// Watch the window's OS-appearance changes and re-apply the user's
-    /// preference each time. Idempotent, and registered from the first
-    /// render pass like `observe_activation` — never from a paint-phase
-    /// callback, which would hit the empty active-node stack on the root
-    /// view's first frame (see the crash note on `_escape`).
+    /// Watch the window's OS-appearance changes and re-apply the system
+    /// palette (the popup always follows the system; `display.theme` is
+    /// indicator-only). Idempotent, and registered from the first render
+    /// pass like `observe_activation` — never from a paint-phase callback,
+    /// which would hit the empty active-node stack on the root view's first
+    /// frame (see the crash note on `_escape`).
     fn observe_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self._appearance.is_some() {
             return;
@@ -390,6 +399,11 @@ impl HistoryView {
         #[cfg(windows)]
         if !self.ever_active {
             window.activate_window();
+            // If activation completed synchronously, the observer below will
+            // not see an edge; seed the guard from the post-activation state.
+            if window.is_window_active() {
+                self.ever_active = true;
+            }
         }
         let subscription = cx.observe_window_activation(window, |view, window, _| {
             if window.is_window_active() {
@@ -405,11 +419,43 @@ impl HistoryView {
     /// Reload the stored samples every [`REFRESH_INTERVAL`] while the window
     /// lives. The loop stops as soon as the view entity is released, i.e.
     /// when the window closes.
+    /// Reload language and CSV scope when the config file changes while the
+    /// popup is open. The theme is system-owned; only these two settings are
+    /// consumed by this panel.
+    fn reload_config(&mut self) {
+        let Ok(path) = config_path() else {
+            return;
+        };
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        if mtime == self.config_mtime {
+            return;
+        }
+        match Config::load(&path) {
+            Ok((cfg, _)) => {
+                self.config_mtime = mtime;
+                self.lang = cfg.display.language;
+                self.csv_scope = cfg.history.csv_scope;
+            }
+            Err(e) => {
+                // Retry only when the file changes again, and keep the last
+                // good values in the meantime.
+                self.config_mtime = mtime;
+                eprintln!("app-history: config reload failed: {e}");
+            }
+        }
+    }
+
     fn start_refresh_loop(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(REFRESH_INTERVAL).await;
             if this
                 .update(cx, |view: &mut HistoryView, cx| {
+                    view.reload_config();
                     view.load_data();
                     cx.notify();
                 })
@@ -421,35 +467,38 @@ impl HistoryView {
         .detach();
     }
 
+    /// The exact query window the chart is showing: a start floored to the
+    /// range's label grid, the current time, the fine curve bucket width, and
+    /// the local-time offset used for both bucketing and label flooring.
+    /// CSV export and the chart both use this so "copy what you see" is true
+    /// at the window boundary too.
+    fn visible_query(&self, now: i64) -> (i64, i64, i64, i64) {
+        let step = self.range.label_step_secs();
+        let offset = Local::now().offset().local_minus_utc() as i64;
+        let from = floor_to_grid(now - self.range.seconds(), step, offset);
+        (from, now, self.range.bucket_secs(), offset)
+    }
+
     fn load_data(&mut self) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let step = self.range.label_step_secs();
-        // The label grid is offset-aligned only for the month range (see
-        // `label_needs_offset`); the fine curve buckets divide every real
-        // UTC offset, so a zero offset keeps their epoch grid for the rest.
-        let offset = if self.range.label_needs_offset() {
-            Local::now().offset().local_minus_utc() as i64
-        } else {
-            0
-        };
-        // Align the window start down to the clean grid: the label step is a
-        // multiple of the fine bucket width, so the first bucket sits exactly
-        // on a wall-clock boundary and the first x label dates the start.
-        let from = floor_to_grid(now - self.range.seconds(), step, offset);
-
+        let (from, to, bucket, offset) = self.visible_query(now);
+        // Clear on failure: otherwise a range switch would keep showing the
+        // previous range's points under the new axis.
+        let mut buckets = Vec::new();
         if let Ok(path) = history_path() {
             if let Ok(store) = Store::open(&path) {
                 // The curve draws at the fine CSV bucket width; axis labels
                 // floor each point's timestamp to the clean grid (see
                 // `points`). One query serves both — no coarse pass anymore.
-                self.buckets = store
-                    .buckets_offset(from, now, self.range.bucket_secs(), offset)
+                buckets = store
+                    .buckets_offset(from, to, bucket, offset)
                     .unwrap_or_default();
             }
         }
+        self.buckets = buckets;
     }
 
     fn points(&self) -> Vec<ChartPoint> {
@@ -470,11 +519,7 @@ impl HistoryView {
         // — painting it twice reads as broken, so only the first keeps it.
         let month_view = self.range == TimeRange::Month1;
         let step = self.range.label_step_secs();
-        let offset = if month_view {
-            Local::now().offset().local_minus_utc() as i64
-        } else {
-            0
-        };
+        let offset = Local::now().offset().local_minus_utc() as i64;
         let labeled: HashSet<usize> = spread_label_indices(self.buckets.len(), X_TICK_COUNT)
             .into_iter()
             .collect();
@@ -513,17 +558,7 @@ impl HistoryView {
 
     fn copy_csv(&mut self) {
         let lang = self.lang;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        let (from, bucket_secs) = match self.csv_scope {
-            CsvScope::Visible => (now - self.range.seconds(), self.range.bucket_secs()),
-            CsvScope::Last24h => (now - 86400, 120),
-            CsvScope::Last7d => (now - 604800, 600),
-            CsvScope::Last30d => (now - 2_592_000, 3600),
-        };
+        self.copy_failed = false;
 
         // Tab-separated rows paste straight into spreadsheet cells (WPS /
         // Excel split on tabs on paste), and unlike a space separator they
@@ -542,20 +577,60 @@ impl HistoryView {
         csv.push_str(&header);
         csv.push('\n');
 
-        if let Ok(path) = history_path() {
-            if let Ok(store) = Store::open(&path) {
-                if let Ok(buckets) = store.buckets(from, now, bucket_secs) {
-                    for b in &buckets {
-                        let ts_str = format_ts_full(b.ts);
-                        csv.push_str(&format!("{ts_str}\t{:.1}\t{:.1}\n", b.cpu, b.mem));
-                    }
+        let buckets = if self.csv_scope == CsvScope::Visible {
+            // Exactly the points currently drawn, including the grid-aligned
+            // window start and the local-time bucket phase.
+            Some(self.buckets.clone())
+        } else {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let (seconds, bucket_secs) = match self.csv_scope {
+                CsvScope::Visible => unreachable!(),
+                CsvScope::Last24h => (86_400, 120),
+                CsvScope::Last7d => (604_800, 600),
+                CsvScope::Last30d => (2_592_000, 3600),
+            };
+            let offset = Local::now().offset().local_minus_utc() as i64;
+            let from = floor_to_grid(now - seconds, bucket_secs, offset);
+            let mut loaded = None;
+            if let Ok(path) = history_path() {
+                if let Ok(store) = Store::open(&path) {
+                    loaded = store.buckets_offset(from, now, bucket_secs, offset).ok();
                 }
             }
+            loaded
+        };
+
+        let Some(buckets) = buckets else {
+            self.copied = false;
+            self.copy_failed = true;
+            eprintln!("app-history: CSV query failed");
+            return;
+        };
+        for b in &buckets {
+            let ts_str = format_ts_full(b.ts);
+            csv.push_str(&format!("{ts_str}\t{:.1}\t{:.1}\n", b.cpu, b.mem));
         }
 
-        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-            let _ = clipboard.set_text(csv);
-            self.copied = true;
+        match arboard::Clipboard::new() {
+            Ok(mut clipboard) => match clipboard.set_text(csv) {
+                Ok(()) => {
+                    self.copied = true;
+                    self.copy_failed = false;
+                }
+                Err(e) => {
+                    self.copied = false;
+                    self.copy_failed = true;
+                    eprintln!("app-history: clipboard write failed: {e}");
+                }
+            },
+            Err(e) => {
+                self.copied = false;
+                self.copy_failed = true;
+                eprintln!("app-history: clipboard unavailable: {e}");
+            }
         }
     }
 
@@ -570,6 +645,7 @@ impl HistoryView {
                 .await;
             let _ = this.update(cx, |view: &mut HistoryView, cx| {
                 view.copied = false;
+                view.copy_failed = false;
                 cx.notify();
             });
         })
@@ -600,21 +676,6 @@ fn fmt_date_time(ts: i64) -> String {
         .unwrap_or_default()
 }
 
-/// Full local date and time (with seconds) for the hover tooltip: the axis
-/// labels are deliberately terse (HH:MM or MM-DD HH:MM) and the popup's
-/// point of existence is to give exact per-point reading, so the tooltip
-/// carries the wall clock down to the second — matching the CSV export's
-/// timestamp format.
-fn fmt_full(ts: i64) -> String {
-    DateTime::from_timestamp(ts, 0)
-        .map(|dt| {
-            dt.with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string()
-        })
-        .unwrap_or_default()
-}
-
 /// Local calendar date as a stable comparison key (`YYYY-MM-DD`). Two
 /// timestamps match only if their wall-clock date in the user's zone
 /// matches, which is the exact "day crossed" test the x-axis labels need.
@@ -628,7 +689,8 @@ fn day_of(ts: i64) -> String {
 }
 
 /// Format a unix timestamp as YYYY-MM-DD HH:MM:SS in the machine's local
-/// time zone, so exported rows line up with the user's wall clock.
+/// time zone. Used by both the CSV export and the hover tooltip so exported
+/// rows and the point readout agree.
 fn format_ts_full(ts: i64) -> String {
     DateTime::from_timestamp(ts, 0)
         .map(|dt| {
@@ -644,6 +706,7 @@ impl Render for HistoryView {
         let lang = self.lang;
         let points = self.points();
         let copied = self.copied;
+        let copy_failed = self.copy_failed;
         let current_range = self.range;
 
         // Register the blur-close observer and the live appearance observer
@@ -676,6 +739,8 @@ impl Render for HistoryView {
         // tooltip keeps the textual hint in the current language.
         let copy_tip = if copied {
             t(lang, "chart.copied").to_string()
+        } else if copy_failed {
+            t(lang, "chart.copy_failed").to_string()
         } else {
             t(lang, "chart.copy_csv").to_string()
         };
@@ -688,6 +753,7 @@ impl Render for HistoryView {
                     .text_color(hsla(150.0 / 360.0, 0.7, 0.45, 1.0))
             })
             .when(!copied, |b| b.icon(IconName::Copy))
+            .when(copy_failed, |b| b.text_color(hsla(0.0, 0.7, 0.5, 1.0)))
             .on_click(cx.listener(|this: &mut Self, _: &ClickEvent, _, cx| {
                 this.copy_csv();
                 this.schedule_copied_reset(cx);
@@ -753,7 +819,7 @@ impl Render for HistoryView {
                 .y_tick_count(6)
                 .grid(true)
                 .appear(false)
-                .tooltip_title(|p: &ChartPoint| fmt_full(p.ts).into())
+                .tooltip_title(|p: &ChartPoint| format_ts_full(p.ts).into())
                 .tooltip_value(|_p: &ChartPoint, _series: usize, v: f64| format!("{v:.2}%").into()),
         );
 
@@ -862,14 +928,10 @@ fn apply_accent(cx: &mut App) {
         return;
     };
     let base = rgb_hex_to_hsla(hex);
-    // Recompute the primary foreground from the accent's lightness. The
-    // palette default cannot be reused: the shadcn neutral set flips per
-    // mode (dark mode ships `neutral-900` black on `neutral-50` white), so
-    // leaving it alone draws black-on-mid-accent text that is unreadable.
-    // Mid-lightness accents fail WCAG with either pure extreme, so the
-    // chosen color is nudged slightly off pure, same direction the Windows
-    // shell takes when it picks button label colors.
-    let foreground = if base.l > 0.60 {
+    // Use WCAG relative luminance, not HSL lightness: a saturated yellow has
+    // an HSL lightness near 0.5 but is far brighter than a mid-blue, so the
+    // old HSL threshold painted white text on it.
+    let foreground = if sysvitals_core::color::prefers_dark_foreground(hex) {
         hsla(0.0, 0.0, 0.08, 1.0)
     } else {
         hsla(0.0, 0.0, 0.97, 1.0)
@@ -1058,12 +1120,17 @@ fn apply_theme_and_accent(cx: &mut App) {
 }
 
 fn main() {
-    let cfg = config_path()
-        .and_then(|p| Config::load(&p).map(|(c, _)| c))
-        .unwrap_or_default();
+    let cfg = match config_path().and_then(|p| Config::load(&p).map(|(c, _)| c)) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("app-history: config load failed: {e}; using defaults");
+            Config::default()
+        }
+    };
 
     let lang = cfg.display.language;
     let csv_scope = cfg.history.csv_scope;
+    let window_title = format!("SysVitals {}", t(lang, "chart.title"));
 
     // Register the bundled icon asset source before the run loop starts.
     // Without this the GPUI default asset source (`()`) returns `Ok(None)`
@@ -1142,13 +1209,13 @@ fn main() {
             None
         } else {
             Some(TitlebarOptions {
-                title: Some("SysVitals History".into()),
+                title: Some(window_title.clone()),
                 ..Default::default()
             })
         };
         #[cfg(not(target_os = "macos"))]
         let titlebar = Some(TitlebarOptions {
-            title: Some("SysVitals History".into()),
+            title: Some(window_title.clone()),
             appears_transparent: anchored,
             ..Default::default()
         });

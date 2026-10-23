@@ -9,12 +9,9 @@
 //!   (tarballs, vendored copies, cache warm-up). The semver is read from
 //!   `CARGO_PKG_VERSION`, which the workspace root propagates.
 //!
-//! The CI quality-gate checkout uses `actions/checkout@v4` with the default
-//! settings: the commit is present but annotated tags are not fetched, so the
-//! dev stamp is what CI emits today. When the first release tag goes out, the
-//! tag step must also flip `fetch-tags: true` on the checkout (or otherwise
-//! pull the tag) so this script's `git describe --tags --exact-match` can
-//! see it.
+//! The CI build jobs pass `fetch-tags: true` to the checkout, so an annotated
+//! release tag is visible here; local builds without git metadata fall back to
+//! the plain version stamp.
 
 use std::path::Path;
 use std::process::Command;
@@ -74,6 +71,9 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn emit_build_id() {
+    // Register this before the override early-return: otherwise Cargo would
+    // not know to rerun the script when the override is later removed.
+    println!("cargo:rerun-if-env-changed=SV_BUILD_ID_OVERRIDE");
     // CI and manual builds can pin the exact string shown in the footer by
     // exporting `SV_BUILD_ID_OVERRIDE`; when set it wins unconditionally so
     // the stamp is reproducible even without a git checkout.
@@ -87,17 +87,24 @@ fn emit_build_id() {
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
     let repo = Path::new(&manifest_dir).join("../..");
-    let head_ref = repo.join(".git/HEAD");
 
-    // Ask cargo to rerun this build script when the checked-out commit moves.
-    // Emitting the path only when it exists avoids cargo's "path outside of
-    // the crate directory" deprecation warning on tarball builds and prevents
-    // the missing file from forcing a rebuild every invocation.
-    if head_ref.exists() {
-        let watch = head_ref.canonicalize().unwrap_or_else(|_| head_ref.clone());
-        println!("cargo:rerun-if-changed={}", watch.display());
+    // Ask cargo to rerun this build script when the checked-out commit or a
+    // tag moves. Watching only `.git/HEAD` misses commits on the same branch
+    // (HEAD is a symref) and newly created tags. Emitting a path only when it
+    // exists avoids cargo's "path outside of the crate directory" warning on
+    // tarball builds.
+    for candidate in [
+        repo.join(".git/HEAD"),
+        repo.join(".git/logs/HEAD"),
+        repo.join(".git/packed-refs"),
+        repo.join(".git/refs/tags"),
+        repo.join(".git/refs/heads"),
+    ] {
+        if candidate.exists() {
+            let watch = candidate.canonicalize().unwrap_or(candidate);
+            println!("cargo:rerun-if-changed={}", watch.display());
+        }
     }
-    println!("cargo:rerun-if-env-changed=SV_BUILD_ID_OVERRIDE");
 
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
 

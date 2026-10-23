@@ -38,7 +38,7 @@ use sysvitals_core::backdrop::Material;
 use sysvitals_core::config::{
     ALLOWED_INTERVAL_MS, ALLOWED_ITEM_SPACING_PX, ALLOWED_LEFT_MARGIN_PX,
 };
-use sysvitals_core::{Anchor, Config, Language, Theme, t};
+use sysvitals_core::{t, Anchor, Config, Language, Theme};
 
 // ---------------------------------------------------------------------------
 // Platform gate for the layout section
@@ -242,7 +242,7 @@ fn system_color_hex(color: &objc2_app_kit::NSColor) -> Option<u32> {
 /// pre-material rendering byte-for-byte. Re-runs on every theme change (the
 /// palette reload overwrites it) — the same replay contract as the accent.
 fn apply_material(cx: &mut App) {
-    use sysvitals_core::backdrop::{MATERIAL_TINT_ALPHA, should_tint};
+    use sysvitals_core::backdrop::{should_tint, MATERIAL_TINT_ALPHA};
     let material = detect_material();
     if !should_tint(material) {
         return;
@@ -363,10 +363,10 @@ fn apply_accent(cx: &mut App) {
         return;
     };
     let base = rgb_hex_to_hsla(hex);
-    // Mid-lightness accents fail WCAG with either pure extreme; nudge the
-    // chosen foreground to a slightly softened pure black/white, same
-    // direction the Windows shell takes when it picks button label colors.
-    let foreground = if base.l > 0.60 {
+    // Use WCAG relative luminance, not HSL lightness: a saturated yellow has
+    // an HSL lightness near 0.5 but is far brighter than a mid-blue, so the
+    // old HSL threshold painted white text on it.
+    let foreground = if sysvitals_core::color::prefers_dark_foreground(hex) {
         hsla(0.0, 0.0, 0.08, 1.0)
     } else {
         hsla(0.0, 0.0, 0.97, 1.0)
@@ -472,6 +472,9 @@ struct SettingsView {
     /// Last accent value seen by the live-refresh poll; the override only
     /// re-applies when this moves (see `new`).
     last_accent: Option<u32>,
+    /// Whether the most recent config write failed. Shown in the footer so a
+    /// read-only/full disk does not silently swallow every setting change.
+    save_failed: std::cell::Cell<bool>,
     /// Keep event subscriptions alive for the lifetime of the view.
     _subscriptions: Vec<Subscription>,
     /// Flush guard: saves the current state whenever the window loses focus,
@@ -479,9 +482,8 @@ struct SettingsView {
     /// not lost (its field may never have received an explicit blur).
     _deactivation: Option<Subscription>,
     /// Kept alive so the appearance observer is not cancelled: a live OS
-    /// light/dark flip re-applies the user's theme preference (which mirrors
-    /// the OS only under `auto`; under an explicit light/dark override the
-    /// re-apply is a no-op that reloads the same palette).
+    /// light/dark flip reloads the system palette (the panel always follows
+    /// the system, independent of the indicator-only `display.theme`).
     _appearance: Option<Subscription>,
 }
 
@@ -630,6 +632,7 @@ impl SettingsView {
             // first 500 ms tick (idempotent when startup already succeeded),
             // after which it tracks the real value.
             last_accent: None,
+            save_failed: std::cell::Cell::new(false),
             _subscriptions,
             _deactivation: None,
             _appearance: None,
@@ -646,26 +649,31 @@ impl SettingsView {
         // `update` on purpose: on macOS `system_accent_hex` reads AppKit
         // (`controlAccentColor`), which belongs to the main thread — the same
         // thread `update` runs on.
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(500))
-                    .await;
-                let alive = this
-                    .update(cx, |view: &mut SettingsView, cx| {
-                        let current = system_accent_hex();
-                        if current == view.last_accent {
-                            return true;
-                        }
-                        view.last_accent = current;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            let alive = this
+                .update(cx, |view: &mut SettingsView, cx| {
+                    let current = system_accent_hex();
+                    if current == view.last_accent {
+                        return true;
+                    }
+                    view.last_accent = current;
+                    if current.is_some() {
                         apply_accent(cx);
-                        cx.notify();
-                        true
-                    })
-                    .unwrap_or(false);
-                if !alive {
-                    break;
-                }
+                    } else {
+                        // The OS moved back to "multicolor" (or the accent
+                        // probe failed): reload the palette so the old accent
+                        // override is removed.
+                        apply_theme_and_accent(cx);
+                    }
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !alive {
+                break;
             }
         })
         .detach();
@@ -722,9 +730,11 @@ impl SettingsView {
 
     fn save(&self, cx: &App) {
         let cfg = self.collect_config(cx);
-        if let Ok(path) = sysvitals_core::config::config_path() {
-            let _ = cfg.save(&path);
+        let result = sysvitals_core::config::config_path().and_then(|path| cfg.save(&path));
+        if let Err(e) = &result {
+            eprintln!("app-settings: config save failed: {e}");
         }
+        self.save_failed.set(result.is_err());
     }
 
     /// Rebuild the language-dependent anchor dropdown after a language flip,
@@ -764,6 +774,11 @@ fn labeled_row(title: String, control: impl IntoElement) -> impl IntoElement {
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Re-probe the taskbar shape on every render: the user can move or
+        // auto-hide the bar while this window stays open, and the Layout row
+        // visibility must follow within the next repaint.
+        self.vertical_taskbar = taskbar_is_vertical();
+        self.layout_available = layout_available();
         // Deactivation flush (registered once): persist the current state
         // whenever the window loses focus, covering the case where a prefix
         // field still holds the last edit when the window is closed or the
@@ -999,7 +1014,11 @@ impl Render for SettingsView {
                         this = this.child(divider(border));
                     }
                     this.child(labeled_row(
-                        t(lang, "settings.left_margin").to_string(),
+                        if self.vertical_taskbar {
+                            t(lang, "settings.top_margin").to_string()
+                        } else {
+                            t(lang, "settings.left_margin").to_string()
+                        },
                         div().w(px(160.)).child(Select::new(&self.margin_select)),
                     ))
                 },
@@ -1049,6 +1068,15 @@ impl Render for SettingsView {
                     .text_color(faint)
                     .child(t(lang, "settings.prefix_hint").to_string()),
             )
+            .when(self.save_failed.get(), |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(faint)
+                        .text_center()
+                        .child(t(lang, "settings.save_failed").to_string()),
+                )
+            })
             // --- Version footer: pinned to the bottom of the scrollable
             // column (mt_auto absorbs the leftover space when the content is
             // shorter than the window). Built from `SV_BUILD_ID`, injected by
@@ -1086,10 +1114,33 @@ fn prefix_cell(label: String, input: &Entity<InputState>, faint: Hsla) -> impl I
         .child(Input::new(input).w_full())
 }
 
+/// Load the config, backing up a malformed file before falling back to
+/// defaults. Without the backup the first instant-save would overwrite the
+/// user's (hand-edited) file with defaults.
+fn load_config_with_backup() -> Config {
+    let Ok(path) = sysvitals_core::config::config_path() else {
+        return Config::default();
+    };
+    match Config::load(&path) {
+        Ok((cfg, _)) => cfg,
+        Err(e) => {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let backup = path.with_file_name(format!("config.toml.corrupt-{stamp}"));
+            let _ = std::fs::rename(&path, &backup);
+            eprintln!(
+                "app-settings: config load failed: {e}; backed up to {}",
+                backup.display()
+            );
+            Config::default()
+        }
+    }
+}
+
 fn main() {
-    let cfg = sysvitals_core::config::config_path()
-        .and_then(|p| Config::load(&p).map(|(c, _)| c))
-        .unwrap_or_default();
+    let cfg = load_config_with_backup();
 
     // macOS: run as a regular foreground app so opening the settings window
     // puts an icon in the Dock (user requirement), and quit with the last
@@ -1136,7 +1187,7 @@ fn main() {
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(420.), px(640.)), cx)),
             titlebar: Some(TitlebarOptions {
-                title: Some("SysVitals Settings".into()),
+                title: Some(t(cfg.display.language, "settings.title").to_string()),
                 ..Default::default()
             }),
             // System backdrop material (Win11 Mica / Win10-era acrylic blur /
