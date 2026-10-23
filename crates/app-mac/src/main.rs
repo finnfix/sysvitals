@@ -23,12 +23,12 @@ mod macos {
     use chrono::Local;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, Bool};
-    use objc2::{define_class, msg_send, sel, ClassType, MainThreadMarker, MainThreadOnly};
+    use objc2::{ClassType, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
     use objc2_app_kit::{
         NSApplication, NSApplicationActivationPolicy, NSAttributedStringNSStringDrawing,
         NSCellImagePosition, NSEventMask, NSEventType, NSFont, NSFontAttributeName, NSImage,
-        NSImageScaling, NSMenu, NSMenuItem, NSScreen, NSStatusBar, NSStatusItem,
-        NSVariableStatusItemLength, NSView,
+        NSImageScaling, NSMenu, NSMenuItem, NSScreen, NSStatusBar, NSStatusItem, NSTrackingArea,
+        NSTrackingAreaOptions, NSVariableStatusItemLength, NSView,
     };
     use objc2_foundation::{
         NSAttributedString, NSDictionary, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
@@ -37,7 +37,7 @@ mod macos {
 
     use sysvitals_core::config::{config_path, history_path};
     use sysvitals_core::format::format_frame;
-    use sysvitals_core::{t, Config, FormattedRow, NetSelection, Sampler};
+    use sysvitals_core::{Config, FormattedRow, NetSelection, Sampler, t};
 
     /// Font-size factor for the dual-row layout: the menu bar has a fixed
     /// height, so two lines only fit with the system menu-bar font scaled
@@ -770,9 +770,11 @@ mod macos {
             unsafe { restart_item.setAction(Some(sel!(restartApp:))) };
             // SAFETY: `target` is the live ActionHandler kept in ACTION_HANDLER.
             unsafe { restart_item.setTarget(Some(target)) };
-            menu.addItem(&restart_item);
 
+            // Separator, then Restart above Quit: Restart is a lifecycle
+            // action like Quit, so both sit below the divider, Restart first.
             menu.addItem(&NSMenuItem::separatorItem(mtm));
+            menu.addItem(&restart_item);
 
             let quit_title = NSString::from_str(t(lang, "menu.quit"));
             let quit_item = NSMenuItem::new(mtm);
@@ -852,10 +854,48 @@ mod macos {
             fn restart_app(&self, _sender: Option<&AnyObject>) {
                 restart_self();
             }
+
+            // Tray-style focus background on hover. The status button already
+            // draws AppKit's native menu-bar highlight while it is being
+            // clicked (the "pressed" state), so this only adds the resting
+            // pointer-over state: an `NSTrackingArea` (installed in `run`)
+            // routes `mouseEntered:` / `mouseExited:` here, and `highlight:`
+            // renders the very same native highlight — template-image tinting
+            // and light/dark inversion are untouched because AppKit owns the
+            // draw. `ActiveAlways` keeps hover alive even when the app is not
+            // key, and `InVisibleRect` re-binds the area to the button's
+            // current bounds so the grow-only width changes need no re-add.
+            #[unsafe(method(mouseEntered:))]
+            fn mouse_entered(&self, _event: Option<&AnyObject>) {
+                set_button_highlight(true);
+            }
+
+            #[unsafe(method(mouseExited:))]
+            fn mouse_exited(&self, _event: Option<&AnyObject>) {
+                set_button_highlight(false);
+            }
         }
 
         unsafe impl NSObjectProtocol for ActionHandler {}
     );
+
+    /// Force the status item button's native highlight on or off. A no-op when
+    /// the button is unavailable (not yet installed, or torn down).
+    fn set_button_highlight(on: bool) {
+        let mtm = mtm();
+        STATUS_ITEM.with(|si| {
+            let si_borrow = si.borrow();
+            let Some(item) = si_borrow.as_ref() else {
+                return;
+            };
+            if let Some(button) = item.button(mtm) {
+                // SAFETY: `highlight:` is a plain NSButton method taking a
+                // BOOL; no invariants beyond a live button, which `button()`
+                // guarantees on the main thread.
+                unsafe { button.highlight(on) };
+            }
+        });
+    }
 
     impl ActionHandler {
         fn new(mtm: MainThreadMarker) -> Retained<Self> {
@@ -913,6 +953,28 @@ mod macos {
             // mouse-up events (Apple's documented pattern for status items).
             let mask = NSEventMask::LeftMouseUp | NSEventMask::RightMouseUp;
             let _ = button.sendActionOn(mask);
+
+            // Hover tracking for the focus background (see `mouseEntered:`).
+            // `InVisibleRect` binds the area to the button's live bounds, so
+            // the grow-only width changes re-aim it without a re-add; the
+            // area is owned by the button, whose lifetime matches the status
+            // item's.
+            let options = NSTrackingAreaOptions::MouseEnteredAndExited
+                | NSTrackingAreaOptions::ActiveAlways
+                | NSTrackingAreaOptions::InVisibleRect;
+            // SAFETY: `owner` is the live ActionHandler (kept for the process
+            // lifetime below), and the rect is ignored because `InVisibleRect`
+            // re-binds it to the button's bounds at layout time.
+            let area = unsafe {
+                NSTrackingArea::initWithRect_options_owner_userInfo(
+                    NSTrackingArea::alloc(),
+                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
+                    options,
+                    Some(&handler),
+                    None,
+                )
+            };
+            button.addTrackingArea(&area);
         }
 
         // Keep the handler alive for the process lifetime, addressable so the
