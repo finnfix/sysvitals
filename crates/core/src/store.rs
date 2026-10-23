@@ -11,19 +11,12 @@
 //!
 //! The store keeps a rolling window (`retention_days`, default 30) and prunes
 //! anything older. For charting, raw samples are aggregated into fixed-width
-//! time buckets on the fly (`GROUP BY ts / bucket * bucket`), so a month-long
-//! view renders a bounded number of points instead of ~1.3M raw rows.
+//! time buckets on the fly, so a month-long view renders a bounded number of
+//! points instead of ~1.3M raw rows.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use std::time::Duration;
 
-/// One stored sample: a unix timestamp (seconds) plus CPU and memory usage
-/// percentages.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Sample {
-    pub ts: i64,
-    pub cpu: f64,
-    pub mem: f64,
-}
+use rusqlite::{params, Connection};
 
 /// One aggregated bucket for charting: the bucket's start timestamp plus the
 /// average CPU and memory over the bucket.
@@ -80,34 +73,42 @@ pub fn spread_label_indices(len: usize, count: usize) -> Vec<usize> {
 impl Store {
     /// Open (or create) the database at `path` and ensure the schema exists.
     /// Uses WAL with `synchronous=NORMAL` so steady 1–3s inserts stay cheap and
-    /// do not fsync on every write.
+    /// do not fsync on every write. A short busy timeout lets the history
+    /// panel read while the indicator is writing.
     pub fn open(path: &std::path::Path) -> anyhow::Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_millis(250))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Self::init_schema(&conn)?;
+        Ok(Self { conn })
+    }
+
+    fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS samples (
                  ts  INTEGER PRIMARY KEY,
                  cpu REAL NOT NULL,
                  mem REAL NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples (ts);",
+             -- `ts` is an INTEGER PRIMARY KEY (a rowid alias) and is already
+             -- indexed by the table itself; the old redundant index is dropped
+             -- from databases created by earlier versions.
+             DROP INDEX IF EXISTS idx_samples_ts;",
         )?;
-        Ok(Self { conn })
+        Ok(())
     }
 
     /// Open an in-memory database (used by tests).
     #[cfg(test)]
     fn in_memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS samples (
-                 ts  INTEGER PRIMARY KEY,
-                 cpu REAL NOT NULL,
-                 mem REAL NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples (ts);",
-        )?;
+        Self::init_schema(&conn)?;
         Ok(Self { conn })
     }
 
@@ -129,21 +130,6 @@ impl Store {
         Ok(true)
     }
 
-    /// Insert many samples in a single transaction. Batched writes keep the
-    /// per-insert overhead low and avoid fsync storms on the steady tick.
-    pub fn insert_batch(&self, rows: &[(i64, f64, f64)]) -> anyhow::Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        {
-            let mut stmt =
-                tx.prepare("INSERT OR REPLACE INTO samples (ts, cpu, mem) VALUES (?1, ?2, ?3)")?;
-            for (ts, cpu, mem) in rows {
-                stmt.execute(params![ts, cpu, mem])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Delete samples older than `retention_days` days before `now`. Returns
     /// the number of rows removed.
     pub fn prune(&self, now: i64, retention_days: u32) -> anyhow::Result<usize> {
@@ -154,44 +140,11 @@ impl Store {
         Ok(n)
     }
 
-    /// Return raw samples in `[from, to]` ordered by time. Used for short
-    /// ranges where full resolution is wanted.
-    pub fn range(&self, from: i64, to: i64) -> anyhow::Result<Vec<Sample>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT ts, cpu, mem FROM samples WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts")?;
-        let rows = stmt.query_map(params![from, to], |row| {
-            Ok(Sample {
-                ts: row.get(0)?,
-                cpu: row.get(1)?,
-                mem: row.get(2)?,
-            })
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
-    }
-
     /// Return the average CPU and memory per `bucket_secs`-wide bucket in
-    /// `[from, to]`, ordered by bucket start. This is what the trend chart
-    /// renders for long ranges: a bounded number of points regardless of how
-    /// many raw samples exist. Bucket boundaries align to the UNIX epoch
-    /// (UTC midnight). Callers that need buckets on a wall-clock grid —
-    /// local midnight, hour boundaries, etc. — pass an offset through
-    /// [`Self::buckets_offset`].
-    pub fn buckets(&self, from: i64, to: i64, bucket_secs: i64) -> anyhow::Result<Vec<Bucket>> {
-        self.buckets_offset(from, to, bucket_secs, 0)
-    }
-
-    /// The same aggregation with an explicit timezone offset: bucket
-    /// boundaries align to the wall clock of a timezone whose UTC offset is
-    /// `offset_secs` (i.e. boundaries are `(ts + off) div b * b - off`).
-    /// A chart showing 5-day buckets in a +8h zone (offset 28800 s) gets
-    /// boundaries at local midnight; the plain epoch-aligned call would
-    /// instead put them at local 08:00, which reads as an off-by-hours grid
-    /// on the axis.
+    /// `[from, to]`, ordered by bucket start, with bucket boundaries aligned
+    /// to a wall clock whose UTC offset is `offset_secs` (0 for the epoch/UTC
+    /// grid, the machine's local offset for local midnight/hour boundaries).
+    /// Chart code that wants a clean local grid passes the local offset.
     ///
     /// All real samples have positive unix seconds and offsets are bounded
     /// by ±14 hours, so `ts + off` stays positive and SQLite's integer
@@ -225,30 +178,24 @@ impl Store {
         }
         Ok(out)
     }
+}
 
-    /// The newest sample, if any. Handy for "last seen" displays and tests.
-    pub fn latest(&self) -> anyhow::Result<Option<Sample>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT ts, cpu, mem FROM samples ORDER BY ts DESC LIMIT 1")?;
-        let row = stmt
-            .query_row([], |row| {
-                Ok(Sample {
-                    ts: row.get(0)?,
-                    cpu: row.get(1)?,
-                    mem: row.get(2)?,
-                })
-            })
-            .optional()?;
-        Ok(row)
+#[cfg(test)]
+impl Store {
+    fn row_count(&self) -> i64 {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM samples", [], |row| row.get(0))
+            .unwrap()
     }
 
-    /// Total number of stored samples.
-    pub fn count(&self) -> anyhow::Result<i64> {
-        let n: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM samples", [], |r| r.get(0))?;
-        Ok(n)
+    fn latest_row(&self) -> Option<(i64, f64, f64)> {
+        self.conn
+            .query_row(
+                "SELECT ts, cpu, mem FROM samples ORDER BY ts DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok()
     }
 }
 
@@ -260,11 +207,8 @@ mod tests {
     fn insert_and_read_back() {
         let s = Store::in_memory().unwrap();
         s.insert(100, 25.0, 60.0).unwrap();
-        let latest = s.latest().unwrap().unwrap();
-        assert_eq!(latest.ts, 100);
-        assert_eq!(latest.cpu, 25.0);
-        assert_eq!(latest.mem, 60.0);
-        assert_eq!(s.count().unwrap(), 1);
+        assert_eq!(s.latest_row(), Some((100, 25.0, 60.0)));
+        assert_eq!(s.row_count(), 1);
     }
 
     #[test]
@@ -272,8 +216,8 @@ mod tests {
         let s = Store::in_memory().unwrap();
         s.insert(100, 10.0, 10.0).unwrap();
         s.insert(100, 90.0, 90.0).unwrap();
-        assert_eq!(s.count().unwrap(), 1);
-        assert_eq!(s.latest().unwrap().unwrap().cpu, 90.0);
+        assert_eq!(s.row_count(), 1);
+        assert_eq!(s.latest_row(), Some((100, 90.0, 90.0)));
     }
 
     #[test]
@@ -285,23 +229,26 @@ mod tests {
         assert!(!s.insert(100, f64::NAN, 50.0).unwrap());
         assert!(!s.insert(101, 50.0, f64::NAN).unwrap());
         assert!(!s.insert(102, f64::NAN, f64::NAN).unwrap());
-        assert_eq!(s.count().unwrap(), 0, "NaN rows must not be stored");
+        assert!(!s.insert(104, f64::INFINITY, 50.0).unwrap());
+        assert_eq!(s.row_count(), 0, "non-finite rows must not be stored");
         // A finite sample right after still inserts and becomes the latest.
         assert!(s.insert(103, 50.0, 50.0).unwrap());
-        assert_eq!(s.count().unwrap(), 1);
-        assert_eq!(s.latest().unwrap().unwrap().ts, 103);
+        assert_eq!(s.row_count(), 1);
+        assert_eq!(s.latest_row().unwrap().0, 103);
     }
 
     #[test]
-    fn batch_insert_and_range_query() {
+    fn schema_has_no_redundant_timestamp_index() {
         let s = Store::in_memory().unwrap();
-        let rows: Vec<(i64, f64, f64)> = (0..10).map(|i| (i * 2, i as f64, i as f64)).collect();
-        s.insert_batch(&rows).unwrap();
-        assert_eq!(s.count().unwrap(), 10);
-
-        let r = s.range(4, 10).unwrap();
-        let ts: Vec<i64> = r.iter().map(|x| x.ts).collect();
-        assert_eq!(ts, vec![4, 6, 8, 10]);
+        let n: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_samples_ts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "ts is a rowid alias and needs no extra index");
     }
 
     #[test]
@@ -313,8 +260,8 @@ mod tests {
         s.insert(now - 86_400 * 60, 2.0, 2.0).unwrap(); // 60 days old: prune
         let removed = s.prune(now, 30).unwrap();
         assert_eq!(removed, 1);
-        assert_eq!(s.count().unwrap(), 1);
-        assert_eq!(s.latest().unwrap().unwrap().cpu, 1.0);
+        assert_eq!(s.row_count(), 1);
+        assert_eq!(s.latest_row().unwrap().1, 1.0);
     }
 
     #[test]
@@ -325,7 +272,7 @@ mod tests {
         s.insert(5, 30.0, 40.0).unwrap();
         s.insert(12, 50.0, 60.0).unwrap();
 
-        let b = s.buckets(0, 20, 10).unwrap();
+        let b = s.buckets_offset(0, 20, 10, 0).unwrap();
         assert_eq!(b.len(), 2);
         assert_eq!(b[0].ts, 0);
         assert_eq!(b[0].cpu, 20.0); // avg(10,30)
@@ -341,7 +288,7 @@ mod tests {
         for i in 0..30 {
             s.insert(i, i as f64, i as f64).unwrap();
         }
-        let b = s.buckets(10, 19, 5).unwrap();
+        let b = s.buckets_offset(10, 19, 5, 0).unwrap();
         // Only buckets whose rows fall inside [10,19].
         assert!(b.iter().all(|x| x.ts >= 10 && x.ts <= 19));
     }
@@ -353,7 +300,7 @@ mod tests {
         s.insert(3, 10.0, 10.0).unwrap();
         s.insert(13, 20.0, 20.0).unwrap();
         s.insert(23, 30.0, 30.0).unwrap();
-        let b = s.buckets(0, 30, 10).unwrap();
+        let b = s.buckets_offset(0, 30, 10, 0).unwrap();
         let starts: Vec<i64> = b.iter().map(|x| x.ts).collect();
         // Epoch-aligned: boundaries are multiples of the bucket width.
         assert_eq!(starts, vec![0, 10, 20]);
@@ -372,18 +319,17 @@ mod tests {
         // = 57600, i.e. the local midnight that opened this bucket.
         assert_eq!(offset[0].ts, 57_600);
         // Without the offset the same sample buckets to 86400 (UTC midnight).
-        let plain = s.buckets(0, 200_000, 86_400).unwrap();
+        let plain = s.buckets_offset(0, 200_000, 86_400, 0).unwrap();
         assert_eq!(plain[0].ts, 86_400);
     }
 
     #[test]
-    fn empty_store_returns_none_and_empty() {
+    fn empty_store_returns_empty() {
         let s = Store::in_memory().unwrap();
-        assert!(s.latest().unwrap().is_none());
-        assert!(s.range(0, 100).unwrap().is_empty());
-        assert!(s.buckets(0, 100, 10).unwrap().is_empty());
+        assert!(s.latest_row().is_none());
+        assert!(s.buckets_offset(0, 100, 10, 0).unwrap().is_empty());
         assert!(s.buckets_offset(0, 100, 10, 3600).unwrap().is_empty());
-        assert_eq!(s.count().unwrap(), 0);
+        assert_eq!(s.row_count(), 0);
     }
 
     #[test]

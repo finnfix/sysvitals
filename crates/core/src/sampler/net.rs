@@ -46,11 +46,11 @@ impl NetSelection {
     }
 }
 
-/// Name prefixes that are never physical throughput adapters (loopback,
-/// containers, tunnels, virtual bridges). Matched case-insensitively.
+/// Name prefixes that are never physical throughput adapters (containers,
+/// tunnels, virtual bridges). Matched case-insensitively. Loopback gets its
+/// own exact/`lo0`-style check below so a legacy physical name such as
+/// "Local Area Connection" is not mistaken for `lo`.
 const EXCLUDED_PREFIXES: &[&str] = &[
-    "lo",
-    "loopback",
     "veth",
     "docker",
     "br-",
@@ -70,9 +70,9 @@ const EXCLUDED_PREFIXES: &[&str] = &[
     "isatap",
     "teredo",
     "vethernet", // Windows Hyper-V virtual
-    "vEthernet",
-    "hapas", // Wi-Fi Direct
+    "hapas",     // Wi-Fi Direct
     "wsl",
+    "vpn",
 ];
 
 /// Decide whether an interface name represents a physical-ish throughput
@@ -82,7 +82,9 @@ pub fn is_physical_name(name: &str) -> bool {
     if lower.is_empty() {
         return false;
     }
-    // Any excluded prefix at the start wins.
+    if lower == "lo" || lower.starts_with("lo0") || lower.starts_with("loopback") {
+        return false;
+    }
     !EXCLUDED_PREFIXES.iter().any(|p| lower.starts_with(p))
 }
 
@@ -115,6 +117,7 @@ pub fn compute_rates(
     frame: &[Counters],
     elapsed_secs: f64,
 ) -> (f64, f64) {
+    let had_baseline = !baseline.is_empty();
     // Rebuild the baseline map from the current frame each call; first we
     // compute deltas against the *previous* baseline.
     let mut rx_delta: u128 = 0;
@@ -142,10 +145,19 @@ pub fn compute_rates(
         baseline.insert(name.clone(), (*rx, *tx));
     }
 
-    if elapsed_secs <= 0.0 || elapsed_secs > super::cpu::STALE_GAP_SECS || !valid_any {
-        // No usable interval, a stale sleep-spanning gap, or no interface had
-        // a valid diff (all new, or all wrapped, or the very first frame) →
-        // report "no data".
+    if elapsed_secs <= 0.0 || elapsed_secs > super::cpu::STALE_GAP_SECS {
+        // No usable interval, or a stale sleep-spanning gap → "no data".
+        return (f64::NAN, f64::NAN);
+    }
+    if !valid_any {
+        // All selected interfaces just went down (auto mode drops links that
+        // are not Up): with a previous baseline this is a disconnect, which
+        // must read as 0 rather than a stale value or a placeholder. A first
+        // frame with no baseline, or a frame containing only new/wrapped
+        // interfaces, still has no measurable rate.
+        if frame.is_empty() && had_baseline {
+            return (0.0, 0.0);
+        }
         return (f64::NAN, f64::NAN);
     }
 
@@ -166,10 +178,6 @@ impl NetSampler {
             selection,
             baseline: HashMap::new(),
         }
-    }
-
-    pub fn reset(&mut self) {
-        self.baseline.clear();
     }
 
     /// Read `sysinfo` cumulative counters, apply selection, and diff against
@@ -360,18 +368,39 @@ mod tests {
     }
 
     #[test]
+    fn link_down_after_baseline_reports_zero_not_nan() {
+        // Auto mode drops links that are no longer Up. With a previous
+        // baseline this is a disconnect and must read as 0 (the display's
+        // "cleared" state), not as the first-frame "--".
+        let mut base = HashMap::new();
+        compute_rates(&mut base, &[("eth0".to_string(), 1000, 1000)], secs(1000));
+        let (up, down) = compute_rates(&mut base, &[], secs(2000));
+        assert_eq!(up, 0.0);
+        assert_eq!(down, 0.0);
+        assert!(base.is_empty());
+        // A first frame with no interfaces still has no rate to report.
+        let mut fresh = HashMap::new();
+        let (up, down) = compute_rates(&mut fresh, &[], secs(1000));
+        assert!(up.is_nan() && down.is_nan());
+    }
+
+    #[test]
     fn physical_name_heuristic() {
         assert!(is_physical_name("eth0"));
         assert!(is_physical_name("wlan0"));
         assert!(is_physical_name("en0"));
         assert!(is_physical_name("Wi-Fi"));
+        // A legacy Windows physical adapter is not loopback.
+        assert!(is_physical_name("Local Area Connection"));
         assert!(!is_physical_name("lo"));
+        assert!(!is_physical_name("lo0"));
         assert!(!is_physical_name("Loopback"));
         assert!(!is_physical_name("docker0"));
         assert!(!is_physical_name("veth1234"));
         assert!(!is_physical_name("br-abc"));
         assert!(!is_physical_name("utun4"));
         assert!(!is_physical_name("wg0"));
+        assert!(!is_physical_name("VPN"));
         assert!(!is_physical_name("vEthernet (WSL)"));
         assert!(!is_physical_name(""));
     }
