@@ -45,10 +45,6 @@ impl CpuSampler {
         }
     }
 
-    pub fn reset(&mut self) {
-        self.last = None;
-    }
-
     /// Fold a raw sysinfo percentage into the smoothed value.
     ///
     /// `elapsed` is the gap since the previous tick, or `None` on the very
@@ -85,11 +81,6 @@ impl CpuSampler {
             }
         }
     }
-
-    /// Current smoothed value, or NaN if nothing sampled yet.
-    pub fn current(&self) -> f64 {
-        self.last.unwrap_or(f64::NAN)
-    }
 }
 
 #[cfg(test)]
@@ -100,7 +91,6 @@ mod tests {
     fn first_value_passes_through_unsmoothed() {
         let mut s = CpuSampler::new(0.3);
         assert_eq!(s.update(50.0, None), 50.0);
-        assert_eq!(s.current(), 50.0);
     }
 
     #[test]
@@ -151,22 +141,5 @@ mod tests {
         let big = Duration::from_secs_f64(STALE_GAP_SECS + 10.0);
         let v = s.update(100.0, Some(big));
         assert_eq!(v, 100.0, "stale gap must re-prime to raw, not blend");
-    }
-
-    #[test]
-    fn current_is_nan_before_first_sample() {
-        let s = CpuSampler::new(0.3);
-        assert!(s.current().is_nan());
-    }
-
-    #[test]
-    fn reset_reprimes() {
-        let mut s = CpuSampler::new(0.3);
-        s.update(50.0, None);
-        s.update(100.0, Some(Duration::from_millis(1000)));
-        s.reset();
-        assert!(s.current().is_nan());
-        // after reset, next value passes through raw again
-        assert_eq!(s.update(77.0, Some(Duration::from_millis(1000))), 77.0);
     }
 }

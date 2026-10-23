@@ -12,6 +12,7 @@
 //! so either can be swapped without changing the public surface.
 
 pub mod backdrop;
+pub mod color;
 pub mod config;
 pub mod format;
 pub mod i18n;
@@ -24,5 +25,5 @@ pub use config::Config;
 pub use format::{format_frame, format_frame_vertical, FormattedRow, Line};
 pub use i18n::{t, Language};
 pub use model::{Anchor, Metric, Snapshot, Theme};
-pub use sampler::{CpuSampler, NetSampler, NetSelection, Sampler};
-pub use store::{floor_to_grid, spread_label_indices, Bucket, Sample, Store};
+pub use sampler::{NetSelection, Sampler};
+pub use store::{floor_to_grid, spread_label_indices, Bucket, Store};

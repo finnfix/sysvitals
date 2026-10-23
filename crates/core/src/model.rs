@@ -56,8 +56,6 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub const NO_DATA: f64 = f64::NAN;
-
     pub fn value(self, metric: Metric) -> f64 {
         match metric {
             Metric::Cpu => self.cpu_pct,
@@ -93,7 +91,7 @@ mod tests {
 
     #[test]
     fn no_data_is_nan_and_invalid() {
-        assert!(!Snapshot::is_valid(Snapshot::NO_DATA));
+        assert!(!Snapshot::is_valid(f64::NAN));
         assert!(Snapshot::is_valid(0.0));
     }
 

@@ -51,7 +51,6 @@ pub struct Config {
     pub display: DisplayConfig,
     pub history: HistoryConfig,
     pub windows: WindowsConfig,
-    pub macos: MacOSConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,10 +70,6 @@ pub struct DisplayConfig {
     /// U and D share one toggle: they are shown/hidden together.
     pub show_network: bool,
     pub theme: Theme,
-    /// Fixed 1024 base. Kept as a field so a future decimal toggle is a
-    /// config-only change. Anything other than `true` is ignored at format
-    /// time; format always divides by 1024.
-    pub binary_unit: bool,
     /// Horizontal gap between adjacent metrics on the single-row layout, in
     /// pixels. One of [`ALLOWED_ITEM_SPACING_PX`]; anything else snaps to the
     /// nearest allowed value via `sanitize`.
@@ -117,32 +112,14 @@ pub enum CsvScope {
 #[serde(default)]
 pub struct WindowsConfig {
     pub anchor: Anchor,
-    pub row_spacing: u32,
+    /// Reserved for the login-startup feature; currently has no consumer.
     pub auto_start: bool,
-    /// Manual font-size override (points). `None` = follow the system metric.
-    /// Dual-row scales the system font (≈0.75) automatically instead.
-    pub font_size_override: Option<f32>,
     /// Offset (pixels) between the taskbar's far end and the indicator. On a
     /// horizontal bar under the far-left anchor this measures from the bar's
     /// left edge; on a vertical (left/right) bar it measures from the bar's
     /// top edge. One of [`ALLOWED_LEFT_MARGIN_PX`]; anything else snaps to the
     /// nearest allowed value via `sanitize`. Default 16.
     pub left_margin_px: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MacOSConfig {
-    pub font_size_mode: FontSizeMode,
-    pub custom_font_size: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum FontSizeMode {
-    #[default]
-    System,
-    Custom,
 }
 
 impl Default for SampleConfig {
@@ -161,7 +138,6 @@ impl Default for DisplayConfig {
             show_resources: true,
             show_network: true,
             theme: Theme::Auto,
-            binary_unit: true,
             item_spacing: DEFAULT_ITEM_SPACING_PX,
             dual_row: false,
             prefix: PrefixConfig::default(),
@@ -206,19 +182,8 @@ impl Default for WindowsConfig {
     fn default() -> Self {
         WindowsConfig {
             anchor: Anchor::Right,
-            row_spacing: 1,
             auto_start: true,
-            font_size_override: None,
             left_margin_px: DEFAULT_LEFT_MARGIN_PX,
-        }
-    }
-}
-
-impl Default for MacOSConfig {
-    fn default() -> Self {
-        MacOSConfig {
-            font_size_mode: FontSizeMode::System,
-            custom_font_size: 13.0,
         }
     }
 }
@@ -298,9 +263,6 @@ impl Config {
             }
         }
 
-        if self.windows.row_spacing > 8 {
-            self.windows.row_spacing = 8;
-        }
         if !ALLOWED_LEFT_MARGIN_PX.contains(&self.windows.left_margin_px) {
             let old = self.windows.left_margin_px;
             self.windows.left_margin_px = snap_u32(old, &ALLOWED_LEFT_MARGIN_PX);
@@ -347,7 +309,9 @@ impl Config {
         }
     }
 
-    /// Persist atomically: write `path.tmp` (fsync), then rename over `path`.
+    /// Persist atomically: write a unique temp file (fsync), then rename over
+    /// `path`. The temp name includes the process id so two settings windows
+    /// launched by hand cannot interleave writes into the same file.
     pub fn save(&self, path: &PathBuf) -> anyhow::Result<()> {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
@@ -357,18 +321,23 @@ impl Config {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "config.toml".to_string());
-            name.push_str(".tmp");
+            name.push_str(&format!(".{}.tmp", std::process::id()));
             dir_join(path.parent(), &name)
         };
         let text = self.to_toml_string()?;
 
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-
-        fs::rename(&tmp, path)?;
-        Ok(())
+        let write = (|| -> anyhow::Result<()> {
+            let mut file = fs::File::create(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&tmp, path)?;
+            Ok(())
+        })();
+        if write.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        write
     }
 }
 

@@ -6,10 +6,10 @@
 //!
 //! Width-stability: within one frame, dual-row columns are padded
 //! to equal widths so the two lines line up. Across frames the rendered text
-//! can still differ by a character (e.g. `9%` -> `100%`); the display layer is
-//! responsible for sizing the embedded window to the maximum width it has
-//! seen and never shrinking it. The renderer
-//! should apply the OpenType `tnum` feature so digits align visually.
+//! can still differ by a character (e.g. `9%` -> `100%`); each display layer
+//! sizes its indicator surface to the maximum width it has seen and never
+//! shrinks it for live values. The renderer should apply the OpenType `tnum`
+//! feature so digits align visually.
 
 use crate::config::Config;
 use crate::model::{Metric, Snapshot};
@@ -52,7 +52,11 @@ pub fn format_rate_compact(bps: f64) -> String {
 }
 
 fn format_rate_with(bps: f64, with_per_sec: bool) -> String {
-    let bps = if bps < 0.0 || bps.is_nan() { 0.0 } else { bps };
+    let bps = if !bps.is_finite() || bps < 0.0 {
+        0.0
+    } else {
+        bps
+    };
     let (scaled, letter) = if bps < KB {
         (bps, "B")
     } else if bps < MB {
@@ -128,8 +132,9 @@ fn unicode_width(c: char) -> usize {
     }
 }
 
-/// Pad a cell's value so the numeric field occupies `width` columns (right
-/// aligned within the cell), keeping the prefix fixed at the left.
+/// Pad a cell's text with trailing spaces so the cell occupies `width`
+/// columns; the next column can then start at the same pixel offset on every
+/// row. Used only by the 2x2 quadrant builder.
 fn pad_to_width(s: &str, width: usize) -> String {
     let cur = display_width(s);
     if cur >= width {
@@ -182,26 +187,6 @@ pub struct FormattedRow {
     pub items: Vec<String>,
 }
 
-impl FormattedRow {
-    /// Convenience: total pixel-independent character width of the widest line,
-    /// used by the display layer to size the embedded window. An embedded
-    /// window must not resize itself from changing content, so this feeds a
-    /// grow-only sizing policy.
-    pub fn max_width(&self) -> usize {
-        self.lines
-            .iter()
-            .map(|l| {
-                if l.right.is_empty() {
-                    display_width(&l.left)
-                } else {
-                    display_width(&l.left) + 2 + display_width(&l.right)
-                }
-            })
-            .max()
-            .unwrap_or(0)
-    }
-}
-
 fn prefix_for(metric: Metric, cfg: &Config) -> &str {
     match metric {
         Metric::Cpu => &cfg.display.prefix.cpu,
@@ -230,7 +215,7 @@ fn format_value_impl(metric: Metric, snapshot: &Snapshot, with_per_sec: bool) ->
     match metric {
         Metric::Cpu | Metric::Mem => {
             let v = snapshot.value(metric);
-            if v.is_nan() {
+            if !v.is_finite() {
                 "--%".to_string()
             } else {
                 format_percent(v)
@@ -238,7 +223,7 @@ fn format_value_impl(metric: Metric, snapshot: &Snapshot, with_per_sec: bool) ->
         }
         Metric::Up | Metric::Down => {
             let v = snapshot.value(metric);
-            if v.is_nan() {
+            if !v.is_finite() {
                 "--".to_string()
             } else {
                 format_rate_with(v, with_per_sec)
@@ -440,7 +425,9 @@ mod tests {
     #[test]
     fn rate_nan_and_negative_become_zero() {
         assert_eq!(format_rate(f64::NAN), "0.00 B/s");
+        assert_eq!(format_rate(f64::NEG_INFINITY), "0.00 B/s");
         assert_eq!(format_rate(-5.0), "0.00 B/s");
+        assert_eq!(format_rate(f64::INFINITY), "0.00 B/s");
     }
 
     #[test]
@@ -559,19 +546,6 @@ mod tests {
             display_width(&f.lines[0].right),
             display_width(&f.lines[1].right)
         );
-    }
-
-    #[test]
-    fn frame_width_can_grow_across_samples_display_layer_pads() {
-        // Documented behavior: the core does not clamp cross-frame width (an
-        // unbounded rate cannot be padded to a fixed size). The display layer
-        // grows the embedded window to the max width it has seen and never
-        // shrinks it. Here we only assert the wider frame is at least as wide.
-        let cfg = Config::default();
-        let small = format_frame(&snap(9.0, 9.0, 1024.0, 1024.0), &cfg).max_width();
-        let large =
-            format_frame(&snap(99.0, 100.0, 1024.0 * 1024.0, 1024.0 * 1024.0), &cfg).max_width();
-        assert!(large > small);
     }
 
     #[test]

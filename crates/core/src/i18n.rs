@@ -19,14 +19,6 @@ pub enum Language {
 impl Language {
     pub const ALL: [Language; 2] = [Language::En, Language::Zh];
 
-    /// Stable key used in config and menu labels.
-    pub fn code(self) -> &'static str {
-        match self {
-            Language::En => "en",
-            Language::Zh => "zh",
-        }
-    }
-
     /// Native name shown in the language picker.
     pub fn label(self) -> &'static str {
         match self {
@@ -60,8 +52,6 @@ pub fn t(lang: Language, key: &str) -> &str {
         (Language::Zh, "theme.dark") => "暗色",
         (Language::En, "settings.sample_interval") => "Sample interval",
         (Language::Zh, "settings.sample_interval") => "采样间隔",
-        (Language::En, "settings.show_indicators") => "Shown indicators",
-        (Language::Zh, "settings.show_indicators") => "显示的指标",
         (Language::En, "settings.prefixes") => "Prefixes",
         (Language::Zh, "settings.prefixes") => "前缀",
         (Language::En, "settings.prefix_hint") => "Independent of language; up to 8 characters.",
@@ -78,8 +68,6 @@ pub fn t(lang: Language, key: &str) -> &str {
         (Language::Zh, "settings.layout") => "布局",
         (Language::En, "settings.unit_seconds") => "s",
         (Language::Zh, "settings.unit_seconds") => "秒",
-        (Language::En, "settings.unit_pixels") => "px",
-        (Language::Zh, "settings.unit_pixels") => "像素",
         (Language::En, "settings.cpu") => "CPU",
         (Language::Zh, "settings.cpu") => "CPU",
         (Language::En, "settings.mem") => "MEM",
@@ -92,12 +80,14 @@ pub fn t(lang: Language, key: &str) -> &str {
         (Language::Zh, "settings.anchor") => "任务栏位置",
         (Language::En, "settings.left_margin") => "Left margin",
         (Language::Zh, "settings.left_margin") => "左侧边距",
+        (Language::En, "settings.top_margin") => "Top margin",
+        (Language::Zh, "settings.top_margin") => "顶部边距",
+        (Language::En, "settings.save_failed") => "Settings could not be saved",
+        (Language::Zh, "settings.save_failed") => "设置保存失败",
         (Language::En, "anchor.right") => "Left of tray",
         (Language::Zh, "anchor.right") => "托盘左侧",
         (Language::En, "anchor.left") => "Far left (Win11 centered only)",
         (Language::Zh, "anchor.left") => "最左侧（仅 Win11 居中时）",
-        (Language::En, "settings.auto_start") => "Start on login",
-        (Language::Zh, "settings.auto_start") => "开机自启",
 
         (Language::En, "chart.title") => "History",
         (Language::Zh, "chart.title") => "历史走势",
@@ -117,6 +107,8 @@ pub fn t(lang: Language, key: &str) -> &str {
         (Language::Zh, "chart.copy_csv") => "复制 CSV",
         (Language::En, "chart.copied") => "Copied to clipboard",
         (Language::Zh, "chart.copied") => "已复制到剪贴板",
+        (Language::En, "chart.copy_failed") => "Copy failed",
+        (Language::Zh, "chart.copy_failed") => "复制失败",
 
         (Language::En, "menu.settings") => "Settings",
         (Language::Zh, "menu.settings") => "设置",
@@ -135,9 +127,6 @@ pub fn t(lang: Language, key: &str) -> &str {
         (Language::Zh, "menu.restart") => "重启",
         (Language::En, "menu.quit") => "Quit",
         (Language::Zh, "menu.quit") => "退出",
-
-        (Language::En, "about.title") => "About SysVitals",
-        (Language::Zh, "about.title") => "关于 SysVitals",
 
         // CSV headers follow the UI language; keys used directly.
         (Language::En, "csv.header.timestamp") => "timestamp",
@@ -189,8 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn language_code_and_default() {
+    fn language_default() {
         assert_eq!(Language::default(), Language::En);
-        assert_eq!(Language::Zh.code(), "zh");
     }
 }
