@@ -26,8 +26,8 @@ mod macos {
     use objc2::{define_class, msg_send, sel, ClassType, MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{
         NSApplication, NSApplicationActivationPolicy, NSAttributedStringNSStringDrawing,
-        NSCellImagePosition, NSEvent, NSEventMask, NSEventType, NSFont, NSFontAttributeName,
-        NSImage, NSImageScaling, NSMenu, NSMenuItem, NSScreen, NSStatusBar, NSStatusItem,
+        NSCellImagePosition, NSEventMask, NSEventType, NSFont, NSFontAttributeName, NSImage,
+        NSImageScaling, NSMenu, NSMenuItem, NSScreen, NSStatusBar, NSStatusItem,
         NSVariableStatusItemLength, NSView,
     };
     use objc2_foundation::{
@@ -347,9 +347,12 @@ mod macos {
         // attribute-dict value type is AnyObject, so two `as_super` steps land
         // on the right reference (`as_super` comes from `objc2::ClassType`).
         let obj: &AnyObject = font.as_super().as_super();
-        // The key static is already `&NSString`; `from_slices` takes a slice of
-        // key references, so the element is `NSFontAttributeName` itself.
-        let dict = NSDictionary::from_slices(&[NSFontAttributeName], &[obj]);
+        // `NSFontAttributeName` is an extern static (the pointer itself lives
+        // in AppKit), so reading it needs unsafe; dereferencing it to the
+        // `&NSString` it always holds is the only operation, which the
+        // framework guarantees to be valid.
+        let key: &NSString = unsafe { NSFontAttributeName };
+        let dict = NSDictionary::from_slices(&[key], &[obj]);
         // SAFETY: the attribute dictionary holds a valid `NSFont` under the
         // documented `NSFontAttributeName` key.
         let attr = unsafe { NSAttributedString::new_with_attributes(&s, &dict) };
@@ -511,7 +514,8 @@ mod macos {
         image.setTemplate(true);
 
         STATUS_ITEM.with(|si| {
-            let Some(item) = si.borrow().as_ref() else {
+            let binding = si.borrow();
+            let Some(item) = binding.as_ref() else {
                 return;
             };
             let Some(button) = item.button(mtm) else {
