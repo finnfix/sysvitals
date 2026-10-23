@@ -46,52 +46,57 @@ mod win {
 
     use sysvitals_core::format::FormattedRow;
     use sysvitals_core::{
-        format_frame, format_frame_vertical, t, Config, NetSelection, Sampler, Theme,
+        Config, NetSelection, Sampler, Theme, format_frame, format_frame_vertical, t,
     };
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
     use windows::Win32::Graphics::Gdi::{
-        CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW,
-        GetDC, ReleaseDC, SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER,
-        ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-        CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT,
-        DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_SWISS, FW_REGULAR,
-        FW_SEMIBOLD, HFONT, OUT_DEFAULT_PRECIS, TRANSPARENT,
+        AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
+        BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+        DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_LEFT,
+        DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FF_SWISS,
+        FW_REGULAR, FW_SEMIBOLD, GetDC, HFONT, OUT_DEFAULT_PRECIS, ReleaseDC, SelectObject,
+        SetBkMode, SetTextColor, TRANSPARENT,
     };
     use windows::Win32::System::Diagnostics::Debug::{
-        SetUnhandledExceptionFilter, EXCEPTION_POINTERS,
+        EXCEPTION_POINTERS, SetUnhandledExceptionFilter,
     };
     use windows::Win32::System::LibraryLoader::{
-        GetModuleFileNameW, GetModuleHandleExW, GetModuleHandleW,
         GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleFileNameW, GetModuleHandleExW, GetModuleHandleW,
     };
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
-        REG_VALUE_TYPE,
+        HKEY, HKEY_CURRENT_USER, KEY_READ, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW,
+        RegQueryValueExW,
     };
     use windows::Win32::System::SystemInformation::GetLocalTime;
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::System::Threading::TerminateProcess;
     use windows::Win32::System::Threading::WaitForSingleObject;
     use windows::Win32::UI::HiDpi::{
-        GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
-        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
+        SetProcessDpiAwarenessContext,
+    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
     };
     use windows::Win32::UI::Shell::{
-        SHAppBarMessage, ShellExecuteExW, ShellExecuteW, ABE_LEFT, ABE_RIGHT, ABM_GETTASKBARPOS,
-        APPBARDATA, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+        ABE_LEFT, ABE_RIGHT, ABM_GETTASKBARPOS, APPBARDATA, SEE_MASK_NOCLOSEPROCESS,
+        SHAppBarMessage, SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-        DispatchMessageW, FindWindowExW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics,
-        GetWindowLongPtrW, GetWindowRect, IsWindowVisible, KillTimer, MoveWindow, PostMessageW,
-        PostQuitMessage, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow,
-        SystemParametersInfoW, TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, CS_HREDRAW,
-        CS_VREDRAW, GWL_EXSTYLE, HWND_TOPMOST, MF_STRING, MSG, NONCLIENTMETRICSW, SM_CXSCREEN,
-        SM_CYSCREEN, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
-        SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
-        WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
-        WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        AppendMenuW, CS_HREDRAW, CS_VREDRAW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+        DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowExW, FindWindowW, GWL_EXSTYLE,
+        GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
+        HWND_TOPMOST, IsWindowVisible, KillTimer, MF_STRING, MSG, MoveWindow, NONCLIENTMETRICSW,
+        PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN,
+        SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
+        SystemParametersInfoW, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+        TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_DESTROY, WM_DISPLAYCHANGE,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSELEAVE, WM_MOUSEMOVE, WM_NULL, WM_RBUTTONUP,
+        WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST, WS_POPUP,
     };
 
     // ------------------------------------------------------------------ consts
@@ -116,20 +121,17 @@ mod win {
     /// two rounded widths do not match exactly, so without slack the last
     /// characters get clipped.
     const WIDTH_SLACK_PX: i32 = 8;
-    /// Font size for the vertical (left/right) taskbar layout, as a fraction of
-    /// the system UI size expressed in tenths. On a vertical taskbar the bar's
-    /// *thickness* — not its length — is the width budget: a typical bar is
-    /// ~48 logical px wide, while the longest rate string rendered at the
-    /// system UI size with a CJK face needs more than that, so the system
-    /// size would clip. The stacked label/value column plus this reduction
-    /// keeps every line inside the bar. Horizontal taskbars are limited by
-    /// height, not width, so they keep the system size untouched.
+    /// Font size for the vertical (left/right) taskbar layout, as a fraction
+    /// of the system UI size expressed in hundredths. On a vertical taskbar
+    /// the bar's *thickness* — not its length — is the width budget: a typical
+    /// bar is ~48 logical px wide, so the system size would clip; the stacked
+    /// label/value column plus this reduction keeps every line inside the bar.
+    /// Horizontal taskbars are limited by height, not width, so they keep the
+    /// system size untouched.
     ///
-    /// 0.7× (was 0.6× before the vertical layout dropped the `/s` suffix):
-    /// removing `/s` from the numeric line frees roughly two character cells
-    /// of width, which buys back the size step for legibility at the same
-    /// thickness budget.
-    const VERTICAL_FONT_TENTHS: i32 = 7;
+    /// 0.75× (was 0.7×): matches the macOS dual-row scale factor exactly so
+    /// the two platforms shrink the same system font by the same amount.
+    const VERTICAL_FONT_HUNDREDTHS: i32 = 75;
     /// Horizontal padding for the vertical layout: the thickness is the binding
     /// constraint, so the text keeps a tighter margin than on horizontal bars.
     const VERTICAL_PAD_PX: i32 = 3;
@@ -167,6 +169,17 @@ mod win {
     /// Track whether the taskbar is currently vertical so we can reset the
     /// grow-only width when orientation flips.
     static TASKBAR_VERTICAL: AtomicBool = AtomicBool::new(false);
+    /// Mouse hover over the indicator rectangle (requirement: a tray-like
+    /// focus background). Set on the first `WM_MOUSEMOVE` after a leave,
+    /// cleared on `WM_MOUSELEAVE`; drives the pill in `render_layered`.
+    static HOVER: AtomicBool = AtomicBool::new(false);
+    /// Left button currently pressed on the indicator (the "clicked" tint).
+    /// Set on `WM_LBUTTONDOWN`, cleared on `WM_LBUTTONUP` / `WM_RBUTTONUP`.
+    static PRESSED: AtomicBool = AtomicBool::new(false);
+    /// Whether a `TrackMouseEvent` leave request is already armed, so each
+    /// `WM_MOUSEMOVE` does not re-register one. Reset when `WM_MOUSELEAVE`
+    /// fires.
+    static TRACK_ARMED: AtomicBool = AtomicBool::new(false);
     /// Last observed mtime (seconds since UNIX epoch) of the config file.
     /// Compared on each CONFIG_POLL_MS tick to detect external edits.
     static CONFIG_MTIME: AtomicI32 = AtomicI32::new(0);
@@ -362,15 +375,15 @@ mod win {
 
     /// Effective glyph height in pixels for the current taskbar orientation:
     /// the system UI size on a horizontal bar, reduced by
-    /// `VERTICAL_FONT_TENTHS` on a vertical (left/right) bar where the bar's
-    /// thickness — not its length — is the width budget.
+    /// `VERTICAL_FONT_HUNDREDTHS` on a vertical (left/right) bar where the
+    /// bar's thickness — not its length — is the width budget.
     fn effective_font_height() -> i32 {
         let (height, _) = ui_font();
         if TASKBAR_VERTICAL.load(Ordering::Relaxed) {
             // `height` is a negative character height; clamp the reduction so a
             // tiny system font can never produce 0 (which CreateFontW would
             // silently interpret as "default font").
-            (height * VERTICAL_FONT_TENTHS / 10).min(-1)
+            (height * VERTICAL_FONT_HUNDREDTHS / 100).min(-1)
         } else {
             height
         }
@@ -606,13 +619,14 @@ mod win {
             } else {
                 center_x.min(screen_w - w).max(0)
             };
-            let left_anchor =
-                cfg.windows.anchor == sysvitals_core::Anchor::Left && win11_centered_taskbar();
-            let y = if left_anchor {
-                bar.top + cfg.windows.left_margin_px as i32
-            } else {
-                bar.bottom - h - TRAY_GAP_PX
-            };
+            // On a vertical bar `left_margin_px` measures from the bar's TOP
+            // edge (the user-facing knob of this value on left/right taskbars;
+            // no anchor gate — the far-left anchor concept does not exist
+            // here). The indicator is pinned near the far end by default, so
+            // the same value also has to be honored when re-anchoring the bar
+            // away from the tray side; see `else` branch for the horizontal
+            // far-left gate.
+            let y = bar.top + cfg.windows.left_margin_px as i32;
             (x, y)
         } else {
             // Horizontal taskbar (bottom or top).
@@ -1086,12 +1100,47 @@ mod win {
             (255u32, 255u32, 255u32)
         };
         let px = bits as *mut u32;
-        let n = (w * h) as usize;
-        for i in 0..n {
-            // Background: minimal (but non-zero) alpha so the whole rectangle
-            // stays hit-testable yet invisible over the taskbar.
-            *px.add(i) = 0x0100_0000;
-        }
+        // Tray-style focus pill (hover / pressed background): while the
+        // pointer is over the indicator, or a button is held down on it, a
+        // rounded rect in the glyph color at a low alpha paints under the
+        // text, imitating how the shell tints its own tray buttons. Idle
+        // (`pill_a == 0`) the composition is byte-for-byte the previous
+        // output: no pill pixels, glyphs as before.
+        let pill_a: u32 = {
+            // Pressed and "popup open" share the stronger tint; hover gets
+            // the lighter one; idle (0) composites exactly as before.
+            let popup_open = HISTORY_PROCESS.with(|slot| {
+                slot.borrow().as_ref().is_some_and(|h| {
+                    !h.is_invalid() && {
+                        // Read-only liveness probe: no handle close, no slot
+                        // clear. `close_history` and the launch path keep owning
+                        // the reaping; a popup that closed itself simply leaves a
+                        // signaled handle, which reads as "not alive" here.
+                        unsafe { WaitForSingleObject(*h, 0) == WAIT_TIMEOUT }
+                    }
+                })
+            });
+            if PRESSED.load(Ordering::Relaxed) || popup_open {
+                64
+            } else if HOVER.load(Ordering::Relaxed) {
+                32
+            } else {
+                0
+            }
+        };
+        // Pill geometry in window coordinates: inset so the highlight does
+        // not touch the window edge, radius capped by the short axis (and by
+        // 8px) so it reads as a chip, not a circle.
+        let inset = 2i32.min(w / 4).min(h / 4).max(0);
+        let pw = (w - 2 * inset).max(0);
+        let ph = (h - 2 * inset).max(0);
+        let radius = (pw.min(ph) / 2).min(8);
+        // Half-extents of the pill's straight-sided core; the rounded-rect
+        // SDF below measures distance against them plus `radius`.
+        let hx = (pw - 2 * radius).max(0) as f32 / 2.0;
+        let hy = (ph - 2 * radius).max(0) as f32 / 2.0;
+        let pcx = inset as f32 + pw as f32 / 2.0;
+        let pcy = inset as f32 + ph as f32 / 2.0;
         for y in 0..h {
             for x in 0..w {
                 let mut acc = 0u32;
@@ -1103,12 +1152,27 @@ mod win {
                     }
                 }
                 let cov = acc / (SS * SS) as u32;
-                if cov > 0 {
-                    let a = cov;
-                    let r = (tr * a) / 255;
-                    let g = (tg * a) / 255;
-                    let b = (tb * a) / 255;
-                    *px.add((y * w + x) as usize) = (a << 24) | (r << 16) | (g << 8) | b;
+                // Signed distance to the rounded rect (<0 inside), feathered
+                // over one pixel so the pill edge is anti-aliased even
+                // though this pass runs at 1x.
+                let ddx = (((x as f32 + 0.5) - pcx).abs() - hx).max(0.0);
+                let ddy = (((y as f32 + 0.5) - pcy).abs() - hy).max(0.0);
+                let dist = (ddx * ddx + ddy * ddy).sqrt() - radius as f32;
+                let inside = (1.0 - dist.max(0.0)).clamp(0.0, 1.0);
+                let pa = (pill_a as f32 * inside) as u32;
+                if cov == 0 && pa == 0 {
+                    // Background: minimal (but non-zero) alpha so the whole
+                    // rectangle stays hit-testable yet invisible over the
+                    // taskbar.
+                    *px.add((y * w + x) as usize) = 0x0100_0000;
+                } else {
+                    // Source-over with the glyph on top of the pill; channels
+                    // stay premultiplied for `AC_SRC_ALPHA` (both layers share
+                    // the glyph color, so one blend factor per channel).
+                    let a = cov + pa * (255 - cov) / 255;
+                    let mix = |c: u32| (c * cov / 255) + (c * pa / 255) * (255 - cov) / 255;
+                    *px.add((y * w + x) as usize) =
+                        (a << 24) | (mix(tr) << 16) | (mix(tg) << 8) | mix(tb);
                 }
             }
         }
@@ -1242,12 +1306,12 @@ mod win {
     /// was terminated — `false` means nothing was running and the caller
     /// should open a new one.
     ///
-    /// This is a hard process kill rather than a polite "please close": the
-    /// popup's own blur-close cannot be relied on here because the click that
-    /// toggles it lands on the indicator, and on Windows the overlay receives
-    /// that click while the popup is foreground — the popup then blurs and
-    /// starts dying on its own, racing this kill. Terminating the handle is
-    /// deterministic and idempotent (already-dead handles are reaped).
+    /// This is a hard process kill rather than a polite "please close": with
+    /// the overlay's `WS_EX_NOACTIVATE`, a click on the indicator leaves the
+    /// popup foreground and alive, so `close_history` is the only exit path
+    /// for the toggle click (blur-close still owns every other click-away).
+    /// Terminating the handle is deterministic and idempotent (already-dead
+    /// handles are reaped).
     fn close_history() -> bool {
         HISTORY_PROCESS.with(|slot| {
             let mut borrow = slot.borrow_mut();
@@ -1496,6 +1560,16 @@ mod win {
         );
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
+        // The overlay is created `WS_EX_NOACTIVATE` (so a left click on the
+        // indicator never steals foreground from the trend-chart popup — see
+        // the toggle note in `close_history`). That same flag means a right
+        // click no longer naturally foregrounds the owner window, and
+        // `TrackPopupMenu` only auto-dismisses on a click-away when its owner
+        // is foreground. Restore that with the documented tray-menu pattern:
+        // foreground the owner first, then post a `WM_NULL` afterward so the
+        // menu reliably disappears (the post is the standard workaround for
+        // the menu lingering when it should not).
+        let _ = SetForegroundWindow(hwnd);
         // Keep maintain_topmost from lifting the overlay above the menu while
         // it is open (its modal loop still dispatches our WM_TIMER).
         MENU_TRACKING.store(true, Ordering::Relaxed);
@@ -1510,6 +1584,7 @@ mod win {
         )
         .0 as u32;
         MENU_TRACKING.store(false, Ordering::Relaxed);
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(menu);
         match choice {
             id if id == IDM_TASKMGR as u32 => launch_taskmgr(),
@@ -1572,6 +1647,11 @@ mod win {
                 reposition(hwnd);
                 LRESULT(0)
             }
+            WM_LBUTTONDOWN => {
+                PRESSED.store(true, Ordering::Relaxed);
+                render_layered(hwnd);
+                LRESULT(0)
+            }
             WM_LBUTTONUP => {
                 // Toggle the trend chart. A live popup (child still running)
                 // is closed; otherwise a new one opens immediately. There is
@@ -1579,13 +1659,49 @@ mod win {
                 // Windows does not synthesize a `WM_LBUTTONDBLCLK`, and Task
                 // Manager lives in the right-click menu. Any left click is a
                 // left click.
+                let was_pressed = PRESSED.swap(false, Ordering::Relaxed);
                 if !close_history() {
                     launch_history(hwnd);
+                }
+                // Paint off the pressed pill even when the popup just opened
+                // (the overlay stays click-responsive, so this tick is ours).
+                if was_pressed {
+                    render_layered(hwnd);
                 }
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
+                PRESSED.store(false, Ordering::Relaxed);
                 show_context_menu(hwnd);
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE => {
+                // Arm one leave-tracking request per enter; the flag keeps
+                // subsequent moves inside the rect from re-posting.
+                if !HOVER.swap(true, Ordering::Relaxed)
+                    && !TRACK_ARMED.swap(true, Ordering::Relaxed)
+                    // SAFETY: the hwnd is live; TME_LEAVE only requests the
+                    // one-shot WM_MOUSELEAVE.
+                    && (unsafe {
+                        TrackMouseEvent(&mut TRACKMOUSEEVENT {
+                            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                            dwFlags: TME_LEAVE,
+                            hwndTrack: hwnd,
+                            dwHoverTime: 0,
+                        })
+                    })
+                    .is_ok()
+                {
+                    render_layered(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_MOUSELEAVE => {
+                TRACK_ARMED.store(false, Ordering::Relaxed);
+                PRESSED.store(false, Ordering::Relaxed);
+                if HOVER.swap(false, Ordering::Relaxed) {
+                    render_layered(hwnd);
+                }
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -1748,8 +1864,24 @@ mod win {
             }
 
             let title = utf16("SysVitals");
+            // `WS_EX_NOACTIVATE` — the toggle race fix. A left click on the
+            // overlay used to pull foreground away from the trend-chart
+            // child; the child's blur observer then began closing itself,
+            // and the overlay's `close_history` liveness check could catch
+            // it mid-exit, see "already dead", and launch a fresh popup
+            // instead — the "closes then re-opens" symptom. Not activating
+            // on click keeps the child foreground and alive, so
+            // `close_history` deterministically terminates it. This is safe
+            // because `app-history` claims activation itself on its first
+            // frame (`activate_window`, Windows-gated) when it did not
+            // inherit foreground from the launcher, so the popup still
+            // arms its blur-close for genuine click-aways. Right-click
+            // menus keep their click-away dismissal through the standard
+            // tray pattern in `show_context_menu`
+            // (`SetForegroundWindow` before, `WM_NULL` post after).
+            // Behavior on target OSes needs verification on real devices.
             let hwnd = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 windows::core::PCWSTR(class_name.as_ptr()),
                 windows::core::PCWSTR(title.as_ptr()),
                 WS_POPUP,
