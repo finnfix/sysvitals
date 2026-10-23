@@ -23,7 +23,9 @@ mod macos {
     use chrono::Local;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, Bool};
-    use objc2::{define_class, msg_send, sel, ClassType, MainThreadMarker, MainThreadOnly};
+    use objc2::{
+        define_class, msg_send, sel, AnyThread, ClassType, MainThreadMarker, MainThreadOnly,
+    };
     use objc2_app_kit::{
         NSApplication, NSApplicationActivationPolicy, NSAttributedStringNSStringDrawing,
         NSCellImagePosition, NSEventMask, NSEventType, NSFont, NSFontAttributeName, NSImage,
@@ -889,10 +891,7 @@ mod macos {
                 return;
             };
             if let Some(button) = item.button(mtm) {
-                // SAFETY: `highlight:` is a plain NSButton method taking a
-                // BOOL; no invariants beyond a live button, which `button()`
-                // guarantees on the main thread.
-                unsafe { button.highlight(on) };
+                button.highlight(on);
             }
         });
     }
