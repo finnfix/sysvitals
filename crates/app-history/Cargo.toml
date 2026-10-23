@@ -18,9 +18,23 @@ arboard = "=3.7.0"
 chrono = { workspace = true }
 
 # Windows-only: the popup reads the system accent color (DWM) so its primary
-# button style matches the OS theme color.
+# button style matches the OS theme color, and probes the OS build number
+# (RtlGetVersion) plus the transparency-effects preference to pick a backdrop.
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
+
+# macOS-only: reads AppKit's dynamic `controlAccentColor` so the popup's
+# primary tile and focus ring follow an explicit OS accent choice (same gate
+# and rationale as the settings panel; the presence check needs NSUserDefaults
+# from objc2-foundation). See app-settings for the feature-selection notes.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.5"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
+    "NSColor",
+    "NSColorSpace",
+    "objc2-core-foundation",
+] }
+objc2-foundation = { version = "=0.3.2", features = ["NSString", "NSUserDefaults"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "=0.1.12"

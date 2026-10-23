@@ -34,6 +34,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use sysvitals_core::backdrop::Material;
 use sysvitals_core::config::{
     ALLOWED_INTERVAL_MS, ALLOWED_ITEM_SPACING_PX, ALLOWED_LEFT_MARGIN_PX,
 };
@@ -109,14 +110,149 @@ fn layout_available() -> bool {
     false
 }
 
-/// The system accent color packed as `0x00RRGGBB`, or `None` when it cannot
-/// be read.
+// ---------------------------------------------------------------------------
+// Window backdrop material (Win11 Mica / macOS blur, with fallbacks)
+// ---------------------------------------------------------------------------
+
+/// Read the registry DWORD at `HKCU\Software\Microsoft\Windows\CurrentVersion\
+/// Themes\Personalize\<value>`. `None` when the key is missing or unreadable.
+#[cfg(windows)]
+fn personalize_dword(value: &str) -> Option<u32> {
+    const PERSONALIZE_KEY: &str =
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+    hkcu_dword(PERSONALIZE_KEY, value)
+}
+
+/// The Windows OS build number, or `None` if the version probe fails.
+///
+/// `RtlGetVersion` is the documented way to read the real build (the classic
+/// `GetVersionEx` is version-helpered and lies on 8.1+). The buffer is
+/// zeroed first, so a failed call leaves `dwBuildNumber` at 0 and the caller
+/// falls back to `Material::Opaque`.
+#[cfg(windows)]
+fn os_build_number() -> Option<u32> {
+    use windows::Wdk::System::SystemServices::RtlGetVersion;
+    use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+    let mut info = OSVERSIONINFOW::default();
+    info.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
+    if unsafe { RtlGetVersion(&mut info) }.is_err() {
+        return None;
+    }
+    Some(info.dwBuildNumber)
+}
+
+/// The backdrop material this Windows host supports, honoring the user's
+/// transparency-effects preference. Kept pure in `core`; this only feeds it
+/// the two platform probes.
+#[cfg(windows)]
+fn detect_material() -> Material {
+    // `EnableTransparency` = 0 means the user turned transparency effects off;
+    // a missing value (None) is treated as enabled, matching the OS default.
+    let transparency = personalize_dword("EnableTransparency")
+        .map(|v| v != 0)
+        .unwrap_or(true);
+    sysvitals_core::backdrop::choose_windows_material(os_build_number(), transparency)
+}
+
+/// macOS always requests the blur material: `NSVisualEffectView` exists on
+/// every supported host, and AppKit automatically flattens it when the user
+/// enables "reduce transparency" — so the accessibility fallback is the
+/// system's own, not something we re-implement.
+#[cfg(target_os = "macos")]
+fn detect_material() -> Material {
+    sysvitals_core::backdrop::choose_macos_material(true)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn detect_material() -> Material {
+    Material::Opaque
+}
+
+/// Map the chosen material onto GPUI's window-background request. The pinned
+/// platform layer recognizes all three variants on their respective hosts and
+/// degrades gracefully to opaque where a variant is unsupported.
+fn backdrop_for(material: Material) -> WindowBackgroundAppearance {
+    match material {
+        Material::Mica => WindowBackgroundAppearance::MicaBackdrop,
+        Material::Blur => WindowBackgroundAppearance::Blurred,
+        Material::Opaque => WindowBackgroundAppearance::Opaque,
+    }
+}
+
+/// Unpack an AppKit `NSColor` into sRGB components packed `0xRRGGBB`.
+///
+/// Only for colors whose resolved value does not depend on the current
+/// appearance (control accent, which reflects the user's color pick).
+/// Dynamic-per-appearance catalog colors (window background, label colors)
+/// would resolve to their light variants outside a draw cycle, so callers
+/// wanting those must install the right NSAppearance first — none of our
+/// calls do, so the tint path just uses the palette's own background (which
+/// GPUI has already flipped on the same system signal).
+///
+/// Returns `None` if the sRGB conversion or the component read fails; callers
+/// then keep their palette-driven fallback instead of painting black. All
+/// call sites run on the main thread (GPUI drives the app from the UI thread).
+#[cfg(target_os = "macos")]
+fn system_color_hex(color: &objc2_app_kit::NSColor) -> Option<u32> {
+    use objc2::rc::Retained;
+    use objc2_app_kit::NSColorSpace;
+    let srgb = NSColorSpace::sRGBColorSpace();
+    let converted: Retained<objc2_app_kit::NSColor> = color.colorUsingColorSpace(&srgb)?;
+    // `CGFloat` is a plain `f64` alias on the supported 64-bit targets, so
+    // local `f64`s are exactly what the out-params expect.
+    let (mut r, mut g, mut b, mut a) = (0f64, 0f64, 0f64, 0f64);
+    unsafe { converted.getRed_green_blue_alpha(&mut r, &mut g, &mut b, &mut a) };
+    let to8 = |x: f64| ((x.clamp(0.0, 1.0) * 255.0).round() as u32) & 0xFF;
+    Some((to8(r) << 16) | (to8(g) << 8) | to8(b))
+}
+
+/// Apply the chosen backdrop to the palette: tint the root surface so the
+/// material shows through. On the opaque fallback this is a no-op, keeping the
+/// pre-material rendering byte-for-byte. Re-runs on every theme change (the
+/// palette reload overwrites it) — the same replay contract as the accent.
+fn apply_material(cx: &mut App) {
+    use sysvitals_core::backdrop::{MATERIAL_TINT_ALPHA, should_tint};
+    let material = detect_material();
+    if !should_tint(material) {
+        return;
+    }
+    UiTheme::update(cx, |theme| {
+        // Force an opaque base before scaling alpha, so the "set" and
+        // "multiply" readings of `opacity` agree and the tint does not hinge
+        // on the helper's exact semantics.
+        let opaque = |c: Hsla| Hsla { a: 1.0, ..c };
+        // The material only reads through when the content layer is
+        // translucent: Windows Mica is a wallpaper tint and the macOS blur is
+        // a live backdrop, and in both cases the pinned platform layer clears
+        // a non-opaque window transparent. Tinting the root surface is what
+        // lets the backdrop show — the material carries the OS color (the
+        // same one a native settings window paints), so the panel matches
+        // without sampling NSColor.windowBackgroundColor (whose
+        // per-appearance resolution needs a deprecated draw-cycle dance we
+        // cannot compile-verify here). `theme.colors.background` is already
+        // the light/dark-correct palette value.
+        theme.colors.background = opaque(theme.colors.background).opacity(MATERIAL_TINT_ALPHA);
+    });
+}
+
+/// The system accent color packed as `0x00RRGGBB`, or `None` when it should
+/// not be used at all.
 ///
 /// Windows exposes the accent picker's choice through
 /// `DwmGetColorizationColor`, which returns an ARGB DWORD. The opaque flag
 /// is ignored: even when translucency effects are on, the RGB channels are
-/// the same accent the Settings app paints with. Non-Windows hosts have no
-/// equivalent single knob, and callers fall back to the library default.
+/// the same accent the Settings app paints with.
+///
+/// macOS follows only an *explicit* choice: `AppleAccentColor` in the
+/// standard defaults is present exactly when the user picked a specific
+/// accent (Graphite included) and absent under the default "auto" mode,
+/// where AppKit derives the accent from the wallpaper. Staying absent under
+/// auto keeps the library look (the agreed behavior — an auto wallpaper color
+/// must not silently re-tint every primary control), and the check is
+/// presence-only on purpose: if a future macOS reshuffles the key, the worst
+/// case degrades to "keep the library default", never to a wrong color. When
+/// present, `NSColor.controlAccentColor` is the user's pick and does not vary
+/// with light/dark, so no appearance resolution is needed.
 #[cfg(windows)]
 fn system_accent_hex() -> Option<u32> {
     use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
@@ -132,7 +268,15 @@ fn system_accent_hex() -> Option<u32> {
     Some(argb & 0x00FF_FFFF)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn system_accent_hex() -> Option<u32> {
+    use objc2_foundation::{NSString, NSUserDefaults};
+    let key = NSString::from_str("AppleAccentColor");
+    NSUserDefaults::standardUserDefaults().objectForKey(&key)?;
+    system_color_hex(&objc2_app_kit::NSColor::controlAccentColor())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn system_accent_hex() -> Option<u32> {
     None
 }
@@ -210,13 +354,15 @@ fn apply_system_theme(cx: &mut App) {
     UiTheme::sync_system_appearance(None, cx);
 }
 
-/// Re-apply the theme palette and the accent override together.
-/// `Theme::change` (and `sync_system_appearance`, which calls it) loads the
-/// registered palette for the mode, which overwrites every color field —
-/// an accent applied earlier is wiped, so it must follow every theme change.
+/// Re-apply the theme palette, the accent override, and the backdrop tint
+/// together, in that order. `Theme::change` (which `sync_system_appearance`
+/// calls) loads the registered palette for the mode, overwriting every color
+/// field — the accent and the material tint are runtime patches applied on
+/// top, so both must follow every theme change, never precede it.
 fn apply_theme_and_accent(cx: &mut App) {
     apply_system_theme(cx);
     apply_accent(cx);
+    apply_material(cx);
 }
 
 // ---------------------------------------------------------------------------
@@ -869,8 +1015,9 @@ fn main() {
         // opened — otherwise a dark-mode desktop shows a light settings
         // panel for the first frame. The panel always follows the system,
         // independent of `display.theme` (which now only governs the
-        // indicator). The OS accent override comes with it (both are
-        // theme-color writes and must be sequenced together).
+        // indicator). The OS accent override and the backdrop tint come with
+        // it (all three are theme-color writes and must be sequenced
+        // together).
         apply_theme_and_accent(cx);
 
         let window_options = WindowOptions {
@@ -879,6 +1026,11 @@ fn main() {
                 title: Some("SysVitals Settings".into()),
                 ..Default::default()
             }),
+            // System backdrop material (Win11 Mica / Win10-era acrylic blur /
+            // macOS window blur, with an opaque fallback on anything older or
+            // when the user disabled transparency effects). The palette tint
+            // applied above is what lets this show through.
+            window_background: backdrop_for(detect_material()),
             focus: true,
             ..Default::default()
         };

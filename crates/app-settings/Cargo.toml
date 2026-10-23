@@ -18,9 +18,30 @@ gpui-kit = { workspace = true }
 
 # Windows-only: the settings window reads the same registry flag as the
 # overlay (HKCU Explorer\Advanced\TaskbarAl) to decide whether to offer the
-# taskbar anchor choices.
+# taskbar anchor choices, and probes the OS build number (RtlGetVersion) to
+# decide which backdrop material the platform layer supports.
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
+
+# macOS-only: reads AppKit's dynamic `controlAccentColor` so the panel's
+# primary buttons can follow an explicit OS accent choice, and probes the
+# `AppleAccentColor` defaults key to detect whether the user picked one at
+# all (absent = multicolor/auto, where the library look is kept). GPUI does
+# not expose NSColor or NSUserDefaults; the pinned objc2 stack matches app-mac
+# so the lockfile keeps one version of each crate (default features stay on,
+# same as app-mac). `NSColor::getRed_green_blue_alpha` is gated behind
+# app-kit's own `objc2-core-foundation` feature (it hands back `CGFloat`
+# pointers), so that feature must be named or the method is missing at
+# compile time. `CGFloat` is a plain `f64` alias on the supported 64-bit
+# targets, so no type import is needed to pass the out-params.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.5"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
+    "NSColor",
+    "NSColorSpace",
+    "objc2-core-foundation",
+] }
+objc2-foundation = { version = "=0.3.2", features = ["NSString", "NSUserDefaults"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "=0.1.12"

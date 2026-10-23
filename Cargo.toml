@@ -34,6 +34,7 @@ directories = "=6.0.0"
 # on Windows/macOS. History storage (R12) is the only consumer.
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
 windows = { version = "=0.62.2", default-features = false, features = [
+    "Wdk_System_SystemServices",
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",

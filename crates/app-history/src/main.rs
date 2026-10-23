@@ -24,6 +24,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use sysvitals_core::backdrop::Material;
 use sysvitals_core::config::{config_path, history_path, Config, CsvScope};
 use sysvitals_core::i18n::{t, Language};
 use sysvitals_core::store::{floor_to_grid, spread_label_indices, Bucket, Store};
@@ -756,16 +757,25 @@ impl Render for HistoryView {
     }
 }
 
-/// Push the OS accent color into the GPUI theme so the primary button style
-/// (the active range tile, focus rings) matches the Windows accent picker.
-///
-/// The chart line colors are deliberately not overridden: they encode which
-/// series is which and stay stable so the two lines remain distinguishable
-/// after a user changes their accent. `Theme::change` (and the auto-sync
-/// path) reloads the whole palette, so the override must be re-applied
-/// after every theme change — see `apply_theme_and_accent`.
+// ---------------------------------------------------------------------------
+// System accent + backdrop material (mirrors app-settings; see there for the
+// full rationale on each helper)
+// ---------------------------------------------------------------------------
+
+/// The system accent color packed as `0x00RRGGBB`, or `None` when it should
+/// not be used at all. Windows reads `DwmGetColorizationColor` (the ARGB
+/// DWORD; opaque flag ignored — the RGB channels are the same accent the
+/// Settings app paints with). macOS follows only an *explicit* choice:
+/// `AppleAccentColor` in the standard defaults is present exactly when the
+/// user picked a specific accent (Graphite included) and absent under the
+/// default "multicolor / auto" mode, where AppKit derives the accent from
+/// the wallpaper. Staying absent under auto keeps the library look; the
+/// check is presence-only on purpose so a future key-reshuffle degrades to
+/// the safe path, not to a wrong color. When present,
+/// `NSColor.controlAccentColor` reflects the user's pick without any
+/// light/dark resolution. See app-settings for the same shape.
 #[cfg(windows)]
-fn apply_accent(cx: &mut App) {
+fn system_accent_hex() -> Option<u32> {
     use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
     let mut argb = 0u32;
     // `Default::default()` avoids naming the `BOOL` type: in windows-core
@@ -774,9 +784,44 @@ fn apply_accent(cx: &mut App) {
     // opaque-blend flag is not read — the accent color is meaningful either
     // way. See the same fix in app-settings.
     if unsafe { DwmGetColorizationColor(&mut argb, &mut Default::default()) }.is_err() {
-        return;
+        return None;
     }
-    let base = rgb_hex_to_hsla(argb & 0x00FF_FFFF);
+    Some(argb & 0x00FF_FFFF)
+}
+
+#[cfg(target_os = "macos")]
+fn system_accent_hex() -> Option<u32> {
+    use objc2::rc::Retained;
+    use objc2_app_kit::{NSColor, NSColorSpace};
+    use objc2_foundation::{NSString, NSUserDefaults};
+    NSUserDefaults::standardUserDefaults().objectForKey(&NSString::from_str("AppleAccentColor"))?;
+    let color = NSColor::controlAccentColor();
+    let srgb = NSColorSpace::sRGBColorSpace();
+    let converted: Retained<NSColor> = color.colorUsingColorSpace(&srgb)?;
+    let (mut r, mut g, mut b, mut a) = (0f64, 0f64, 0f64, 0f64);
+    unsafe { converted.getRed_green_blue_alpha(&mut r, &mut g, &mut b, &mut a) };
+    let to8 = |x: f64| ((x.clamp(0.0, 1.0) * 255.0).round() as u32) & 0xFF;
+    Some((to8(r) << 16) | (to8(g) << 8) | to8(b))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn system_accent_hex() -> Option<u32> {
+    None
+}
+
+/// Push the OS accent into the theme so the primary button style (the active
+/// range tile, focus rings) matches the OS picker, writing both the legacy
+/// `primary` and `button_primary` fields plus the lightness-shifted
+/// hover/active variants and `ring` (see app-settings).
+///
+/// The chart line colors are deliberately *not* overridden here: they encode
+/// which series is which and must stay stable so the two lines remain
+/// distinguishable after a user changes their accent.
+fn apply_accent(cx: &mut App) {
+    let Some(hex) = system_accent_hex() else {
+        return;
+    };
+    let base = rgb_hex_to_hsla(hex);
     UiTheme::update(cx, |theme| {
         let shift = |dl: f32| Hsla {
             l: (base.l + dl).clamp(0.05, 0.95),
@@ -792,8 +837,121 @@ fn apply_accent(cx: &mut App) {
     });
 }
 
-#[cfg(not(windows))]
-fn apply_accent(_cx: &mut App) {}
+// ---------------------------------------------------------------------------
+// Window backdrop material (Win11 Mica / macOS blur, with fallbacks)
+// ---------------------------------------------------------------------------
+
+/// Read a HKCU registry DWORD (same pattern as app-settings, which reads the
+/// layout flag; the windows feature set in the workspace manifest covers the
+/// registry API).
+#[cfg(windows)]
+fn hkcu_dword(key: &str, value: &str) -> Option<u32> {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+        REG_VALUE_TYPE,
+    };
+    let utf16 = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let key_w = utf16(key);
+    let value_w = utf16(value);
+    let mut hkey = HKEY::default();
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            windows::core::PCWSTR(key_w.as_ptr()),
+            None,
+            KEY_READ,
+            &mut hkey,
+        )
+    }
+    .is_err()
+    {
+        return None;
+    }
+    let mut data = [0u8; 4];
+    let mut size = 4u32;
+    let mut kind = REG_VALUE_TYPE::default();
+    let queried = unsafe {
+        RegQueryValueExW(
+            hkey,
+            windows::core::PCWSTR(value_w.as_ptr()),
+            None,
+            Some(&mut kind),
+            Some(data.as_mut_ptr()),
+            Some(&mut size),
+        )
+    };
+    let _ = unsafe { RegCloseKey(hkey) };
+    if queried.is_ok() && size >= 4 {
+        Some(u32::from_le_bytes(data))
+    } else {
+        None
+    }
+}
+
+/// The Windows OS build number via `RtlGetVersion` (see app-settings for why
+/// the classic API lies); `None` when the probe fails.
+#[cfg(windows)]
+fn os_build_number() -> Option<u32> {
+    use windows::Wdk::System::SystemServices::RtlGetVersion;
+    use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+    let mut info = OSVERSIONINFOW::default();
+    info.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
+    if unsafe { RtlGetVersion(&mut info) }.is_err() {
+        return None;
+    }
+    Some(info.dwBuildNumber)
+}
+
+/// The backdrop this Windows host supports, honoring the transparency-effects
+/// preference. Same rule as app-settings, fed by the same probes; the pure
+/// threshold decision lives in core.
+#[cfg(windows)]
+fn detect_material() -> Material {
+    const PERSONALIZE_KEY: &str =
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+    let transparency = hkcu_dword(PERSONALIZE_KEY, "EnableTransparency")
+        .map(|v| v != 0)
+        .unwrap_or(true);
+    sysvitals_core::backdrop::choose_windows_material(os_build_number(), transparency)
+}
+
+/// macOS always requests the blur material: the window blur exists on every
+/// supported host, and AppKit flattens it automatically when the user turns
+/// on "reduce transparency", so the accessibility fallback is the system's
+/// own — see app-settings for the same reasoning.
+#[cfg(target_os = "macos")]
+fn detect_material() -> Material {
+    sysvitals_core::backdrop::choose_macos_material(true)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn detect_material() -> Material {
+    Material::Opaque
+}
+
+/// Map the material onto GPUI's window-background request (see app-settings).
+fn backdrop_for(material: Material) -> WindowBackgroundAppearance {
+    match material {
+        Material::Mica => WindowBackgroundAppearance::MicaBackdrop,
+        Material::Blur => WindowBackgroundAppearance::Blurred,
+        Material::Opaque => WindowBackgroundAppearance::Opaque,
+    }
+}
+
+/// Tint the popup's root surface so the backdrop reads through, with the
+/// opaque fallback as a no-op. Same replay-after-theme-change contract as the
+/// accent; see the matching function in app-settings.
+fn apply_material(cx: &mut App) {
+    use sysvitals_core::backdrop::{should_tint, MATERIAL_TINT_ALPHA};
+    let material = detect_material();
+    if !should_tint(material) {
+        return;
+    }
+    UiTheme::update(cx, |theme| {
+        let opaque = |c: Hsla| Hsla { a: 1.0, ..c };
+        theme.colors.background = opaque(theme.colors.background).opacity(MATERIAL_TINT_ALPHA);
+    });
+}
 
 /// Convert a packed 24-bit RGB hex to GPUI's `Hsla` (h/s/l/a in 0..1).
 /// Hand-rolled so the accent path does not depend on which color helpers the
@@ -836,12 +994,13 @@ fn apply_system_theme(cx: &mut App) {
     UiTheme::sync_system_appearance(None, cx);
 }
 
-/// Theme sync and accent override applied together: a palette reload wipes
-/// the accent override, so the accent must follow every theme change, never
-/// precede it.
+/// Theme sync, accent override, and material tint applied together, in that
+/// order. The palette reload wipes every runtime patch, so both follow every
+/// theme change (see the matching rule in app-settings).
 fn apply_theme_and_accent(cx: &mut App) {
     apply_system_theme(cx);
     apply_accent(cx);
+    apply_material(cx);
 }
 
 fn main() {
@@ -950,6 +1109,13 @@ fn main() {
             },
             is_movable: !anchored,
             is_resizable: !anchored,
+            // System backdrop material (Win11 Mica / Win10-era acrylic blur /
+            // macOS window blur, opaque fallback on anything older or when the
+            // user disabled transparency effects). The palette tint applied in
+            // `apply_theme_and_accent` is what lets it show through. This is
+            // purely a compositor attribute — it does not change the window's
+            // activation edges, so the blur-close contract is untouched.
+            window_background: backdrop_for(detect_material()),
             focus: true,
             ..Default::default()
         };
