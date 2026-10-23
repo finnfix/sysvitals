@@ -31,9 +31,9 @@ jobs:
       - name: Format check (all workspace members)
         run: cargo fmt --check
       - name: Clippy (default members)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Tests (default members)
-        run: cargo test
+        run: cargo test --locked
 
   # ---------------------------------------------------------------------------
   # Build gate + distribution packaging.
@@ -49,14 +49,16 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-tags: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build Windows display layer
-        run: cargo build --release -p app-win
+        run: cargo build --locked --release -p app-win
       - name: Build GPUI settings window
-        run: cargo build --release -p app-settings
+        run: cargo build --locked --release -p app-settings
       - name: Build GPUI history chart
-        run: cargo build --release -p app-history
+        run: cargo build --locked --release -p app-history
       # Portable (green) distribution: overlay exe plus the settings/history
       # exes when present. Package name: SysVitals_Windows_x64_v{version}_{short-hash}_dev.zip
       # (Windows ships x64 only); the version is read from the workspace
@@ -71,9 +73,14 @@ jobs:
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           $commit = (git rev-parse --short HEAD)
           $zip = "SysVitals_Windows_x64_v${version}_${commit}_dev.zip"
-          $files = @("target/release/SysVitals.exe")
-          if (Test-Path "target/release/SysVitalsSettings.exe") { $files += "target/release/SysVitalsSettings.exe" }
-          if (Test-Path "target/release/SysVitalsHistory.exe") { $files += "target/release/SysVitalsHistory.exe" }
+          $files = @(
+            "target/release/SysVitals.exe",
+            "target/release/SysVitalsSettings.exe",
+            "target/release/SysVitalsHistory.exe"
+          )
+          foreach ($f in $files) {
+            if (!(Test-Path $f)) { throw "missing build output: $f" }
+          }
           Compress-Archive -Path $files -DestinationPath $zip
           Write-Host "Packaged $zip"
       - name: Upload Windows portable package
@@ -88,6 +95,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-tags: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
@@ -95,11 +104,11 @@ jobs:
       # Apple Silicon only: the explicit target pin keeps the package arm64
       # no matter which arch the runner image happens to be.
       - name: Build macOS display layer
-        run: cargo build --release --target aarch64-apple-darwin -p app-mac
+        run: cargo build --locked --release --target aarch64-apple-darwin -p app-mac
       - name: Build GPUI settings window
-        run: cargo build --release --target aarch64-apple-darwin -p app-settings
+        run: cargo build --locked --release --target aarch64-apple-darwin -p app-settings
       - name: Build GPUI history chart
-        run: cargo build --release --target aarch64-apple-darwin -p app-history
+        run: cargo build --locked --release --target aarch64-apple-darwin -p app-history
       # One bundle, not three apps: the indicator is the declared
       # CFBundleExecutable, and the settings/history binaries are sibling
       # executables it launches from Contents/MacOS. Package name:
@@ -115,15 +124,21 @@ jobs:
           app="SysVitals.app"
           bin="target/aarch64-apple-darwin/release"
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          for f in sysvitals SysVitalsSettings SysVitalsHistory; do
+            if [ ! -f "$bin/$f" ]; then
+              echo "missing build output: $bin/$f" >&2
+              exit 1
+            fi
+          done
           cp "$bin/sysvitals" "$app/Contents/MacOS/sysvitals"
-          if [ -f "$bin/SysVitalsSettings" ]; then
-            cp "$bin/SysVitalsSettings" "$app/Contents/MacOS/SysVitalsSettings"
-          fi
-          if [ -f "$bin/SysVitalsHistory" ]; then
-            cp "$bin/SysVitalsHistory" "$app/Contents/MacOS/SysVitalsHistory"
-          fi
+          cp "$bin/SysVitalsSettings" "$app/Contents/MacOS/SysVitalsSettings"
+          cp "$bin/SysVitalsHistory" "$app/Contents/MacOS/SysVitalsHistory"
           cp crates/app-mac/assets/Info.plist "$app/Contents/Info.plist"
           cp crates/app-mac/assets/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
+          # The plist is a template; substitute the workspace version and a
+          # numeric build number so Finder/Get Info never shows a stale 0.0.0.
+          plutil -replace CFBundleShortVersionString -string "$version" "$app/Contents/Info.plist"
+          plutil -replace CFBundleVersion -string "$(git rev-list --count HEAD)" "$app/Contents/Info.plist"
           zip -qr "SysVitals_macOS_arm64_v${version}_${commit}_dev.zip" "$app"
           echo "Packaged SysVitals_macOS_arm64_v${version}_${commit}_dev.zip"
       - name: Upload macOS app bundle
