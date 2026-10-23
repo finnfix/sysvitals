@@ -23,7 +23,7 @@ mod macos {
     use chrono::Local;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, Bool};
-    use objc2::{ClassType, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+    use objc2::{define_class, msg_send, sel, ClassType, MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{
         NSApplication, NSApplicationActivationPolicy, NSAttributedStringNSStringDrawing,
         NSCellImagePosition, NSEventMask, NSEventType, NSFont, NSFontAttributeName, NSImage,
@@ -37,7 +37,7 @@ mod macos {
 
     use sysvitals_core::config::{config_path, history_path};
     use sysvitals_core::format::format_frame;
-    use sysvitals_core::{Config, FormattedRow, NetSelection, Sampler, t};
+    use sysvitals_core::{t, Config, FormattedRow, NetSelection, Sampler};
 
     /// Font-size factor for the dual-row layout: the menu bar has a fixed
     /// height, so two lines only fit with the system menu-bar font scaled

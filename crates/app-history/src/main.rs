@@ -25,9 +25,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use sysvitals_core::backdrop::Material;
-use sysvitals_core::config::{Config, CsvScope, config_path, history_path};
-use sysvitals_core::i18n::{Language, t};
-use sysvitals_core::store::{Bucket, Store, floor_to_grid, spread_label_indices};
+use sysvitals_core::config::{config_path, history_path, Config, CsvScope};
+use sysvitals_core::i18n::{t, Language};
+use sysvitals_core::store::{floor_to_grid, spread_label_indices, Bucket, Store};
 
 /// Screen rectangle of the indicator, passed by the overlay in GPUI's
 /// global logical pixel space (top-left origin, y growing downward).
@@ -304,26 +304,24 @@ impl HistoryView {
     /// with the view entity, i.e. when the window closes. Same shape as the
     /// settings window's accent poll.
     fn start_accent_watch(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(500))
-                    .await;
-                let alive = this
-                    .update(cx, |view: &mut HistoryView, cx| {
-                        let current = system_accent_hex();
-                        if current == view.last_accent {
-                            return true;
-                        }
-                        view.last_accent = current;
-                        apply_accent(cx);
-                        cx.notify();
-                        true
-                    })
-                    .unwrap_or(false);
-                if !alive {
-                    break;
-                }
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            let alive = this
+                .update(cx, |view: &mut HistoryView, cx| {
+                    let current = system_accent_hex();
+                    if current == view.last_accent {
+                        return true;
+                    }
+                    view.last_accent = current;
+                    apply_accent(cx);
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !alive {
+                break;
             }
         })
         .detach();
@@ -408,18 +406,16 @@ impl HistoryView {
     /// lives. The loop stops as soon as the view entity is released, i.e.
     /// when the window closes.
     fn start_refresh_loop(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(REFRESH_INTERVAL).await;
-                if this
-                    .update(cx, |view: &mut HistoryView, cx| {
-                        view.load_data();
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(REFRESH_INTERVAL).await;
+            if this
+                .update(cx, |view: &mut HistoryView, cx| {
+                    view.load_data();
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
             }
         })
         .detach();
@@ -905,8 +901,8 @@ fn apply_accent(cx: &mut App) {
 #[cfg(windows)]
 fn hkcu_dword(key: &str, value: &str) -> Option<u32> {
     use windows::Win32::System::Registry::{
-        HKEY, HKEY_CURRENT_USER, KEY_READ, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW,
-        RegQueryValueExW,
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+        REG_VALUE_TYPE,
     };
     let utf16 = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
     let key_w = utf16(key);
@@ -1000,7 +996,7 @@ fn backdrop_for(material: Material) -> WindowBackgroundAppearance {
 /// opaque fallback as a no-op. Same replay-after-theme-change contract as the
 /// accent; see the matching function in app-settings.
 fn apply_material(cx: &mut App) {
-    use sysvitals_core::backdrop::{MATERIAL_TINT_ALPHA, should_tint};
+    use sysvitals_core::backdrop::{should_tint, MATERIAL_TINT_ALPHA};
     let material = detect_material();
     if !should_tint(material) {
         return;
