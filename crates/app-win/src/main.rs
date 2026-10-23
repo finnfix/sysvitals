@@ -93,9 +93,9 @@ mod win {
         CS_VREDRAW, GWL_EXSTYLE, HWND_TOPMOST, MF_STRING, MSG, NONCLIENTMETRICSW, SM_CXSCREEN,
         SM_CYSCREEN, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
         SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
-        WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSELEAVE, WM_MOUSEMOVE,
-        WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NULL,
+        WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     };
 
     // ------------------------------------------------------------------ consts
@@ -113,6 +113,9 @@ mod win {
     /// overlay re-samples, resizes and re-renders in its own wndproc at top
     /// level, which is always safe (no reentrant rendering).
     const WM_APP_APPLY: u32 = 0x8000 + 1;
+    /// `WM_MOUSELEAVE` (WinUser.h). The `windows` crate metadata omits this
+    /// message, so it is defined locally; `TrackMouseEvent(TME_LEAVE)` posts it.
+    const WM_MOUSELEAVE: u32 = 0x02A3;
     /// Horizontal padding around the measured text.
     const PAD_PX: i32 = 6;
     /// Extra width slack added when sizing the overlay. Sizing measures text at
