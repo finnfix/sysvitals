@@ -76,8 +76,10 @@ pub fn choose_macos_material(transparency_enabled: bool) -> Material {
 /// Alpha for the theme background tint painted over a live material, so the
 /// desktop shows through without collapsing text contrast against a busy
 /// background. Kept here so both panels share one value and the choice is
-/// unit-testable.
-pub const MATERIAL_TINT_ALPHA: f32 = 0.72;
+/// unit-testable. 0.55 (was 0.72) after on-device feedback that Mica read as
+/// a flat fill: the extra 17 points of transparency is what makes the
+/// wallpaper tint legible while text stays readable on both palettes.
+pub const MATERIAL_TINT_ALPHA: f32 = 0.55;
 
 /// Whether the material needs the theme background tinted translucent.
 /// `Opaque` never tints, so the fallback path keeps the pre-material

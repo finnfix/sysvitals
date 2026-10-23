@@ -29,14 +29,17 @@ pub const DEFAULT_INTERVAL_MS: u64 = 2000;
 /// Allowed item-spacing values in pixels for the single-row layout. The
 /// settings UI offers exactly these choices; any other value snaps to the
 /// nearest one.
-pub const ALLOWED_ITEM_SPACING_PX: [u32; 4] = [8, 12, 16, 24];
+pub const ALLOWED_ITEM_SPACING_PX: [u32; 4] = [4, 8, 16, 32];
 
-/// Default item spacing: 16 px.
-pub const DEFAULT_ITEM_SPACING_PX: u32 = 16;
+/// Default item spacing: 8 px.
+pub const DEFAULT_ITEM_SPACING_PX: u32 = 8;
 
-/// Allowed left-margin values in pixels for the far-left anchor. The settings
-/// UI offers exactly these choices; any other value snaps to the nearest one.
-pub const ALLOWED_LEFT_MARGIN_PX: [u32; 5] = [8, 16, 48, 128, 256];
+/// Allowed margin values in pixels. The setting offsets the indicator from
+/// the far end of the taskbar: the bar's left edge on a horizontal bar under
+/// the far-left anchor, and its top edge on a vertical (left/right) bar. The
+/// settings UI offers exactly these choices; any other value snaps to the
+/// nearest one.
+pub const ALLOWED_LEFT_MARGIN_PX: [u32; 6] = [8, 16, 32, 64, 128, 256];
 
 /// Default left margin: 16 px.
 pub const DEFAULT_LEFT_MARGIN_PX: u32 = 16;
@@ -119,10 +122,11 @@ pub struct WindowsConfig {
     /// Manual font-size override (points). `None` = follow the system metric.
     /// Dual-row scales the system font (≈0.75) automatically instead.
     pub font_size_override: Option<f32>,
-    /// Extra gap (pixels) between the taskbar's left edge and the indicator
-    /// when the far-left anchor is active. One of [`ALLOWED_LEFT_MARGIN_PX`];
-    /// anything else snaps to the nearest allowed value via `sanitize`.
-    /// Default 16.
+    /// Offset (pixels) between the taskbar's far end and the indicator. On a
+    /// horizontal bar under the far-left anchor this measures from the bar's
+    /// left edge; on a vertical (left/right) bar it measures from the bar's
+    /// top edge. One of [`ALLOWED_LEFT_MARGIN_PX`]; anything else snaps to the
+    /// nearest allowed value via `sanitize`. Default 16.
     pub left_margin_px: u32,
 }
 
@@ -557,27 +561,27 @@ mod tests {
         let mut low = Config::default();
         low.display.item_spacing = 1;
         let issues = low.sanitize();
-        assert_eq!(low.display.item_spacing, 8);
+        assert_eq!(low.display.item_spacing, 4);
         assert!(issues.iter().any(|i| i.field == "display.item_spacing"));
 
-        let mut high = Config::default();
-        high.display.item_spacing = 20;
-        high.sanitize();
-        // 20 is equidistant from 16 and 24; the tie resolves to the first
-        // (smaller) allowed value.
-        assert_eq!(high.display.item_spacing, 16);
+        let mut mid = Config::default();
+        mid.display.item_spacing = 11;
+        mid.sanitize();
+        // 11 is equidistant from 8 and 16 (nearest on each side); the tie
+        // resolves to the first (smaller) allowed value.
+        assert_eq!(mid.display.item_spacing, 8);
 
         // Values above the max snap down to the max allowed entry.
         let mut above = Config::default();
         above.display.item_spacing = 100;
         above.sanitize();
-        assert_eq!(above.display.item_spacing, 24);
+        assert_eq!(above.display.item_spacing, 32);
 
         // Legacy space-count values from old configs snap sensibly.
         let mut legacy = Config::default();
         legacy.display.item_spacing = 2;
         legacy.sanitize();
-        assert_eq!(legacy.display.item_spacing, 8);
+        assert_eq!(legacy.display.item_spacing, 4);
     }
 
     #[test]
@@ -589,12 +593,18 @@ mod tests {
             assert_eq!(c.windows.left_margin_px, v);
             assert!(issues.iter().all(|i| i.field != "windows.left_margin_px"));
         }
-        // 4 (the old default) snaps to the nearest allowed value, 8.
+        // 4 snaps up to the smallest allowed value, 8.
         let mut c = Config::default();
         c.windows.left_margin_px = 4;
         let issues = c.sanitize();
         assert_eq!(c.windows.left_margin_px, 8);
         assert!(issues.iter().any(|i| i.field == "windows.left_margin_px"));
+
+        // Removed set entry (48) snaps to the nearest survivor, 32.
+        let mut old = Config::default();
+        old.windows.left_margin_px = 48;
+        old.sanitize();
+        assert_eq!(old.windows.left_margin_px, 32);
 
         // Large values snap down to the max allowed entry.
         let mut big = Config::default();
