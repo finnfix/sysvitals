@@ -11,6 +11,7 @@
 //! touchpoints; each is kept behind its own module ([`sampler`], [`store`])
 //! so either can be swapped without changing the public surface.
 
+pub mod backdrop;
 pub mod config;
 pub mod format;
 pub mod i18n;
