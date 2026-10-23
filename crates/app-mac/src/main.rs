@@ -22,18 +22,22 @@ mod macos {
 
     use chrono::Local;
     use objc2::rc::Retained;
-    use objc2::runtime::AnyObject;
-    use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
+    use objc2::runtime::{AnyObject, Bool};
+    use objc2::{define_class, msg_send, sel, ClassType, MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventMask, NSEventType, NSFont,
-        NSMenu, NSMenuItem, NSScreen, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
-        NSView,
+        NSApplication, NSApplicationActivationPolicy, NSAttributedStringNSStringDrawing,
+        NSCellImagePosition, NSEvent, NSEventMask, NSEventType, NSFont, NSFontAttributeName,
+        NSImage, NSImageScaling, NSMenu, NSMenuItem, NSScreen, NSStatusBar, NSStatusItem,
+        NSVariableStatusItemLength, NSView,
     };
-    use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSString, NSTimer};
+    use objc2_foundation::{
+        NSAttributedString, NSDictionary, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+        NSString, NSTimer,
+    };
 
     use sysvitals_core::config::{config_path, history_path};
     use sysvitals_core::format::format_frame;
-    use sysvitals_core::{t, Config, NetSelection, Sampler};
+    use sysvitals_core::{t, Config, FormattedRow, NetSelection, Sampler};
 
     /// Font-size factor for the dual-row layout: the menu bar has a fixed
     /// height, so two lines only fit with the system menu-bar font scaled
@@ -156,6 +160,27 @@ mod macos {
         // (nothing inserts it there), so a nil target would leave AppKit's
         // automatic enabling unable to find a receiver and gray the items out.
         static ACTION_HANDLER: RefCell<Option<Retained<ActionHandler>>> = const { RefCell::new(None) };
+
+        // --- Self-drawn indicator image -----------------------------------
+        // The status item shows a template `NSImage` we render ourselves
+        // instead of a plain `setTitle`. That is the only way to control the
+        // two-column dual-row layout to the pixel: item spacing, left-column
+        // alignment and vertical centering are all impossible through AppKit's
+        // string-titled status button, whose text placement we cannot reach.
+        // Making the image a *template* keeps menu-bar light/dark inversion for
+        // free (AppKit tints it from the system appearance), consistent with the
+        // "indicator always follows the system theme" conclusion that also let
+        // us hide the theme picker on macOS.
+
+        /// Render signature of the image currently mounted (layout parameters +
+        /// all texts). `tick` compares it first and skips everything when the
+        /// frame is identical — no rebuild, no redraw, no bitmap churn.
+        static DRAW_SIGNATURE: RefCell<String> = const { RefCell::new(String::new()) };
+        /// Grow-only ceiling for the item width: the indicator never shrinks
+        /// below the widest it has been, so a number losing a digit (or a rate
+        /// unit stepping down) cannot shift the block left/right. Mirrors the
+        /// Windows overlay's grow-only window sizing.
+        static DRAW_WIDTH_CEIL: RefCell<f64> = const { RefCell::new(0.0) };
     }
 
     /// Screen rectangle (left, top, right, bottom) in GPUI's global top-left,
@@ -291,8 +316,221 @@ mod macos {
         });
     }
 
-    /// Sample metrics, record the history row, and update the status item
-    /// title.
+    /// One text run baked into the current indicator image: an attributed
+    /// string (carrying the font) plus the point to draw it at, in the image's
+    /// flipped (top-left origin, y downward) space. The list is captured by the
+    /// image's drawing handler, so AppKit can rasterize it without touching
+    /// thread-local state from a possibly non-main thread.
+    struct DrawItem {
+        attr: Retained<NSAttributedString>,
+        x: f64,
+        y: f64,
+    }
+
+    /// One laid-out dual-row line: left run, optional right run, with measured
+    /// widths/heights kept for the column math.
+    struct RowRun {
+        la: Retained<NSAttributedString>,
+        lw: f64,
+        lh: f64,
+        ra: Option<Retained<NSAttributedString>>,
+        rw: f64,
+        rh: f64,
+    }
+
+    /// Build one attributed run (font baked in) and measure it. `size()` reads
+    /// the attributed string's own attributes, so measurement and drawing can
+    /// never disagree on the font.
+    fn make_run(text: &str, font: &Retained<NSFont>) -> (Retained<NSAttributedString>, f64, f64) {
+        let s = NSString::from_str(text);
+        // NSFont's super chain is NSFont -> NSObject -> AnyObject; the
+        // attribute-dict value type is AnyObject, so two `as_super` steps land
+        // on the right reference (`as_super` comes from `objc2::ClassType`).
+        let obj: &AnyObject = font.as_super().as_super();
+        // The key static is already `&NSString`; `from_slices` takes a slice of
+        // key references, so the element is `NSFontAttributeName` itself.
+        let dict = NSDictionary::from_slices(&[NSFontAttributeName], &[obj]);
+        // SAFETY: the attribute dictionary holds a valid `NSFont` under the
+        // documented `NSFontAttributeName` key.
+        let attr = unsafe { NSAttributedString::new_with_attributes(&s, &dict) };
+        let sz = attr.size();
+        (attr, sz.width, sz.height)
+    }
+
+    /// Render the formatted frame into the status item as a self-drawn
+    /// template image — the macOS counterpart of the Windows overlay's GDI
+    /// painting, giving pixel control over dual-row alignment, item spacing
+    /// and vertical centering that AppKit's string title does not offer.
+    ///
+    /// Skips every action when the render signature (layout parameters plus
+    /// all texts) is unchanged: the mounted image simply stays, so an
+    /// idle-second tick costs nothing (no rebuild, no bitmap churn). On change
+    /// a fresh block-image is built and mounted; the previous image is
+    /// reference-counted away. Grow-only width keeps the block from shifting
+    /// when values lose a digit.
+    fn render_indicator(row: &FormattedRow, cfg: &Config) {
+        let mtm = mtm();
+        let dual = cfg.display.dual_row && row.lines.len() > 1;
+        let spacing = f64::from(cfg.display.item_spacing.max(1));
+        // The menu-bar height (logical points) is the canvas height; drawing
+        // inside it keeps the glyphs at the system's own vertical band.
+        let img_h = NSStatusBar::systemStatusBar().thickness();
+
+        // Single-row strictly follows the system menu-bar font (size 0 =
+        // standard); dual-row uses the 0.75-scaled variant so two lines fit
+        // the fixed bar height (same factor as the Windows quadrant).
+        let base = NSFont::menuBarFontOfSize(0.0);
+        let font = if dual {
+            let scaled = (base.pointSize() * DUAL_ROW_FONT_FACTOR).max(1.0);
+            NSFont::menuBarFontOfSize(scaled)
+        } else {
+            base
+        };
+
+        // --- lay out the runs (flipped space: y grows downward) -----------
+        let mut items: Vec<DrawItem> = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
+        let mut width = 0f64;
+        // `display.theme` is deliberately not consulted: the indicator is a
+        // template image, which AppKit tints from the menu-bar appearance —
+        // light/dark inversion is automatic and per-item color is not a thing
+        // on the menu bar (see the theme-picker removal in app-settings).
+        if dual {
+            // 2x2 quadrant mirroring the Windows overlay's `measure_frame`:
+            // both rows' left columns start at x = 0 (left alignment, ②),
+            // the right column starts at `left_col_w + item_spacing` (③),
+            // and the two-line block is vertically centered in the bar (⑤).
+            let mut runs: Vec<RowRun> = Vec::with_capacity(row.lines.len());
+            for line in &row.lines {
+                let (la, lw, lh) = make_run(line.left.trim_end(), &font);
+                let (ra, rw, rh) = if line.right.is_empty() {
+                    (None, 0.0, 0.0)
+                } else {
+                    let (a, w, h) = make_run(line.right.trim_end(), &font);
+                    (Some(a), w, h)
+                };
+                texts.push(line.left.clone());
+                texts.push(line.right.clone());
+                runs.push(RowRun {
+                    la,
+                    lw,
+                    lh,
+                    ra,
+                    rw,
+                    rh,
+                });
+            }
+            let left_w = runs.iter().map(|r| r.lw).fold(0f64, f64::max);
+            let right_w = runs.iter().map(|r| r.rw).fold(0f64, f64::max);
+            let line_h = runs.iter().map(|r| r.lh.max(r.rh)).fold(0f64, f64::max);
+            let n = runs.len() as f64;
+            let block_h = line_h * n;
+            let y0 = ((img_h - block_h) / 2.0).max(0.0);
+            let right_x = left_w + spacing;
+            for (i, r) in runs.iter().enumerate() {
+                let y = y0 + line_h * i as f64;
+                items.push(DrawItem {
+                    attr: r.la.clone(),
+                    x: 0.0,
+                    y,
+                });
+                if let Some(ra) = &r.ra {
+                    items.push(DrawItem {
+                        attr: ra.clone(),
+                        x: right_x,
+                        y,
+                    });
+                }
+            }
+            width = if right_w > 0.0 {
+                right_x + right_w
+            } else {
+                left_w
+            };
+        } else {
+            // Single row: lay the individual metric items with a pixel gap
+            // (③ exact `item_spacing`, mirroring the Windows single-row path);
+            // vertically centered on its own measured height (⑤).
+            let parts: Vec<String> = if !row.items.is_empty() {
+                row.items.clone()
+            } else {
+                let mut v = Vec::new();
+                for line in &row.lines {
+                    v.push(line.left.clone());
+                    if !line.right.is_empty() {
+                        v.push(line.right.clone());
+                    }
+                }
+                v
+            };
+            let mut x = 0f64;
+            for part in parts {
+                let (attr, w, h) = make_run(part.trim_end(), &font);
+                texts.push(part);
+                let y = ((img_h - h) / 2.0).max(0.0);
+                items.push(DrawItem { attr, x, y });
+                x += w + spacing;
+                width = width.max(x - spacing);
+            }
+        }
+        if items.is_empty() || width <= 0.0 {
+            return;
+        }
+
+        // Grow-only: keep the widest width ever laid out so later frames with
+        // narrower content do not shift the block (② anti-jitter). Content
+        // stays left-aligned inside the padded canvas.
+        let ceil = DRAW_WIDTH_CEIL.with(|c| {
+            let prev = *c.borrow();
+            let next = prev.max(width);
+            if next != prev {
+                *c.borrow_mut() = next;
+            }
+            next
+        });
+        let sig = format!(
+            "{dual}|{spacing}|{img_h:.1}|{ceil:.1}|{}",
+            texts.join("\u{1}")
+        );
+        if DRAW_SIGNATURE.with(|s| *s.borrow() == sig) {
+            return;
+        }
+
+        // --- build the template image --------------------------------------
+        // Flipped drawing context: origin top-left, y downward — the space the
+        // layout above was computed in. The handler captures the run list, so
+        // rasterization never touches thread-local state.
+        let block = block2::RcBlock::new(move |_rect: NSRect| -> Bool {
+            for it in &items {
+                it.attr.drawAtPoint(NSPoint::new(it.x, it.y));
+            }
+            Bool::YES
+        });
+        let image =
+            NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(ceil, img_h), true, &block);
+        image.setTemplate(true);
+
+        STATUS_ITEM.with(|si| {
+            let Some(item) = si.borrow().as_ref() else {
+                return;
+            };
+            let Some(button) = item.button(mtm) else {
+                return;
+            };
+            // Title cleared so only the image renders; `ImageOnly` +
+            // `ScaleNone` keeps AppKit from rescaling our point-sized layout.
+            button.setTitle(&NSString::from_str(""));
+            button.setImage(Some(&image));
+            button.setImagePosition(NSCellImagePosition::ImageOnly);
+            button.setImageScaling(NSImageScaling::ScaleNone);
+            // Fixed width = canvas width (grow-only), replacing the variable
+            // length used for the string title.
+            item.setLength(ceil);
+        });
+        DRAW_SIGNATURE.with(|s| *s.borrow_mut() = sig);
+    }
+
+    /// Sample metrics, record the history row, and update the indicator.
     fn tick() {
         reload_config_if_changed();
         reschedule_if_interval_changed();
@@ -313,70 +551,7 @@ mod macos {
         record_history(&cfg, now, &snapshot);
 
         let row = format_frame(&snapshot, &cfg);
-
-        // Dual-row: stack the two formatted lines into one two-line title.
-        // The menu bar height is fixed, so both lines only fit with the font
-        // scaled down (0.75 of the system menu-bar size — the same factor the
-        // Windows overlay uses for the 2x2 quadrant).
-        let dual = cfg.display.dual_row && row.lines.len() > 1;
-
-        // Build the display text from the formatted row.
-        let text = if dual {
-            row.lines
-                .iter()
-                .map(|l| l.render().trim_end().to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else if row.items.is_empty() {
-            row.lines
-                .iter()
-                .map(|l| {
-                    if l.right.is_empty() {
-                        l.left.clone()
-                    } else {
-                        format!("{}  {}", l.left, l.right)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("  ")
-        } else {
-            row.items.join("  ")
-        };
-
-        let title = NSString::from_str(&text);
-        let mtm = mtm();
-        // Single-row strictly follows the system menu-bar font (size 0 =
-        // standard); dual-row uses the 0.75-scaled variant. `menuBarFontOfSize`
-        // is the canonical menu-bar face at the requested size, so this only
-        // changes the size, never the family.
-        //
-        // `display.theme` is deliberately not consulted: an `NSStatusItem`
-        // title is drawn by AppKit, which picks the foreground color from the
-        // system menu-bar appearance and offers no public per-item color hook.
-        // The user's theme override therefore has no effect here, and the
-        // settings window hides the picker on macOS so a dead control is not
-        // presented (the Windows overlay honors it with hard-coded white /
-        // black glyphs).
-        let font = if dual {
-            let base = NSFont::menuBarFontOfSize(0.0);
-            let scaled = (base.pointSize() * DUAL_ROW_FONT_FACTOR).max(1.0);
-            NSFont::menuBarFontOfSize(scaled)
-        } else {
-            NSFont::menuBarFontOfSize(0.0)
-        };
-        STATUS_ITEM.with(|si| {
-            if let Some(item) = si.borrow().as_ref() {
-                if let Some(button) = item.button(mtm) {
-                    button.setTitle(&title);
-                    button.setFont(Some(&font));
-                    // The two-line title only renders as two lines when the
-                    // cell wraps; single-line titles are unaffected.
-                    if let Some(cell) = button.cell() {
-                        cell.setWraps(dual);
-                    }
-                }
-            }
-        });
+        render_indicator(&row, &cfg);
     }
 
     /// Directory containing the running executable.
