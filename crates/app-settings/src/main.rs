@@ -96,10 +96,8 @@ fn hkcu_dword(key: &str, value: &str) -> Option<u32> {
     }
 }
 
-/// Whether this machine offers the taskbar layout section at all: Windows 11
-/// with centered taskbar icons is the only environment where the far-left
-/// anchor is honored (the indicator itself falls back to the tray-side anchor
-/// everywhere else, so the section is hidden instead).
+/// Whether the indicator's layout section is offered on this machine: the
+/// far-left anchor exists only on Windows 11 with a centered taskbar.
 #[cfg(windows)]
 fn layout_available() -> bool {
     hkcu_dword(TASKBAR_KEY, TASKBAR_VALUE) == Some(1)
@@ -107,6 +105,39 @@ fn layout_available() -> bool {
 
 #[cfg(not(windows))]
 fn layout_available() -> bool {
+    false
+}
+
+/// Whether the taskbar is currently docked left or right. On such a bar the
+/// margin value offsets the indicator from the bar's top edge, and that knob
+/// must be editable even where the anchor section is not offered, so the
+/// settings window probes the same app-bar position the overlay reads.
+/// `false` anywhere the probe fails (macOS, hidden taskbar, pre-registered
+/// shell) keeps the previous UI surface untouched.
+#[cfg(windows)]
+fn taskbar_is_vertical() -> bool {
+    use windows::Win32::UI::Shell::{
+        ABE_LEFT, ABE_RIGHT, ABM_GETTASKBARPOS, APPBARDATA, SHAppBarMessage,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CYSCREEN};
+    let mut abd = APPBARDATA {
+        cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+        ..Default::default()
+    };
+    if unsafe { SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd) } == 0 {
+        return false;
+    }
+    // Auto-hidden bars report a rect parked off-screen; then the orientation
+    // does not matter for what is visible right now.
+    let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    if abd.rc.bottom <= 0 || abd.rc.top >= screen_h {
+        return false;
+    }
+    abd.uEdge == ABE_LEFT || abd.uEdge == ABE_RIGHT
+}
+
+#[cfg(not(windows))]
+fn taskbar_is_vertical() -> bool {
     false
 }
 
@@ -319,16 +350,27 @@ fn rgb_hex_to_hsla(hex: u32) -> Hsla {
 /// that does NOT derive from `ThemeColor.primary`, so both fields are
 /// written; the hover/active variants are derived by shifting lightness
 /// around the accent, and `ring` follows so the focus outline agrees with
-/// the button. Foreground colors (near-white on the default palette) are
-/// left untouched — Windows accent colors are always dark enough that a
-/// white foreground stays readable. A no-op on hosts with no accent source
-/// or when the DWM call fails: the library's default palette is preferable
-/// to a half-set theme.
+/// the button. The foreground is recomputed from the accent's lightness,
+/// mirroring the OS: near-white text on a dark accent, near-black on a
+/// light one. The palette default cannot be reused here — the shadcn
+/// neutral set flips per mode (dark mode ships `neutral-900` black on
+/// `neutral-50` white), which renders unreadable black text once the
+/// background is an accent of mid luminance. A no-op on hosts with no
+/// accent source or when the DWM call fails: the library's default palette
+/// is preferable to a half-set theme.
 fn apply_accent(cx: &mut App) {
     let Some(hex) = system_accent_hex() else {
         return;
     };
     let base = rgb_hex_to_hsla(hex);
+    // Mid-lightness accents fail WCAG with either pure extreme; nudge the
+    // chosen foreground to a slightly softened pure black/white, same
+    // direction the Windows shell takes when it picks button label colors.
+    let foreground = if base.l > 0.60 {
+        hsla(0.0, 0.0, 0.08, 1.0)
+    } else {
+        hsla(0.0, 0.0, 0.97, 1.0)
+    };
     UiTheme::update(cx, |theme| {
         let shift = |dl: f32| Hsla {
             l: (base.l + dl).clamp(0.05, 0.95),
@@ -340,6 +382,8 @@ fn apply_accent(cx: &mut App) {
         theme.colors.button_primary_hover = shift(0.06);
         theme.colors.primary_active = shift(-0.06);
         theme.colors.button_primary_active = shift(-0.06);
+        theme.colors.primary_foreground = foreground;
+        theme.colors.button_primary_foreground = foreground;
         theme.colors.ring = base;
     });
 }
@@ -418,6 +462,16 @@ struct SettingsView {
     /// Whether the layout section is offered on this machine (see
     /// `layout_available`). False hides it entirely.
     layout_available: bool,
+    /// Whether the taskbar is docked left/right (see `taskbar_is_vertical`),
+    /// probed once at view start. On such a bar the margin row is shown
+    /// unconditionally (the value offsets the indicator from the bar's top
+    /// edge), while the anchor dropdown — which selects between the tray end
+    /// and the far-left end of a HORIZONTAL bar — would be a dead control and
+    /// stays hidden.
+    vertical_taskbar: bool,
+    /// Last accent value seen by the live-refresh poll; the override only
+    /// re-applies when this moves (see `new`).
+    last_accent: Option<u32>,
     /// Keep event subscriptions alive for the lifetime of the view.
     _subscriptions: Vec<Subscription>,
     /// Flush guard: saves the current state whenever the window loses focus,
@@ -549,7 +603,7 @@ impl SettingsView {
             );
         }
 
-        Self {
+        let view = Self {
             dual_row: cfg.display.dual_row,
             show_resources: cfg.display.show_resources,
             show_network: cfg.display.show_network,
@@ -568,10 +622,54 @@ impl SettingsView {
             margin_select,
             anchor_select,
             layout_available: layout_available(),
+            vertical_taskbar: taskbar_is_vertical(),
+            // Seed with `None` (a sentinel), not the live accent: if the
+            // startup `apply_accent` were ever overwritten by a later
+            // palette load, a real seed would make the poll see "no change"
+            // and never re-apply. `None` forces one guaranteed re-apply on the
+            // first 500 ms tick (idempotent when startup already succeeded),
+            // after which it tracks the real value.
+            last_accent: None,
             _subscriptions,
             _deactivation: None,
             _appearance: None,
-        }
+        };
+        // OS accent live-refresh. The appearance observer registered in
+        // `render` only fires when the light/dark MODE flips (the platform
+        // layer filters `WM_SETTINGCHANGE` to `ImmersiveColorSet` with a mode
+        // change); the user changing the accent in the system Settings app
+        // does not re-run it, so the panel would keep the old primary color
+        // until it reopens. Poll the accent source every 500 ms and re-apply
+        // the override only when the value actually moved; the loop stops
+        // with the view entity, i.e. when the window closes. Same shape as
+        // the history popup's data-refresh loop. The probe runs inside
+        // `update` on purpose: on macOS `system_accent_hex` reads AppKit
+        // (`controlAccentColor`), which belongs to the main thread — the same
+        // thread `update` runs on.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                let alive = this
+                    .update(cx, |view: &mut SettingsView, cx| {
+                        let current = system_accent_hex();
+                        if current == view.last_accent {
+                            return true;
+                        }
+                        view.last_accent = current;
+                        apply_accent(cx);
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+        view
     }
 
     fn current_lang(&self) -> Language {
@@ -874,10 +972,12 @@ impl Render for SettingsView {
                 div().w(px(160.)).child(Select::new(&self.spacing_select)),
             ))
             // --- Layout: only offered where the choice actually exists
-            // (Windows 11 with a centered taskbar, read once at view start);
-            // the margin row additionally appears only for the far-left
-            // anchor.
-            .when(self.layout_available, |this| {
+            // (Windows 11 with a centered taskbar AND a horizontal bar — the
+            // far-left anchor concept does not apply to a vertical bar).
+            // The margin row additionally appears when the far-left anchor is
+            // selected OR the taskbar is vertical (on a vertical bar the value
+            // offsets the indicator from the bar's top edge).
+            .when(self.layout_available && !self.vertical_taskbar, |this| {
                 this.child(divider(border))
                     .child(section_label(t(lang, "settings.layout").to_string(), dim))
                     .child(labeled_row(
@@ -885,12 +985,25 @@ impl Render for SettingsView {
                         div().w(px(240.)).child(Select::new(&self.anchor_select)),
                     ))
             })
-            .when(self.layout_available && self.anchor_idx == 1, |this| {
-                this.child(labeled_row(
-                    t(lang, "settings.left_margin").to_string(),
-                    div().w(px(160.)).child(Select::new(&self.margin_select)),
-                ))
-            })
+            .when(
+                (self.layout_available && self.anchor_idx == 1 && !self.vertical_taskbar)
+                    || self.vertical_taskbar,
+                |this| {
+                    // The anchor section above is shown only when
+                    // `layout_available && !vertical_taskbar`. Whenever it is
+                    // hidden, the margin row stands alone and needs its own
+                    // divider to separate it from the display group.
+                    let standalone = !(self.layout_available && !self.vertical_taskbar);
+                    let mut this = this;
+                    if standalone {
+                        this = this.child(divider(border));
+                    }
+                    this.child(labeled_row(
+                        t(lang, "settings.left_margin").to_string(),
+                        div().w(px(160.)).child(Select::new(&self.margin_select)),
+                    ))
+                },
+            )
             // --- Prefixes: a 2x2 grid (CPU / MEM on the first row, upload /
             // download on the second). Each cell is a labelled field column:
             // caption above, input below. Inputs flex to their column so the

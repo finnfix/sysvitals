@@ -25,9 +25,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use sysvitals_core::backdrop::Material;
-use sysvitals_core::config::{config_path, history_path, Config, CsvScope};
-use sysvitals_core::i18n::{t, Language};
-use sysvitals_core::store::{floor_to_grid, spread_label_indices, Bucket, Store};
+use sysvitals_core::config::{Config, CsvScope, config_path, history_path};
+use sysvitals_core::i18n::{Language, t};
+use sysvitals_core::store::{Bucket, Store, floor_to_grid, spread_label_indices};
 
 /// Screen rectangle of the indicator, passed by the overlay in GPUI's
 /// global logical pixel space (top-left origin, y growing downward).
@@ -266,6 +266,11 @@ struct HistoryView {
     /// single window with no text fields, so a global keystroke observer is
     /// both safe and simpler.
     _escape: Option<Subscription>,
+    /// Last accent value seen by the live-refresh poll; the override only
+    /// re-applies when this moves (see `start_accent_watch`). Seeded with
+    /// `None` so the first tick always re-applies once (idempotent when the
+    /// startup override already succeeded).
+    last_accent: Option<u32>,
 }
 
 impl HistoryView {
@@ -280,11 +285,48 @@ impl HistoryView {
             _activation: None,
             _appearance: None,
             _escape: None,
+            last_accent: None,
         };
         view.load_data();
         view.start_refresh_loop(cx);
         view.start_escape_observer(cx);
+        view.start_accent_watch(cx);
         view
+    }
+
+    /// Poll the OS accent every 500 ms and re-apply the override when it
+    /// moved. The appearance observer only fires on a light/dark MODE flip
+    /// (the Windows platform layer filters `WM_SETTINGCHANGE` down to
+    /// `ImmersiveColorSet` with an appearance change), so an accent-only
+    /// change never re-runs `apply_accent` on its own. The probe runs inside
+    /// `update`: on macOS `system_accent_hex` reads AppKit's
+    /// `controlAccentColor`, which belongs to the main thread. The loop stops
+    /// with the view entity, i.e. when the window closes. Same shape as the
+    /// settings window's accent poll.
+    fn start_accent_watch(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let alive = this
+                    .update(cx, |view: &mut HistoryView, cx| {
+                        let current = system_accent_hex();
+                        if current == view.last_accent {
+                            return true;
+                        }
+                        view.last_accent = current;
+                        apply_accent(cx);
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Dismiss the popup when Esc is pressed.
@@ -366,16 +408,18 @@ impl HistoryView {
     /// lives. The loop stops as soon as the view entity is released, i.e.
     /// when the window closes.
     fn start_refresh_loop(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(REFRESH_INTERVAL).await;
-            if this
-                .update(cx, |view: &mut HistoryView, cx| {
-                    view.load_data();
-                    cx.notify();
-                })
-                .is_err()
-            {
-                break;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(REFRESH_INTERVAL).await;
+                if this
+                    .update(cx, |view: &mut HistoryView, cx| {
+                        view.load_data();
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
@@ -822,6 +866,18 @@ fn apply_accent(cx: &mut App) {
         return;
     };
     let base = rgb_hex_to_hsla(hex);
+    // Recompute the primary foreground from the accent's lightness. The
+    // palette default cannot be reused: the shadcn neutral set flips per
+    // mode (dark mode ships `neutral-900` black on `neutral-50` white), so
+    // leaving it alone draws black-on-mid-accent text that is unreadable.
+    // Mid-lightness accents fail WCAG with either pure extreme, so the
+    // chosen color is nudged slightly off pure, same direction the Windows
+    // shell takes when it picks button label colors.
+    let foreground = if base.l > 0.60 {
+        hsla(0.0, 0.0, 0.08, 1.0)
+    } else {
+        hsla(0.0, 0.0, 0.97, 1.0)
+    };
     UiTheme::update(cx, |theme| {
         let shift = |dl: f32| Hsla {
             l: (base.l + dl).clamp(0.05, 0.95),
@@ -833,6 +889,8 @@ fn apply_accent(cx: &mut App) {
         theme.colors.button_primary_hover = shift(0.06);
         theme.colors.primary_active = shift(-0.06);
         theme.colors.button_primary_active = shift(-0.06);
+        theme.colors.primary_foreground = foreground;
+        theme.colors.button_primary_foreground = foreground;
         theme.colors.ring = base;
     });
 }
@@ -847,8 +905,8 @@ fn apply_accent(cx: &mut App) {
 #[cfg(windows)]
 fn hkcu_dword(key: &str, value: &str) -> Option<u32> {
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
-        REG_VALUE_TYPE,
+        HKEY, HKEY_CURRENT_USER, KEY_READ, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW,
+        RegQueryValueExW,
     };
     let utf16 = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
     let key_w = utf16(key);
@@ -942,7 +1000,7 @@ fn backdrop_for(material: Material) -> WindowBackgroundAppearance {
 /// opaque fallback as a no-op. Same replay-after-theme-change contract as the
 /// accent; see the matching function in app-settings.
 fn apply_material(cx: &mut App) {
-    use sysvitals_core::backdrop::{should_tint, MATERIAL_TINT_ALPHA};
+    use sysvitals_core::backdrop::{MATERIAL_TINT_ALPHA, should_tint};
     let material = detect_material();
     if !should_tint(material) {
         return;
