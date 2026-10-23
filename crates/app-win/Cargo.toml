@@ -1,6 +1,6 @@
 [package]
 name = "app-win"
-description = "Windows display layer: topmost taskbar overlay indicator (Win32 layered window + GDI text) plus tray/settings host."
+description = "Windows display layer: topmost taskbar overlay indicator (Win32 layered window + GDI text)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

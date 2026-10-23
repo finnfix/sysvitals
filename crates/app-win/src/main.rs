@@ -27,9 +27,9 @@
 //! overlay process minimal (no UI toolkit, no modal loops) and lets the
 //! settings app evolve independently.
 //!
-//! Typography mirrors the taskbar clock: Segoe UI at the system caption size,
-//! semibold weight, and pure white / pure black glyphs per theme so the
-//! indicator reads as part of the taskbar rather than a foreign widget.
+//! Typography mirrors the taskbar clock: the system UI message font at the
+//! system size, semibold weight, and pure white / pure black glyphs per theme
+//! so the indicator reads as part of the taskbar rather than a foreign widget.
 //! Rendering is GDI text; the layout strings come from the pure core crate so
 //! the single-row / dual-row quadrant rules stay unit-tested there. Glyphs are
 //! drawn at 2x supersampled resolution and box-filtered down for smooth edges
@@ -40,7 +40,7 @@
 #[cfg(windows)]
 mod win {
     use std::cell::RefCell;
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
     use std::sync::{OnceLock, RwLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -81,8 +81,8 @@ mod win {
         TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
     };
     use windows::Win32::UI::Shell::{
-        SHAppBarMessage, ShellExecuteExW, ShellExecuteW, ABE_LEFT, ABE_RIGHT, ABM_GETTASKBARPOS,
-        APPBARDATA, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+        SHAppBarMessage, ShellExecuteExW, ShellExecuteW, ABE_LEFT, ABE_RIGHT, ABM_GETSTATE,
+        ABM_GETTASKBARPOS, ABS_AUTOHIDE, APPBARDATA, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -157,10 +157,6 @@ mod win {
 
     static WIN_W: AtomicI32 = AtomicI32::new(0);
     static WIN_H: AtomicI32 = AtomicI32::new(0);
-    /// Whether we already attempted to open the history store. A failed open
-    /// is logged once and never retried, so a broken data dir does not spam
-    /// the log on every tick.
-    static STORE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
     /// Cached `SystemUsesLightTheme` (1 = light taskbar). Refreshed on
     /// `WM_SETTINGCHANGE` so a live theme switch repaints correctly.
     static LIGHT_THEME: AtomicU32 = AtomicU32::new(0);
@@ -178,13 +174,20 @@ mod win {
     /// Left button currently pressed on the indicator (the "clicked" tint).
     /// Set on `WM_LBUTTONDOWN`, cleared on `WM_LBUTTONUP` / `WM_RBUTTONUP`.
     static PRESSED: AtomicBool = AtomicBool::new(false);
-    /// Whether a `TrackMouseEvent` leave request is already armed, so each
-    /// `WM_MOUSEMOVE` does not re-register one. Reset when `WM_MOUSELEAVE`
-    /// fires.
-    static TRACK_ARMED: AtomicBool = AtomicBool::new(false);
-    /// Last observed mtime (seconds since UNIX epoch) of the config file.
-    /// Compared on each CONFIG_POLL_MS tick to detect external edits.
-    static CONFIG_MTIME: AtomicI32 = AtomicI32::new(0);
+    /// Per-target launch guards. Bit 0 = Settings, bit 1 = History: a launch
+    /// in flight for one child must not suppress starting the other.
+    static LAUNCHING: AtomicU8 = AtomicU8::new(0);
+    /// Last observed config mtime in nanoseconds since UNIX_EPOCH. Nanosecond
+    /// precision is required: the settings window saves on every click, and
+    /// two saves inside one second would otherwise be invisible to the poller.
+    static CONFIG_MTIME: AtomicU64 = AtomicU64::new(0);
+    /// mtime of the last config parse failure, so a broken file logs once
+    /// instead of every CONFIG_POLL_MS tick.
+    static CONFIG_ERROR_MTIME: AtomicU64 = AtomicU64::new(0);
+    /// Whether a history write/prune failure has already been logged. Open
+    /// failures are retried periodically; write failures are logged once so a
+    /// full disk does not spam the log every tick.
+    static STORE_WRITE_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
 
     thread_local! {
         static SAMPLER: RefCell<Option<Sampler>> = const { RefCell::new(None) };
@@ -205,10 +208,27 @@ mod win {
         CONFIG
             .get_or_init(|| {
                 // A missing or broken config file must not stop the indicator:
-                // fall back to defaults and keep running.
-                let loaded = sysvitals_core::config::config_path()
-                    .and_then(|p| Config::load(&p).map(|(c, _)| c))
-                    .unwrap_or_default();
+                // fall back to defaults and keep running, but leave a trace so
+                // a parse error is diagnosable.
+                let loaded = match sysvitals_core::config::config_path() {
+                    Ok(p) => match Config::load(&p) {
+                        Ok((c, _)) => c,
+                        Err(e) => {
+                            log_event(
+                                "WARN",
+                                &format!(
+                                    "config load failed ({}): {e}; using defaults",
+                                    p.display()
+                                ),
+                            );
+                            Config::default()
+                        }
+                    },
+                    Err(e) => {
+                        log_event("WARN", &format!("config path unavailable: {e}"));
+                        Config::default()
+                    }
+                };
                 RwLock::new(loaded)
             })
             .read()
@@ -477,9 +497,20 @@ mod win {
             return None;
         }
         let r = abd.rc;
+        // With auto-hide enabled the shell parks the bar off screen while it
+        // is hidden. The rect alone is not a reliable signal on every build:
+        // also ask the shell for the autohide flag and require the tray window
+        // to be visible while the flag is set.
+        if SHAppBarMessage(ABM_GETSTATE, &mut abd) & ABS_AUTOHIDE as usize != 0 {
+            let cls = utf16("Shell_TrayWnd");
+            let tray = FindWindowW(windows::core::PCWSTR(cls.as_ptr()), None).ok();
+            if tray.map_or(true, |h| !IsWindowVisible(h).as_bool()) {
+                return None;
+            }
+        }
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
-        // An auto-hidden taskbar reports a rect parked off-screen.
+        // An auto-hidden taskbar can still report a rect parked off-screen.
         let on_screen = r.bottom > 0 && r.top < screen_h && r.right > 0 && r.left < screen_w;
         if !on_screen {
             return None;
@@ -501,16 +532,6 @@ mod win {
     /// in the topmost band — re-asserting the indicator's band during tracking
     /// would lift the tiny overlay back above the open menu. Skip those ticks.
     static MENU_TRACKING: AtomicBool = AtomicBool::new(false);
-    /// Re-entrancy guard for `launch_child`. The single-instance check reads
-    /// the process handle slot, but `ShellExecuteExW` only writes it *after*
-    /// the launch completes — and the Shell execute path can pump messages
-    /// internally (shell extensions, auto-approval). A fast double click on
-    /// the indicator can therefore dispatch the second `WM_LBUTTONUP` while
-    /// the first launch is still in flight, find the slot empty, and spawn a
-    /// duplicate child (two trend popups stacked at the same anchor, only
-    /// one of them ever activated). This flag spans the whole launch call:
-    /// the second click sees "launching" and no-ops.
-    static LAUNCHING: AtomicBool = AtomicBool::new(false);
 
     /// Keep the overlay at the very top of the topmost band, every tick.
     ///
@@ -586,13 +607,10 @@ mod win {
             let _ = ShowWindow(hwnd, SW_HIDE);
             return;
         };
-        // Taskbar is on screen: keep the indicator in the topmost band (it can
-        // be re-banded below shell flyouts between ticks; see maintain_topmost).
-        maintain_topmost(hwnd);
-        let bar = info.rect;
-
         // Track orientation changes: reset grow-only width when the taskbar
-        // flips between horizontal and vertical.
+        // flips between horizontal and vertical. Re-sampling here rebuilds the
+        // stacked/dual layout; the sample path also places the window with the
+        // new size, so this branch returns instead of positioning again.
         let was_vertical = TASKBAR_VERTICAL.swap(info.vertical, Ordering::Relaxed);
         if was_vertical != info.vertical {
             log_event(
@@ -601,19 +619,45 @@ mod win {
             );
             WIN_W.store(0, Ordering::Relaxed);
             sample_now(hwnd);
+            return;
         }
+        apply_position_with_info(hwnd, info);
+    }
 
+    /// Place the current window at its anchor using the latest `WIN_W`/`WIN_H`.
+    /// Called both by the once-per-second geometry tick and immediately after
+    /// a measured resize: growing the width while keeping the old left edge
+    /// would push a right-anchored overlay into the tray until the next tick.
+    unsafe fn apply_position(hwnd: HWND) {
+        let Some(info) = taskbar_info() else {
+            if IsWindowVisible(hwnd).as_bool() {
+                log_event(
+                    "INFO",
+                    "overlay hidden: taskbar not on screen (auto-hide or fullscreen app)",
+                );
+            }
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            return;
+        };
+        apply_position_with_info(hwnd, info);
+    }
+
+    unsafe fn apply_position_with_info(hwnd: HWND, info: TaskbarInfo) {
+        // Taskbar is on screen: keep the indicator in the topmost band (it can
+        // be re-banded below shell flyouts between ticks; see maintain_topmost).
+        maintain_topmost(hwnd);
+        let bar = info.rect;
         let cfg = config();
         let w = WIN_W.load(Ordering::Relaxed);
         let h = WIN_H.load(Ordering::Relaxed);
 
         let (x, y) = if info.vertical {
-            // Vertical taskbar: horizontally centered within the bar thickness,
-            // anchored top or bottom. When the stacked column is wider than the
-            // bar's thickness, centering would push the window past the screen
-            // edge it is docked to and clip it. Clamp so the overflow goes into
-            // the desktop instead: keep the left edge on-screen for a
-            // left-docked bar, the right edge on-screen for a right-docked bar.
+            // Vertical taskbar: horizontally centered within the bar thickness.
+            // When the stacked column is wider than the bar's thickness,
+            // centering would push the window past the screen edge it is
+            // docked to and clip it. Clamp so the overflow goes into the
+            // desktop instead: keep the left edge on-screen for a left-docked
+            // bar, the right edge on-screen for a right-docked bar.
             let center_x = bar.left + (bar.right - bar.left - w) / 2;
             let screen_w = GetSystemMetrics(SM_CXSCREEN);
             let x = if info.left_edge {
@@ -622,12 +666,8 @@ mod win {
                 center_x.min(screen_w - w).max(0)
             };
             // On a vertical bar `left_margin_px` measures from the bar's TOP
-            // edge (the user-facing knob of this value on left/right taskbars;
-            // no anchor gate — the far-left anchor concept does not exist
-            // here). The indicator is pinned near the far end by default, so
-            // the same value also has to be honored when re-anchoring the bar
-            // away from the tray side; see `else` branch for the horizontal
-            // far-left gate.
+            // edge. The far-left anchor concept does not exist here, so the
+            // value is honored unconditionally.
             let y = bar.top + cfg.windows.left_margin_px as i32;
             (x, y)
         } else {
@@ -712,6 +752,7 @@ mod win {
         row: &FormattedRow,
         spacing_px: i32,
         vertical: bool,
+        line_pad: i32,
     ) -> FrameMetrics {
         let multi_line = row.lines.len() > 1;
         let has_right_col = row.lines.iter().any(|l| !l.right.is_empty());
@@ -754,11 +795,13 @@ mod win {
         if !multi_line || !has_right_col {
             let mut want_w = 0i32;
             for line in &row.lines {
-                want_w = want_w.max(text_w(&row_text(line)));
+                want_w = want_w.max(text_w(&line.render()));
             }
             // Vertical layout: separator lines shrink to the configured block
             // gap so it matches the horizontal single-row metric gap; content
-            // lines keep the measured text height + breathing room.
+            // lines keep the measured text height plus a breathing margin.
+            // `line_pad` is supplied by the caller so the 2x supersampled
+            // measurement scales it along with the glyphs.
             let line_heights: Vec<i32> = if vertical {
                 row.lines
                     .iter()
@@ -766,7 +809,7 @@ mod win {
                         if is_vertical_separator(l) {
                             spacing_px.max(1)
                         } else {
-                            line_h + 2
+                            line_h + line_pad
                         }
                     })
                     .collect()
@@ -812,7 +855,7 @@ mod win {
         let hdc = GetDC(Some(hwnd));
         let font = make_font();
         let old = SelectObject(hdc, font.into());
-        let m = measure_frame(hdc, row, spacing_px, vertical);
+        let m = measure_frame(hdc, row, spacing_px, vertical, 2);
         SelectObject(hdc, old);
         let _ = DeleteObject(font.into());
         let _ = ReleaseDC(Some(hwnd), hdc);
@@ -827,19 +870,6 @@ mod win {
         };
         WIN_W.fetch_max(want_w, Ordering::Relaxed);
         WIN_H.store(want_h, Ordering::Relaxed);
-        let w = WIN_W.load(Ordering::Relaxed);
-        let mut rc = RECT::default();
-        if GetWindowRect(hwnd, &mut rc).is_ok() {
-            let _ = MoveWindow(hwnd, rc.left, rc.top, w, want_h, true);
-        }
-    }
-
-    fn row_text(line: &sysvitals_core::Line) -> String {
-        if line.right.is_empty() {
-            line.left.clone()
-        } else {
-            format!("{}  {}", line.left, line.right)
-        }
     }
 
     unsafe fn sample_now(hwnd: HWND) {
@@ -862,18 +892,27 @@ mod win {
         };
         resize_to_content(hwnd, &row);
         LAST_ROW.with(|l| *l.borrow_mut() = Some(row));
+        // Re-place with the new size before painting: a right-anchored window
+        // must not grow into the tray until the next one-second move tick.
+        apply_position(hwnd);
         render_layered(hwnd);
     }
 
     /// Insert the current CPU/MEM sample into the history database and prune
-    /// old rows periodically.
+    /// old rows periodically. A failed open is retried every 300 ticks (ten
+    /// minutes at the default interval); write failures are logged once.
     fn record_history(cfg: &Config, now: i64, snapshot: &sysvitals_core::Snapshot) {
         if !cfg.history.enabled {
             return;
         }
+        let tick = TICK_COUNT.with(|c| {
+            let v = c.get().wrapping_add(1);
+            c.set(v);
+            v
+        });
         STORE.with(|s| {
             let mut guard = s.borrow_mut();
-            if guard.is_none() && !STORE_ATTEMPTED.swap(true, Ordering::Relaxed) {
+            if guard.is_none() && (tick == 1 || tick % 300 == 0) {
                 if let Ok(path) = sysvitals_core::config::history_path() {
                     if let Some(parent) = path.parent() {
                         let _ = std::fs::create_dir_all(parent);
@@ -898,14 +937,17 @@ mod win {
                 }
             }
             if let Some(store) = guard.as_ref() {
-                let _ = store.insert(now, snapshot.cpu_pct, snapshot.mem_pct);
-                let tick = TICK_COUNT.with(|c| {
-                    let v = c.get() + 1;
-                    c.set(v);
-                    v
-                });
+                if let Err(e) = store.insert(now, snapshot.cpu_pct, snapshot.mem_pct) {
+                    if !STORE_WRITE_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
+                        log_event("WARN", &format!("history insert failed: {e}"));
+                    }
+                }
                 if tick % 300 == 0 {
-                    let _ = store.prune(now, cfg.history.retention_days);
+                    if let Err(e) = store.prune(now, cfg.history.retention_days) {
+                        if !STORE_WRITE_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
+                            log_event("WARN", &format!("history prune failed: {e}"));
+                        }
+                    }
                 }
             }
         });
@@ -968,7 +1010,7 @@ mod win {
         // tighter margin; measurement and rendering must agree on it.
         let pad = pad_px() * SS;
         let vertical = TASKBAR_VERTICAL.load(Ordering::Relaxed);
-        let fm = measure_frame(mem_dc, &row, spacing_px * SS, vertical);
+        let fm = measure_frame(mem_dc, &row, spacing_px * SS, vertical, 2 * SS);
         // Line slot tops in supersampled pixels. Uniform division works for
         // the horizontal layouts; the vertical layout has per-line heights
         // (separator lines sized to `item_spacing`, content lines sized to
@@ -1042,7 +1084,7 @@ mod win {
                 }
             } else if fm.multi_line {
                 // Multi-line single column: left-aligned.
-                let text = row_text(line);
+                let text = line.render();
                 let mut line_rc = RECT {
                     left: pad,
                     top,
@@ -1058,7 +1100,7 @@ mod win {
                 );
             } else {
                 // Single row: centered.
-                let text = row_text(line);
+                let text = line.render();
                 let mut line_rc = RECT {
                     left: 0,
                     top,
@@ -1130,18 +1172,28 @@ mod win {
                 0
             }
         };
-        // Pill geometry in window coordinates: inset so the highlight does
-        // not touch the window edge, radius capped by the short axis (and by
-        // 8px) so it reads as a chip, not a circle.
+        // Pill geometry follows the measured content, not the grow-only
+        // window width: a value that once needed more horizontal space must
+        // not leave a permanent oversized hover chip.
+        let want_w_1x = (fm.want_w / SS).max(1);
+        let single_row = fm.item_widths.is_some();
+        let content_left = if single_row {
+            (w - want_w_1x) / 2
+        } else {
+            pad / SS
+        };
+        let content_right = content_left + want_w_1x;
         let inset = 2i32.min(w / 4).min(h / 4).max(0);
-        let pw = (w - 2 * inset).max(0);
+        let pill_left = content_left + inset;
+        let pill_right = content_right - inset;
+        let pw = (pill_right - pill_left).max(0);
         let ph = (h - 2 * inset).max(0);
         let radius = (pw.min(ph) / 2).min(8);
         // Half-extents of the pill's straight-sided core; the rounded-rect
         // SDF below measures distance against them plus `radius`.
         let hx = (pw - 2 * radius).max(0) as f32 / 2.0;
         let hy = (ph - 2 * radius).max(0) as f32 / 2.0;
-        let pcx = inset as f32 + pw as f32 / 2.0;
+        let pcx = (pill_left + pill_right) as f32 / 2.0;
         let pcy = inset as f32 + ph as f32 / 2.0;
         for y in 0..h {
             for x in 0..w {
@@ -1215,9 +1267,9 @@ mod win {
 
     // ------------------------------------------------- config file watching
 
-    /// Read the config file's last-modified time as seconds since UNIX epoch.
-    /// Returns 0 when the file does not exist or cannot be read.
-    fn config_mtime() -> i32 {
+    /// Read the config file's last-modified time as nanoseconds since UNIX
+    /// epoch. Returns 0 when the file does not exist or cannot be read.
+    fn config_mtime() -> u64 {
         let Ok(path) = sysvitals_core::config::config_path() else {
             return 0;
         };
@@ -1229,7 +1281,7 @@ mod win {
         };
         modified
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i32)
+            .map(|d| d.as_nanos() as u64)
             .unwrap_or(0)
     }
 
@@ -1242,11 +1294,22 @@ mod win {
         if current == previous {
             return;
         }
+        let loaded =
+            sysvitals_core::config::config_path().and_then(|p| Config::load(&p).map(|(c, _)| c));
+        let loaded = match loaded {
+            Ok(c) => c,
+            Err(e) => {
+                // Keep the last good config. Do not advance CONFIG_MTIME, so a
+                // fixed file is picked up on the next poll; throttle the log
+                // to one line per broken mtime.
+                if CONFIG_ERROR_MTIME.swap(current, Ordering::Relaxed) != current {
+                    log_event("WARN", &format!("config reload failed: {e}"));
+                }
+                return;
+            }
+        };
         CONFIG_MTIME.store(current, Ordering::Relaxed);
-        // Reload from disk.
-        let loaded = sysvitals_core::config::config_path()
-            .and_then(|p| Config::load(&p).map(|(c, _)| c))
-            .unwrap_or_default();
+        CONFIG_ERROR_MTIME.store(0, Ordering::Relaxed);
         store_config(loaded.clone());
         log_event(
             "INFO",
@@ -1289,6 +1352,7 @@ mod win {
             return false;
         };
         if handle.is_invalid() {
+            *borrow = None;
             return false;
         }
         let wait = unsafe { WaitForSingleObject(*handle, 0) };
@@ -1301,11 +1365,34 @@ mod win {
         }
     }
 
+    /// Terminate the process behind `slot` if it is still running. The handle
+    /// is closed and the slot cleared either way. Returns `true` only when a
+    /// live process was terminated.
+    fn terminate_child(slot: &std::cell::RefCell<Option<HANDLE>>, label: &str) -> bool {
+        let mut borrow = slot.borrow_mut();
+        let Some(handle) = borrow.as_ref() else {
+            return false;
+        };
+        if handle.is_invalid() {
+            *borrow = None;
+            return false;
+        }
+        // Already exited: reap quietly, treat as "nothing to close".
+        if unsafe { WaitForSingleObject(*handle, 0) } != WAIT_TIMEOUT {
+            let _ = unsafe { CloseHandle(*handle) };
+            *borrow = None;
+            return false;
+        }
+        let _ = unsafe { TerminateProcess(*handle, 0) };
+        let _ = unsafe { CloseHandle(*handle) };
+        *borrow = None;
+        log_event("INFO", &format!("{label} process closed by indicator"));
+        true
+    }
+
     /// Terminate the history popup's process if it is still running: the
-    /// click-to-toggle half of `WM_LBUTTONUP`. The child's handle is closed and
-    /// the slot cleared either way (an already-exited child is reaped), so the
-    /// next click opens a fresh popup. Returns `true` only when a live popup
-    /// was terminated — `false` means nothing was running and the caller
+    /// click-to-toggle half of `WM_LBUTTONUP`. Returns `true` only when a live
+    /// popup was terminated — `false` means nothing was running and the caller
     /// should open a new one.
     ///
     /// This is a hard process kill rather than a polite "please close": with
@@ -1315,27 +1402,36 @@ mod win {
     /// Terminating the handle is deterministic and idempotent (already-dead
     /// handles are reaped).
     fn close_history() -> bool {
-        HISTORY_PROCESS.with(|slot| {
-            let mut borrow = slot.borrow_mut();
-            let Some(handle) = borrow.as_ref() else {
-                return false;
-            };
-            if handle.is_invalid() {
-                *borrow = None;
-                return false;
-            }
-            // Already exited: reap quietly, treat as "nothing to close".
-            if unsafe { WaitForSingleObject(*handle, 0) } != WAIT_TIMEOUT {
-                let _ = unsafe { CloseHandle(*handle) };
-                *borrow = None;
-                return false;
-            }
-            let _ = unsafe { TerminateProcess(*handle, 0) };
-            let _ = unsafe { CloseHandle(*handle) };
-            *borrow = None;
-            log_event("INFO", "history popup closed by indicator click");
-            true
-        })
+        HISTORY_PROCESS.with(|slot| terminate_child(slot, "history popup"))
+    }
+
+    /// Close both child panels on restart/quit. Their processes are owned by
+    /// this indicator; leaving them alive makes a restarted instance open a
+    /// second History window (its slot starts empty) and leaves Settings
+    /// orphaned after Quit.
+    fn close_children() {
+        let _ = close_history();
+        SETTINGS_PROCESS.with(|slot| {
+            let _ = terminate_child(slot, "settings window");
+        });
+    }
+
+    /// A guard for the per-target launch bit: clearing it in `Drop` keeps a
+    /// panic in the launch path from permanently blocking the next launch.
+    struct LaunchingGuard(u8);
+
+    impl Drop for LaunchingGuard {
+        fn drop(&mut self) {
+            LAUNCHING.fetch_and(!self.0, Ordering::SeqCst);
+        }
+    }
+
+    fn launch_bit(exe_name: &str) -> u8 {
+        if exe_name.contains("Settings") {
+            1
+        } else {
+            2
+        }
     }
 
     /// Launch a sibling executable from the current exe directory, keeping one
@@ -1346,9 +1442,10 @@ mod win {
     /// The liveness check reads the process handle slot, but that slot is only
     /// written *after* `ShellExecuteExW` returns — and Shell execute can pump
     /// messages on its own thread-reentrant path, so a second click landing
-    /// mid-launch would see an empty slot and spawn a duplicate. The `LAUNCHING`
-    /// flag spans the whole launch (checked + set before, cleared after) so the
-    /// overlapping click no-ops instead. See the `LAUNCHING` note above.
+    /// mid-launch would see an empty slot and spawn a duplicate. A per-target
+    /// bit spans the whole launch (checked + set before, cleared after) so an
+    /// overlapping launch of the same target no-ops while the other child can
+    /// still start.
     fn launch_child(
         exe_name: &str,
         args: Option<&str>,
@@ -1361,16 +1458,16 @@ mod win {
             );
             return false;
         }
-        if LAUNCHING.swap(true, Ordering::SeqCst) {
+        let bit = launch_bit(exe_name);
+        if LAUNCHING.fetch_or(bit, Ordering::SeqCst) & bit != 0 {
             log_event(
                 "INFO",
                 &format!("launch_child {exe_name}: launch already in flight, skipped"),
             );
             return false;
         }
-        let result = launch_child_inner(exe_name, args, slot);
-        LAUNCHING.store(false, Ordering::SeqCst);
-        result
+        let _guard = LaunchingGuard(bit);
+        launch_child_inner(exe_name, args, slot)
     }
 
     fn launch_child_inner(
@@ -1483,6 +1580,9 @@ mod win {
         let verb = utf16("open");
         let target = utf16("cmd.exe");
         let params = windows::core::PCWSTR(cmd_w.as_ptr());
+        // Close child panels first: the new instance starts with empty slots
+        // and would otherwise open a second History window next to the old one.
+        close_children();
         log_event("INFO", "restart_self: scheduling relaunch and exiting");
         unsafe {
             let _ = ShellExecuteW(
@@ -1593,6 +1693,7 @@ mod win {
             id if id == IDM_SETTINGS as u32 => launch_settings(),
             id if id == IDM_RESTART as u32 => restart_self(hwnd),
             id if id == IDM_QUIT as u32 => {
+                close_children();
                 let _ = KillTimer(Some(hwnd), TIMER_SAMPLE);
                 let _ = KillTimer(Some(hwnd), TIMER_MOVE);
                 let _ = KillTimer(Some(hwnd), TIMER_CONFIG);
@@ -1678,28 +1779,30 @@ mod win {
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
-                // Arm one leave-tracking request per enter; the flag keeps
-                // subsequent moves inside the rect from re-posting.
-                if !HOVER.swap(true, Ordering::Relaxed)
-                    && !TRACK_ARMED.swap(true, Ordering::Relaxed)
+                // First move after a leave: arm one-shot leave tracking and
+                // paint the hover pill. If tracking cannot be armed, clear the
+                // hover state so the next move retries instead of leaving the
+                // pill stuck on forever.
+                if !HOVER.swap(true, Ordering::Relaxed) {
                     // SAFETY: the hwnd is live; TME_LEAVE only requests the
                     // one-shot WM_MOUSELEAVE.
-                    && (unsafe {
+                    let armed = unsafe {
                         TrackMouseEvent(&mut TRACKMOUSEEVENT {
                             cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                             dwFlags: TME_LEAVE,
                             hwndTrack: hwnd,
                             dwHoverTime: 0,
                         })
-                    })
-                    .is_ok()
-                {
+                    }
+                    .is_ok();
+                    if !armed {
+                        HOVER.store(false, Ordering::Relaxed);
+                    }
                     render_layered(hwnd);
                 }
                 LRESULT(0)
             }
             WM_MOUSELEAVE => {
-                TRACK_ARMED.store(false, Ordering::Relaxed);
                 PRESSED.store(false, Ordering::Relaxed);
                 if HOVER.swap(false, Ordering::Relaxed) {
                     render_layered(hwnd);
@@ -1707,6 +1810,7 @@ mod win {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                close_children();
                 log_event("INFO", "SysVitals exiting");
                 PostQuitMessage(0);
                 LRESULT(0)
@@ -1908,16 +2012,20 @@ mod win {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
-            // Detect taskbar orientation first, then seed one frame.
+            // Detect taskbar orientation first, then seed one frame. The
+            // orientation-change path inside `reposition` already samples when
+            // the bar is vertical, so only sample here if it did not.
             reposition(hwnd);
-            sample_now(hwnd);
+            if LAST_ROW.with(|l| l.borrow().is_none()) {
+                sample_now(hwnd);
+            }
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             SetTimer(Some(hwnd), TIMER_SAMPLE, interval_ms, None);
             SetTimer(Some(hwnd), TIMER_MOVE, MOVE_MS, None);
             SetTimer(Some(hwnd), TIMER_CONFIG, CONFIG_POLL_MS, None);
 
             let mut msg = MSG::default();
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            while GetMessageW(&mut msg, None, 0, 0) > 0 {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
