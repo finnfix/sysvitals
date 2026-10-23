@@ -1,9 +1,9 @@
 //! macOS display layer: NSStatusItem menu-bar indicator.
 //!
-//! Shows CPU / memory / network stats in the macOS menu bar using
-//! NSStatusItem with the system menu-bar font. Samples periodically via
-//! sysvitals-core, formats with the shared format engine, and updates
-//! the status item title.
+//! Shows CPU / memory / network stats in the macOS menu bar using a
+//! self-drawn template `NSImage` on an `NSStatusItem`. Samples periodically via
+//! sysvitals-core and formats with the shared format engine; AppKit tints the
+//! template from the menu-bar appearance.
 //!
 //! Interaction model (matches Windows):
 //! - Single-click: toggle the history trend chart popup
@@ -33,8 +33,8 @@ mod macos {
         NSTrackingAreaOptions, NSVariableStatusItemLength, NSView,
     };
     use objc2_foundation::{
-        NSAttributedString, NSDictionary, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
-        NSString, NSTimer,
+        NSAttributedString, NSDictionary, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop,
+        NSRunLoopCommonModes, NSSize, NSString, NSTimer,
     };
 
     use sysvitals_core::config::{config_path, history_path};
@@ -139,12 +139,15 @@ mod macos {
         static SAMPLER: RefCell<Option<Sampler>> = const { RefCell::new(None) };
         static CONFIG: RefCell<Config> = RefCell::new(Config::default());
         static STATUS_ITEM: RefCell<Option<Retained<NSStatusItem>>> = const { RefCell::new(None) };
-        static CONFIG_MTIME: RefCell<i64> = const { RefCell::new(0) };
+        /// Last successfully applied config mtime in nanoseconds. Two saves
+        /// inside one second must still be visible to the poller.
+        static CONFIG_MTIME: RefCell<u64> = const { RefCell::new(0) };
+        static CONFIG_ERROR_MTIME: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static MTM: RefCell<Option<MainThreadMarker>> = const { RefCell::new(None) };
         // History store, lazily opened on the first tick so a missing data
         // dir never blocks the indicator (mirrors the Windows overlay).
         static STORE: RefCell<Option<sysvitals_core::Store>> = const { RefCell::new(None) };
-        static STORE_ATTEMPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static STORE_WRITE_ERROR_LOGGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static TICK_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         // The repeating sample timer, kept so the interval can be re-applied
         // when the config file changes it (parity with the Windows overlay,
@@ -183,26 +186,34 @@ mod macos {
         /// unit stepping down) cannot shift the block left/right. Mirrors the
         /// Windows overlay's grow-only window sizing.
         static DRAW_WIDTH_CEIL: RefCell<f64> = const { RefCell::new(0.0) };
+        /// One-shot diagnostic for a dual-row block that still exceeds the
+        /// menu-bar thickness after the automatic font shrink.
+        static DUAL_OVERFLOW_LOGGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Screen rectangle (left, top, right, bottom) in GPUI's global top-left,
-    /// y-downward logical coordinate space, derived from the status item's
-    /// button window. Returns `None` when the button or window is unavailable.
+    /// y-downward logical coordinate space. Uses the button's own bounds in
+    /// screen coordinates (not the whole status-bar window) and converts
+    /// Cocoa's bottom-left global space with the *primary* screen height, so a
+    /// menu bar extra on a secondary display anchors correctly too.
     fn anchor_rect() -> Option<(i64, i64, i64, i64)> {
         let mtm = mtm();
         STATUS_ITEM.with(|si| {
             let item = si.borrow().clone()?;
             let button = item.button(mtm)?;
             let window = button.window()?;
-            let frame = window.frame();
+            let rect = window.convertRectToScreen(button.convertRect_toView(button.bounds(), None));
             let screen = window.screen().or_else(|| NSScreen::mainScreen(mtm))?;
-            let screen_frame = screen.frame();
-            // Cocoa origin is bottom-left with y growing upward; GPUI wants
-            // top-left with y downward, so flip around the screen top edge.
-            let left = frame.origin.x;
-            let top = screen_frame.size.height - (frame.origin.y + frame.size.height);
-            let right = left + frame.size.width;
-            let bottom = top + frame.size.height;
+            let primary_height = NSScreen::screens(mtm)
+                .firstObject()
+                .map(|s| s.frame().size.height)
+                .unwrap_or_else(|| screen.frame().size.height);
+            // Cocoa origin is bottom-left with y growing upward; GPUI/CGDisplay
+            // global space starts at the primary screen's top-left.
+            let left = rect.origin.x;
+            let top = primary_height - (rect.origin.y + rect.size.height);
+            let right = left + rect.size.width;
+            let bottom = top + rect.size.height;
             Some((
                 left.round() as i64,
                 top.round() as i64,
@@ -217,21 +228,52 @@ mod macos {
         MTM.with(|m| m.borrow().expect("MainThreadMarker not set"))
     }
 
-    /// Load or reload the config file, updating the cached mtime.
+    /// Load or reload the config file. The mtime cache only advances after a
+    /// successful parse, so a corrupt file keeps the last good config and is
+    /// retried when it changes again.
     fn reload_config_if_changed() {
-        if let Ok(path) = config_path() {
-            let mtime = std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
+        let Ok(path) = config_path() else {
+            return;
+        };
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
 
-            let prev = CONFIG_MTIME.with(|m| *m.borrow());
-            if mtime != prev {
+        let prev = CONFIG_MTIME.with(|m| *m.borrow());
+        if mtime == prev {
+            return;
+        }
+        match Config::load(&path) {
+            Ok((cfg, _)) => {
                 CONFIG_MTIME.with(|m| *m.borrow_mut() = mtime);
-                if let Ok((cfg, _)) = Config::load(&path) {
-                    CONFIG.with(|c| *c.borrow_mut() = cfg);
+                CONFIG_ERROR_MTIME.set(0);
+                CONFIG.with(|c| *c.borrow_mut() = cfg.clone());
+                // A layout/prefix change should be able to make the item
+                // narrower; grow-only applies to live values, not to an
+                // explicit configuration change.
+                DRAW_WIDTH_CEIL.with(|c| *c.borrow_mut() = 0.0);
+                log_event(
+                    "INFO",
+                    &format!(
+                        "config reloaded: interval={}ms dual_row={} show_resources={} \
+                         show_network={} item_spacing={}px",
+                        cfg.sample.interval_ms,
+                        cfg.display.dual_row,
+                        cfg.display.show_resources,
+                        cfg.display.show_network,
+                        cfg.display.item_spacing,
+                    ),
+                );
+            }
+            Err(e) => {
+                // Keep the last good config and retry on the next mtime
+                // change; log once per broken mtime.
+                if CONFIG_ERROR_MTIME.get() != mtime {
+                    CONFIG_ERROR_MTIME.set(mtime);
+                    log_event("WARN", &format!("config reload failed: {e}"));
                 }
             }
         }
@@ -254,12 +296,13 @@ mod macos {
         // SAFETY: the block captures nothing non-Send and fires on the main run
         // loop, same contract as the other timers here.
         let timer = unsafe {
-            NSTimer::scheduledTimerWithTimeInterval_repeats_block(
-                interval_ms as f64 / 1000.0,
-                true,
-                &block,
-            )
+            NSTimer::timerWithTimeInterval_repeats_block(interval_ms as f64 / 1000.0, true, &block)
         };
+        // Add to common modes, not just the default mode: the context menu's
+        // nested tracking loop would otherwise pause sampling/history while
+        // the menu is open.
+        let run_loop = NSRunLoop::mainRunLoop();
+        unsafe { run_loop.addTimer_forMode(&timer, NSRunLoopCommonModes) };
         // Install the new timer and invalidate the one it replaces so exactly
         // one keeps firing.
         let prev = SAMPLE_TIMER.with(|slot| slot.replace(Some(timer)));
@@ -271,16 +314,19 @@ mod macos {
 
     /// Insert the current CPU/MEM sample into the history database and prune
     /// old rows periodically. Mirrors the Windows overlay: a failed open is
-    /// logged-attempt once and never retried so a broken data dir does not
-    /// spam on every tick. (Without this, macOS never writes history and the
-    /// trend popup would always be empty.)
+    /// retried every 300 ticks; write failures are logged once.
     fn record_history(cfg: &Config, now: i64, snapshot: &sysvitals_core::Snapshot) {
         if !cfg.history.enabled {
             return;
         }
+        let tick = TICK_COUNT.with(|c| {
+            let v = c.get().wrapping_add(1);
+            c.set(v);
+            v
+        });
         STORE.with(|s| {
             let mut guard = s.borrow_mut();
-            if guard.is_none() && !STORE_ATTEMPTED.replace(true) {
+            if guard.is_none() && (tick == 1 || tick % 300 == 0) {
                 if let Ok(path) = history_path() {
                     if let Some(parent) = path.parent() {
                         let _ = std::fs::create_dir_all(parent);
@@ -291,8 +337,6 @@ mod macos {
                             *guard = Some(store);
                         }
                         Err(e) => {
-                            // One-shot: the trend popup would stay empty, so
-                            // this must be diagnosable from the log.
                             log_event(
                                 "WARN",
                                 &format!("history store open failed: {} — {e}", path.display()),
@@ -305,14 +349,17 @@ mod macos {
             if let Some(store) = guard.as_ref() {
                 // Non-finite samples (first/wake ticks) are skipped inside
                 // `insert`; the returned bool is not acted on here.
-                let _ = store.insert(now, snapshot.cpu_pct, snapshot.mem_pct);
-                let tick = TICK_COUNT.with(|c| {
-                    let v = c.get() + 1;
-                    c.set(v);
-                    v
-                });
+                if let Err(e) = store.insert(now, snapshot.cpu_pct, snapshot.mem_pct) {
+                    if !STORE_WRITE_ERROR_LOGGED.replace(true) {
+                        log_event("WARN", &format!("history insert failed: {e}"));
+                    }
+                }
                 if tick % 300 == 0 {
-                    let _ = store.prune(now, cfg.history.retention_days);
+                    if let Err(e) = store.prune(now, cfg.history.retention_days) {
+                        if !STORE_WRITE_ERROR_LOGGED.replace(true) {
+                            log_event("WARN", &format!("history prune failed: {e}"));
+                        }
+                    }
                 }
             }
         });
@@ -362,6 +409,34 @@ mod macos {
         (attr, sz.width, sz.height)
     }
 
+    /// Build the measured runs for the 2x2 dual-row layout. Kept separate so
+    /// the caller can shrink the font and retry if the block exceeds the menu
+    /// bar height.
+    fn layout_dual(row: &FormattedRow, font: &Retained<NSFont>) -> (Vec<RowRun>, f64, f64, f64) {
+        let mut runs: Vec<RowRun> = Vec::with_capacity(row.lines.len());
+        for line in &row.lines {
+            let (la, lw, lh) = make_run(line.left.trim_end(), font);
+            let (ra, rw, rh) = if line.right.is_empty() {
+                (None, 0.0, 0.0)
+            } else {
+                let (a, w, h) = make_run(line.right.trim_end(), font);
+                (Some(a), w, h)
+            };
+            runs.push(RowRun {
+                la,
+                lw,
+                lh,
+                ra,
+                rw,
+                rh,
+            });
+        }
+        let left_w = runs.iter().map(|r| r.lw).fold(0f64, f64::max);
+        let right_w = runs.iter().map(|r| r.rw).fold(0f64, f64::max);
+        let line_h = runs.iter().map(|r| r.lh.max(r.rh)).fold(0f64, f64::max);
+        (runs, left_w, right_w, line_h)
+    }
+
     /// Render the formatted frame into the status item as a self-drawn
     /// template image — the macOS counterpart of the Windows overlay's GDI
     /// painting, giving pixel control over dual-row alignment, item spacing
@@ -385,7 +460,7 @@ mod macos {
         // standard); dual-row uses the 0.75-scaled variant so two lines fit
         // the fixed bar height (same factor as the Windows quadrant).
         let base = NSFont::menuBarFontOfSize(0.0);
-        let font = if dual {
+        let mut font = if dual {
             let scaled = (base.pointSize() * DUAL_ROW_FONT_FACTOR).max(1.0);
             NSFont::menuBarFontOfSize(scaled)
         } else {
@@ -405,31 +480,38 @@ mod macos {
             // both rows' left columns start at x = 0 (left alignment, ②),
             // the right column starts at `left_col_w + item_spacing` (③),
             // and the two-line block is vertically centered in the bar (⑤).
-            let mut runs: Vec<RowRun> = Vec::with_capacity(row.lines.len());
             for line in &row.lines {
-                let (la, lw, lh) = make_run(line.left.trim_end(), &font);
-                let (ra, rw, rh) = if line.right.is_empty() {
-                    (None, 0.0, 0.0)
-                } else {
-                    let (a, w, h) = make_run(line.right.trim_end(), &font);
-                    (Some(a), w, h)
-                };
                 texts.push(line.left.clone());
                 texts.push(line.right.clone());
-                runs.push(RowRun {
-                    la,
-                    lw,
-                    lh,
-                    ra,
-                    rw,
-                    rh,
-                });
             }
-            let left_w = runs.iter().map(|r| r.lw).fold(0f64, f64::max);
-            let right_w = runs.iter().map(|r| r.rw).fold(0f64, f64::max);
-            let line_h = runs.iter().map(|r| r.lh.max(r.rh)).fold(0f64, f64::max);
+            let (mut runs, mut left_w, mut right_w, mut line_h) = layout_dual(row, &font);
             let n = runs.len() as f64;
-            let block_h = line_h * n;
+            let mut block_h = line_h * n;
+            // The system menu-bar thickness is the hard canvas height. If the
+            // 0.75x two-line block still does not fit (e.g. a 22pt reported
+            // thickness on a 24pt bar), shrink once more and re-measure rather
+            // than silently clipping the second row at the image bottom.
+            let mut attempts = 0;
+            while block_h > img_h && attempts < 2 {
+                let factor = (img_h / block_h * 0.98).clamp(0.5, 1.0);
+                font = NSFont::menuBarFontOfSize((font.pointSize() * factor).max(1.0));
+                let laid = layout_dual(row, &font);
+                runs = laid.0;
+                left_w = laid.1;
+                right_w = laid.2;
+                line_h = laid.3;
+                block_h = line_h * n;
+                attempts += 1;
+            }
+            if block_h > img_h && !DUAL_OVERFLOW_LOGGED.replace(true) {
+                log_event(
+                    "WARN",
+                    &format!(
+                        "dual-row block exceeds menu bar: block={block_h:.1} bar={img_h:.1} font={:.2}",
+                        font.pointSize()
+                    ),
+                );
+            }
             let y0 = ((img_h - block_h) / 2.0).max(0.0);
             let right_x = left_w + spacing;
             for (i, r) in runs.iter().enumerate() {
@@ -494,7 +576,8 @@ mod macos {
             next
         });
         let sig = format!(
-            "{dual}|{spacing}|{img_h:.1}|{ceil:.1}|{}",
+            "{dual}|{spacing}|{img_h:.1}|{:.2}|{ceil:.1}|{}",
+            font.pointSize(),
             texts.join("\u{1}")
         );
         if DRAW_SIGNATURE.with(|s| *s.borrow() == sig) {
@@ -540,6 +623,7 @@ mod macos {
     fn tick() {
         reload_config_if_changed();
         reschedule_if_interval_changed();
+        reap_children();
 
         let cfg = CONFIG.with(|c| c.borrow().clone());
         let now = SystemTime::now()
@@ -598,6 +682,61 @@ mod macos {
             },
             None => false,
         }
+    }
+
+    /// Reap children that exited on their own so a long-running indicator does
+    /// not accumulate zombies between launches.
+    fn reap_children() {
+        SETTINGS_CHILD.with(|slot| {
+            let mut borrow = slot.borrow_mut();
+            if let Some(child) = borrow.as_mut() {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    *borrow = None;
+                }
+            }
+        });
+        HISTORY_CHILD.with(|slot| {
+            let mut borrow = slot.borrow_mut();
+            if let Some(child) = borrow.as_mut() {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    *borrow = None;
+                }
+            }
+        });
+    }
+
+    /// Terminate a child panel and reap it so no zombie remains.
+    fn terminate_child(slot: &RefCell<Option<Child>>, label: &str) -> bool {
+        let mut borrow = slot.borrow_mut();
+        let Some(child) = borrow.as_mut() else {
+            return false;
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                *borrow = None;
+                false
+            }
+            _ => {
+                let _ = child.kill();
+                // The kill guarantees a prompt exit; the wait only reaps.
+                let _ = child.wait();
+                *borrow = None;
+                log_event("INFO", &format!("{label} process closed by indicator"));
+                true
+            }
+        }
+    }
+
+    fn close_settings() -> bool {
+        SETTINGS_CHILD.with(|slot| terminate_child(slot, "settings window"))
+    }
+
+    /// Close both child panels on restart/quit. Leaving them alive makes a
+    /// restarted instance open a second History popup and leaves Settings
+    /// orphaned after Quit.
+    fn close_children() {
+        let _ = close_history();
+        let _ = close_settings();
     }
 
     /// Launch the external GPUI settings process (`SysVitalsSettings`), one
@@ -672,37 +811,18 @@ mod macos {
     /// popup was closed; `false` when nothing was running (or it had already
     /// exited, which is reaped here so the slot is free for the next open).
     fn close_history() -> bool {
-        let closed = HISTORY_CHILD.with(|slot| {
-            let mut borrow = slot.borrow_mut();
-            match borrow.as_mut() {
-                Some(child) => match child.try_wait() {
-                    Ok(Some(_status)) => {
-                        *borrow = None;
-                        false
-                    }
-                    _ => {
-                        let _ = child.kill();
-                        // The kill guarantees a prompt exit, so this wait
-                        // cannot block meaningfully; it only reaps.
-                        let _ = child.wait();
-                        *borrow = None;
-                        true
-                    }
-                },
-                None => false,
-            }
-        });
-        if closed {
-            log_event("INFO", "history popup closed by indicator click");
-        }
-        closed
+        HISTORY_CHILD.with(|slot| terminate_child(slot, "history popup"))
     }
 
-    /// Open Activity Monitor (macOS equivalent of Task Manager).
+    /// Open Activity Monitor (macOS equivalent of Task Manager). `status()`
+    /// waits for the short-lived `open` helper, so it cannot leave a zombie.
     fn open_activity_monitor() {
-        let _ = std::process::Command::new("open")
+        if let Err(e) = std::process::Command::new("open")
             .args(["-a", "Activity Monitor"])
-            .spawn();
+            .status()
+        {
+            log_event("WARN", &format!("open Activity Monitor failed: {e}"));
+        }
     }
 
     /// Restart: schedule a delayed relaunch, then exit.
@@ -713,11 +833,15 @@ mod macos {
             return;
         };
         let target_str = target.to_string_lossy().to_string();
-        // Use a background shell that waits 2 seconds then relaunches.
+        // Pass the path as a positional parameter instead of interpolating it
+        // into the shell program: a quote in the install path must not break
+        // the relaunch command.
         let _ = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!("sleep 2 && open '{}'", target_str))
+            .args(["-c", "sleep 2; open \"$1\"", "sh", target_str.as_str()])
             .spawn();
+        // Close child panels before exiting: a restarted instance starts with
+        // empty slots and would otherwise open a second History popup.
+        close_children();
         // Exit current instance.
         let mtm = mtm();
         let app = NSApplication::sharedApplication(mtm);
@@ -781,10 +905,8 @@ mod macos {
             let quit_title = NSString::from_str(t(lang, "menu.quit"));
             let quit_item = NSMenuItem::new(mtm);
             quit_item.setTitle(&quit_title);
-            unsafe { quit_item.setAction(Some(sel!(terminate:))) };
-            // Quit goes through NSApplication itself: `terminate:` is resolved
-            // down the responder chain to the shared app, so this item keeps a
-            // nil target on purpose (the handler does not implement it).
+            unsafe { quit_item.setAction(Some(sel!(quitApp:))) };
+            unsafe { quit_item.setTarget(Some(target)) };
             menu.addItem(&quit_item);
 
             // Pop the menu directly at the button's lower-left corner. The
@@ -855,6 +977,16 @@ mod macos {
             #[unsafe(method(restartApp:))]
             fn restart_app(&self, _sender: Option<&AnyObject>) {
                 restart_self();
+            }
+
+            /// Menu-item action: close child panels, then terminate. Keeping
+            /// the default `terminate:` responder would quit without reaping
+            /// Settings/History.
+            #[unsafe(method(quitApp:))]
+            fn quit_app(&self, _sender: Option<&AnyObject>) {
+                close_children();
+                let mtm = mtm();
+                NSApplication::sharedApplication(mtm).terminate(None);
             }
 
             // Tray-style focus background on hover. The status button already
@@ -978,8 +1110,9 @@ mod macos {
 
         // Keep the handler alive for the process lifetime, addressable so the
         // context menu can name it as the action target (see ACTION_HANDLER).
-        ACTION_HANDLER.with(|h| *h.borrow_mut() = Some(handler.clone()));
-        std::mem::forget(handler);
+        // The stored clone is sufficient; leaking the original as well would
+        // just retain one extra reference forever.
+        ACTION_HANDLER.with(|h| *h.borrow_mut() = Some(handler));
 
         // Store the status item for the tick callback.
         STATUS_ITEM.with(|si| *si.borrow_mut() = Some(status_item));
