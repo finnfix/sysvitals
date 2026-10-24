@@ -242,27 +242,18 @@ fn system_color_hex(color: &objc2_app_kit::NSColor) -> Option<u32> {
 /// pre-material rendering byte-for-byte. Re-runs on every theme change (the
 /// palette reload overwrites it) — the same replay contract as the accent.
 fn apply_material(cx: &mut App) {
-    use sysvitals_core::backdrop::{should_tint, MATERIAL_TINT_ALPHA};
+    use sysvitals_core::backdrop::{material_tint_alpha, should_tint};
     let material = detect_material();
     if !should_tint(material) {
         return;
     }
     UiTheme::update(cx, |theme| {
+        let alpha = material_tint_alpha(theme.mode.is_dark());
         // Force an opaque base before scaling alpha, so the "set" and
         // "multiply" readings of `opacity` agree and the tint does not hinge
         // on the helper's exact semantics.
         let opaque = |c: Hsla| Hsla { a: 1.0, ..c };
-        // The material only reads through when the content layer is
-        // translucent: Windows Mica is a wallpaper tint and the macOS blur is
-        // a live backdrop, and in both cases the pinned platform layer clears
-        // a non-opaque window transparent. Tinting the root surface is what
-        // lets the backdrop show — the material carries the OS color (the
-        // same one a native settings window paints), so the panel matches
-        // without sampling NSColor.windowBackgroundColor (whose
-        // per-appearance resolution needs a deprecated draw-cycle dance we
-        // cannot compile-verify here). `theme.colors.background` is already
-        // the light/dark-correct palette value.
-        theme.colors.background = opaque(theme.colors.background).opacity(MATERIAL_TINT_ALPHA);
+        theme.colors.background = opaque(theme.colors.background).opacity(alpha);
     });
 }
 
@@ -407,6 +398,15 @@ fn apply_theme_and_accent(cx: &mut App) {
     apply_system_theme(cx);
     apply_accent(cx);
     apply_material(cx);
+    // Settings-page typography: the component library defaults to 16px,
+    // which reads larger than the host Settings app. 14px matches the system
+    // settings body; the focus ring is disabled because its 2px outer ring
+    // reads as a heavy border on these compact controls, and clicking outside
+    // a control is handled separately by blurring the window.
+    UiTheme::update(cx, |theme| {
+        theme.font_size = px(14.);
+        theme.focus_ring = false;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -984,7 +984,10 @@ impl Render for SettingsView {
             )
             .child(labeled_row(
                 t(lang, "settings.item_spacing").to_string(),
-                div().w(px(160.)).child(Select::new(&self.spacing_select)),
+                div()
+                    .w(px(160.))
+                    .on_mouse_down_out(|_, window, cx| window.blur(cx))
+                    .child(Select::new(&self.spacing_select)),
             ))
             // --- Layout: only offered where the choice actually exists
             // (Windows 11 with a centered taskbar AND a horizontal bar — the
@@ -997,7 +1000,10 @@ impl Render for SettingsView {
                     .child(section_label(t(lang, "settings.layout").to_string(), dim))
                     .child(labeled_row(
                         t(lang, "settings.anchor").to_string(),
-                        div().w(px(240.)).child(Select::new(&self.anchor_select)),
+                        div()
+                            .w(px(240.))
+                            .on_mouse_down_out(|_, window, cx| window.blur(cx))
+                            .child(Select::new(&self.anchor_select)),
                     ))
             })
             .when(
@@ -1019,7 +1025,10 @@ impl Render for SettingsView {
                         } else {
                             t(lang, "settings.left_margin").to_string()
                         },
-                        div().w(px(160.)).child(Select::new(&self.margin_select)),
+                        div()
+                            .w(px(160.))
+                            .on_mouse_down_out(|_, window, cx| window.blur(cx))
+                            .child(Select::new(&self.margin_select)),
                     ))
                 },
             )
@@ -1111,7 +1120,12 @@ fn prefix_cell(label: String, input: &Entity<InputState>, faint: Hsla) -> impl I
         .flex_1()
         .gap_1()
         .child(div().text_xs().text_color(faint).child(label))
-        .child(Input::new(input).w_full())
+        .child(
+            div()
+                .w_full()
+                .on_mouse_down_out(|_, window, cx| window.blur(cx))
+                .child(Input::new(input).w_full()),
+        )
 }
 
 /// Load the config, backing up a malformed file before falling back to
