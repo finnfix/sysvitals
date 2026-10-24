@@ -1139,7 +1139,8 @@ mod win {
             return;
         };
 
-        let (tr, tg, tb) = if theme_is_light() {
+        let light_theme = theme_is_light();
+        let (tr, tg, tb) = if light_theme {
             (0u32, 0u32, 0u32)
         } else {
             (255u32, 255u32, 255u32)
@@ -1147,13 +1148,19 @@ mod win {
         let px = bits as *mut u32;
         // Tray-style focus pill (hover / pressed background): while the
         // pointer is over the indicator, or a button is held down on it, a
-        // white rounded rect at a low alpha paints under the text, imitating
-        // the shell's own tray/clock highlight in both light and dark themes.
+        // rounded rect paints under the text, imitating the shell's own
+        // tray/clock highlight. The tint follows the taskbar appearance:
+        // a dark wash on the light taskbar, a light wash on the dark one.
         // Idle (`pill_a == 0`) the composition is byte-for-byte the previous
         // output: no pill pixels, glyphs as before.
         let pill_a: u32 = {
             // Pressed and "popup open" share the stronger tint; hover gets
-            // the lighter one; idle (0) composites exactly as before.
+            // the lighter one; idle (0) composites exactly as before. The
+            // alphas are deliberately lower than the first white-pill pass:
+            // at 40/72 the highlight read brighter than the shell's own
+            // buttons on both taskbar themes.
+            let (hover_alpha, pressed_alpha): (u32, u32) =
+                if light_theme { (14, 28) } else { (22, 40) };
             let popup_open = HISTORY_PROCESS.with(|slot| {
                 slot.borrow().as_ref().is_some_and(|h| {
                     !h.is_invalid() && {
@@ -1166,17 +1173,16 @@ mod win {
                 })
             });
             if PRESSED.load(Ordering::Relaxed) || popup_open {
-                72
+                pressed_alpha
             } else if HOVER.load(Ordering::Relaxed) {
-                40
+                hover_alpha
             } else {
                 0
             }
         };
         // The tray focuses the whole clock/button area, not just the glyphs:
-        // use the full window minus a small inset and paint it white in both
-        // themes. Windows' light taskbar uses a light overlay; reusing the
-        // glyph color here would paint a dark pill in light mode.
+        // use the full window minus a small inset. The pill reuses the glyph
+        // color, which is also the correct wash for the host taskbar theme.
         let inset = 2i32.min(w / 4).min(h / 4).max(0);
         let pw = (w - 2 * inset).max(0);
         let ph = (h - 2 * inset).max(0);
