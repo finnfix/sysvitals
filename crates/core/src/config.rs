@@ -74,8 +74,9 @@ pub struct DisplayConfig {
     /// pixels. One of [`ALLOWED_ITEM_SPACING_PX`]; anything else snaps to the
     /// nearest allowed value via `sanitize`.
     pub item_spacing: u32,
-    /// Dual-row (2x2 quadrant) layout. Cross-platform: Windows renders it in
-    /// the taskbar overlay; macOS will render it in the menu bar (Phase 4).
+    /// Dual-row (2x2 quadrant) layout, on by default. Cross-platform:
+    /// Windows renders it in the taskbar overlay; macOS renders it in the
+    /// menu bar.
     pub dual_row: bool,
     pub prefix: PrefixConfig,
 }
@@ -139,7 +140,7 @@ impl Default for DisplayConfig {
             show_network: true,
             theme: Theme::Auto,
             item_spacing: DEFAULT_ITEM_SPACING_PX,
-            dual_row: false,
+            dual_row: true,
             prefix: PrefixConfig::default(),
         }
     }
@@ -430,7 +431,7 @@ mod tests {
         assert_eq!(c.display.prefix.cpu, "CPU:");
         assert_eq!(c.display.prefix.up, "U:");
         assert_eq!(c.windows.anchor, Anchor::Right);
-        assert!(!c.display.dual_row);
+        assert!(c.display.dual_row);
         assert_eq!(c.history.retention_days, 30);
         assert_eq!(c.display.item_spacing, DEFAULT_ITEM_SPACING_PX);
         assert_eq!(c.windows.left_margin_px, DEFAULT_LEFT_MARGIN_PX);

@@ -460,7 +460,8 @@ mod tests {
 
     #[test]
     fn single_row_layout() {
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        cfg.display.dual_row = false;
         let f = format_frame(&snap(29.0, 68.0, 1.2 * MB, 314.0 * KB), &cfg);
         assert_eq!(f.lines.len(), 1);
         assert_eq!(
@@ -474,7 +475,8 @@ mod tests {
         // Item spacing is now a pixel value applied by the display layer, so
         // the core exposes the individual metric strings (`items`) for the
         // single-row layout instead of baking a space count into the text.
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        cfg.display.dual_row = false;
         let f = format_frame(&snap(29.0, 68.0, 1024.0, 2048.0), &cfg);
         assert_eq!(
             f.items,
@@ -482,6 +484,7 @@ mod tests {
         );
         // The fallback joined string is stable regardless of item_spacing.
         let mut cfg2 = Config::default();
+        cfg2.display.dual_row = false;
         cfg2.display.item_spacing = 24;
         let f2 = format_frame(&snap(29.0, 68.0, 1024.0, 2048.0), &cfg2);
         assert_eq!(f2.items, f.items);
@@ -504,6 +507,7 @@ mod tests {
         // Resources and network are each one toggle: turning off a group hides
         // both of its metrics at once.
         let mut cfg = Config::default();
+        cfg.display.dual_row = false;
         cfg.display.show_resources = false;
         let f = format_frame(&snap(29.0, 68.0, 1024.0, 2048.0), &cfg);
         let text = f.lines[0].render();
@@ -511,6 +515,7 @@ mod tests {
         assert!(text.starts_with("U: "));
 
         let mut cfg2 = Config::default();
+        cfg2.display.dual_row = false;
         cfg2.display.show_network = false;
         let f2 = format_frame(&snap(29.0, 68.0, 1024.0, 2048.0), &cfg2);
         assert_eq!(f2.lines[0].render(), "CPU: 29%  MEM: 68%");
@@ -550,11 +555,13 @@ mod tests {
 
     #[test]
     fn nan_values_show_placeholder() {
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        cfg.display.dual_row = false;
         let f = format_frame(&snap(f64::NAN, f64::NAN, f64::NAN, f64::NAN), &cfg);
         assert_eq!(f.lines[0].render(), "CPU: --%  MEM: --%  U: --  D: --");
         // And the whole group disappears when its paired toggle is off.
         let mut c2 = Config::default();
+        c2.display.dual_row = false;
         c2.display.show_network = false;
         let f2 = format_frame(&snap(f64::NAN, f64::NAN, f64::NAN, f64::NAN), &c2);
         assert_eq!(f2.lines[0].render(), "CPU: --%  MEM: --%");
@@ -575,6 +582,7 @@ mod tests {
     #[test]
     fn custom_and_empty_prefix() {
         let mut cfg = Config::default();
+        cfg.display.dual_row = false;
         cfg.display.prefix.cpu = "".to_string();
         cfg.display.prefix.up = "↑".to_string();
         let f = format_frame(&snap(29.0, 68.0, 1024.0, 0.0), &cfg);
