@@ -1492,7 +1492,7 @@ mod win {
             Some(a) => format!("\"{exe_path}\" {a}"),
             None => format!("\"{exe_path}\""),
         });
-        let mut si = STARTUPINFOW {
+        let si = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
             ..Default::default()
         };
@@ -2044,7 +2044,7 @@ mod win {
             SetTimer(Some(hwnd), TIMER_CONFIG, CONFIG_POLL_MS, None);
 
             let mut msg = MSG::default();
-            while GetMessageW(&mut msg, None, 0, 0) > 0 {
+            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
