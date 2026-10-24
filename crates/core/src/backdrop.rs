@@ -81,6 +81,21 @@ pub fn choose_macos_material(transparency_enabled: bool) -> Material {
 /// wallpaper tint legible while text stays readable on both palettes.
 pub const MATERIAL_TINT_ALPHA: f32 = 0.55;
 
+/// Dark-mode tint alpha. The dark palette itself is already a dark layer; at
+/// 0.55 it hides most of the Mica wallpaper tint (on-device: light mode looked
+/// right, dark mode looked flat). 0.40 keeps body text readable while letting
+/// the dark Mica tint through.
+pub const MATERIAL_TINT_ALPHA_DARK: f32 = 0.40;
+
+/// Pick the tint alpha for the current palette mode.
+pub fn material_tint_alpha(dark: bool) -> f32 {
+    if dark {
+        MATERIAL_TINT_ALPHA_DARK
+    } else {
+        MATERIAL_TINT_ALPHA
+    }
+}
+
 /// Whether the material needs the theme background tinted translucent.
 /// `Opaque` never tints, so the fallback path keeps the pre-material
 /// appearance untouched.
@@ -147,5 +162,11 @@ mod tests {
         assert!(!should_tint(Material::Opaque));
         assert!(should_tint(Material::Mica));
         assert!(should_tint(Material::Blur));
+    }
+
+    #[test]
+    fn dark_mode_uses_a_clearer_tint() {
+        assert_eq!(material_tint_alpha(false), MATERIAL_TINT_ALPHA);
+        assert_eq!(material_tint_alpha(true), MATERIAL_TINT_ALPHA_DARK);
     }
 }
