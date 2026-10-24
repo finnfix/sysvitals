@@ -38,7 +38,7 @@ use sysvitals_core::backdrop::Material;
 use sysvitals_core::config::{
     ALLOWED_INTERVAL_MS, ALLOWED_ITEM_SPACING_PX, ALLOWED_LEFT_MARGIN_PX,
 };
-use sysvitals_core::{t, Anchor, Config, Language, Theme};
+use sysvitals_core::{Anchor, Config, Language, Theme, t};
 
 // ---------------------------------------------------------------------------
 // Platform gate for the layout section
@@ -649,31 +649,33 @@ impl SettingsView {
         // `update` on purpose: on macOS `system_accent_hex` reads AppKit
         // (`controlAccentColor`), which belongs to the main thread — the same
         // thread `update` runs on.
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(500))
-                .await;
-            let alive = this
-                .update(cx, |view: &mut SettingsView, cx| {
-                    let current = system_accent_hex();
-                    if current == view.last_accent {
-                        return true;
-                    }
-                    view.last_accent = current;
-                    if current.is_some() {
-                        apply_accent(cx);
-                    } else {
-                        // The OS moved back to "multicolor" (or the accent
-                        // probe failed): reload the palette so the old accent
-                        // override is removed.
-                        apply_theme_and_accent(cx);
-                    }
-                    cx.notify();
-                    true
-                })
-                .unwrap_or(false);
-            if !alive {
-                break;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                let alive = this
+                    .update(cx, |view: &mut SettingsView, cx| {
+                        let current = system_accent_hex();
+                        if current == view.last_accent {
+                            return true;
+                        }
+                        view.last_accent = current;
+                        if current.is_some() {
+                            apply_accent(cx);
+                        } else {
+                            // The OS moved back to "multicolor" (or the accent
+                            // probe failed): reload the palette so the old accent
+                            // override is removed.
+                            apply_theme_and_accent(cx);
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
             }
         })
         .detach();
