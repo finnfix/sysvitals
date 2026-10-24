@@ -42,7 +42,7 @@ mod win {
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
     use std::sync::{OnceLock, RwLock};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use sysvitals_core::format::FormattedRow;
     use sysvitals_core::{
@@ -70,9 +70,10 @@ mod win {
         REG_VALUE_TYPE,
     };
     use windows::Win32::System::SystemInformation::GetLocalTime;
-    use windows::Win32::System::Threading::CreateMutexW;
-    use windows::Win32::System::Threading::TerminateProcess;
-    use windows::Win32::System::Threading::WaitForSingleObject;
+    use windows::Win32::System::Threading::{
+        CreateMutexW, CreateProcessW, TerminateProcess, WaitForSingleObject, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
     use windows::Win32::UI::HiDpi::{
         GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -81,8 +82,8 @@ mod win {
         TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
     };
     use windows::Win32::UI::Shell::{
-        SHAppBarMessage, ShellExecuteExW, ShellExecuteW, ABE_LEFT, ABE_RIGHT, ABM_GETSTATE,
-        ABM_GETTASKBARPOS, ABS_AUTOHIDE, APPBARDATA, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+        SHAppBarMessage, ShellExecuteW, ABE_LEFT, ABE_RIGHT, ABM_GETSTATE, ABM_GETTASKBARPOS,
+        ABS_AUTOHIDE, APPBARDATA,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -90,12 +91,12 @@ mod win {
         GetWindowLongPtrW, GetWindowRect, IsWindowVisible, KillTimer, MoveWindow, PostMessageW,
         PostQuitMessage, RegisterClassExW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
         SystemParametersInfoW, TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, CS_HREDRAW,
-        CS_VREDRAW, GWL_EXSTYLE, HWND_TOPMOST, MF_STRING, MSG, NONCLIENTMETRICSW, SM_CXSCREEN,
-        SM_CYSCREEN, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
-        SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
-        WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NULL,
-        WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        CS_VREDRAW, GWL_EXSTYLE, HWND_TOPMOST, MF_SEPARATOR, MF_STRING, MSG, NONCLIENTMETRICSW,
+        SM_CXSCREEN, SM_CYSCREEN, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+        ULW_ALPHA, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     };
 
     // ------------------------------------------------------------------ consts
@@ -1146,9 +1147,9 @@ mod win {
         let px = bits as *mut u32;
         // Tray-style focus pill (hover / pressed background): while the
         // pointer is over the indicator, or a button is held down on it, a
-        // rounded rect in the glyph color at a low alpha paints under the
-        // text, imitating how the shell tints its own tray buttons. Idle
-        // (`pill_a == 0`) the composition is byte-for-byte the previous
+        // white rounded rect at a low alpha paints under the text, imitating
+        // the shell's own tray/clock highlight in both light and dark themes.
+        // Idle (`pill_a == 0`) the composition is byte-for-byte the previous
         // output: no pill pixels, glyphs as before.
         let pill_a: u32 = {
             // Pressed and "popup open" share the stronger tint; hover gets
@@ -1165,35 +1166,26 @@ mod win {
                 })
             });
             if PRESSED.load(Ordering::Relaxed) || popup_open {
-                64
+                72
             } else if HOVER.load(Ordering::Relaxed) {
-                32
+                40
             } else {
                 0
             }
         };
-        // Pill geometry follows the measured content, not the grow-only
-        // window width: a value that once needed more horizontal space must
-        // not leave a permanent oversized hover chip.
-        let want_w_1x = (fm.want_w / SS).max(1);
-        let single_row = fm.item_widths.is_some();
-        let content_left = if single_row {
-            (w - want_w_1x) / 2
-        } else {
-            pad / SS
-        };
-        let content_right = content_left + want_w_1x;
+        // The tray focuses the whole clock/button area, not just the glyphs:
+        // use the full window minus a small inset and paint it white in both
+        // themes. Windows' light taskbar uses a light overlay; reusing the
+        // glyph color here would paint a dark pill in light mode.
         let inset = 2i32.min(w / 4).min(h / 4).max(0);
-        let pill_left = content_left + inset;
-        let pill_right = content_right - inset;
-        let pw = (pill_right - pill_left).max(0);
+        let pw = (w - 2 * inset).max(0);
         let ph = (h - 2 * inset).max(0);
         let radius = (pw.min(ph) / 2).min(8);
         // Half-extents of the pill's straight-sided core; the rounded-rect
         // SDF below measures distance against them plus `radius`.
         let hx = (pw - 2 * radius).max(0) as f32 / 2.0;
         let hy = (ph - 2 * radius).max(0) as f32 / 2.0;
-        let pcx = (pill_left + pill_right) as f32 / 2.0;
+        let pcx = inset as f32 + pw as f32 / 2.0;
         let pcy = inset as f32 + ph as f32 / 2.0;
         for y in 0..h {
             for x in 0..w {
@@ -1220,11 +1212,11 @@ mod win {
                     // taskbar.
                     *px.add((y * w + x) as usize) = 0x0100_0000;
                 } else {
-                    // Source-over with the glyph on top of the pill; channels
-                    // stay premultiplied for `AC_SRC_ALPHA` (both layers share
-                    // the glyph color, so one blend factor per channel).
+                    // Source-over with the glyph on top of the white pill;
+                    // channels stay premultiplied for `AC_SRC_ALPHA`.
                     let a = cov + pa * (255 - cov) / 255;
-                    let mix = |c: u32| (c * cov / 255) + (c * pa / 255) * (255 - cov) / 255;
+                    let mix =
+                        |glyph: u32| (glyph * cov / 255) + (255 * pa / 255) * (255 - cov) / 255;
                     *px.add((y * w + x) as usize) =
                         (a << 24) | (mix(tr) << 16) | (mix(tg) << 8) | mix(tb);
                 }
@@ -1494,30 +1486,54 @@ mod win {
                 args.map(|a| format!(" {a}")).unwrap_or_default()
             ),
         );
-        let path_w = utf16(&exe_path);
-        let verb = utf16("open");
-        let args_w = args.map(utf16);
-        let mut sei = SHELLEXECUTEINFOW {
-            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-            fMask: SEE_MASK_NOCLOSEPROCESS,
-            lpVerb: windows::core::PCWSTR(verb.as_ptr()),
-            lpFile: windows::core::PCWSTR(path_w.as_ptr()),
-            lpParameters: args_w
-                .as_ref()
-                .map(|a| windows::core::PCWSTR(a.as_ptr()))
-                .unwrap_or(windows::core::PCWSTR::null()),
-            nShow: SW_SHOWNORMAL.0,
+        let exe_w = utf16(&exe_path);
+        let dir_w = utf16(&dir);
+        let mut cmdline = utf16(&match args {
+            Some(a) => format!("\"{exe_path}\" {a}"),
+            None => format!("\"{exe_path}\""),
+        });
+        let mut si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
             ..Default::default()
         };
-        if unsafe { ShellExecuteExW(&mut sei) }.is_err() {
-            log_event(
-                "WARN",
-                &format!("launch_child: ShellExecuteExW failed for {exe_name}"),
-            );
-            return false;
+        let mut pi = PROCESS_INFORMATION::default();
+        let started = Instant::now();
+        // CreateProcessW launches the sibling directly: the Shell execute path
+        // used before can pump messages and adds shell lookup overhead. The
+        // child is a GUI-subsystem binary, so no console/STARTUPINFO window
+        // fields are needed.
+        let result = unsafe {
+            CreateProcessW(
+                windows::core::PCWSTR(exe_w.as_ptr()),
+                Some(windows::core::PWSTR(cmdline.as_mut_ptr())),
+                None,
+                None,
+                false,
+                Default::default(),
+                None,
+                windows::core::PCWSTR(dir_w.as_ptr()),
+                &si,
+                &mut pi,
+            )
+        };
+        match result {
+            Ok(()) => {
+                let _ = unsafe { CloseHandle(pi.hThread) };
+                *slot.borrow_mut() = Some(pi.hProcess);
+                log_event(
+                    "INFO",
+                    &format!("launched {exe_name} in {}ms", started.elapsed().as_millis()),
+                );
+                true
+            }
+            Err(e) => {
+                log_event(
+                    "WARN",
+                    &format!("launch_child: CreateProcessW failed for {exe_name}: {e}"),
+                );
+                false
+            }
         }
-        *slot.borrow_mut() = Some(sei.hProcess);
-        true
     }
 
     /// Launch the external settings process (`SysVitalsSettings.exe`).
@@ -1648,6 +1664,9 @@ mod win {
             IDM_SETTINGS,
             windows::core::PCWSTR(settings.as_ptr()),
         );
+        // Separate the frequent commands (system viewer / settings) from the
+        // lifecycle actions, matching the native shell/tray menu grouping.
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
         let _ = AppendMenuW(
             menu,
             MF_STRING,
