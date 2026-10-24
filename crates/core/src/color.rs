@@ -6,6 +6,15 @@
 //! is far brighter than a mid-blue, so an HSL threshold paints white text on
 //! it. This module keeps that decision pure and unit-testable.
 
+/// Convert a Windows `ABGR` color DWORD (the byte order used by the
+/// Explorer accent registry values) into a packed `0xRRGGBB` color.
+///
+/// The alpha byte is dropped: the accent is meaningful independently of the
+/// translucency flag Windows stores alongside it.
+pub fn abgr_to_rgb(abgr: u32) -> u32 {
+    ((abgr & 0xFF) << 16) | (abgr & 0xFF00) | ((abgr >> 16) & 0xFF)
+}
+
 /// WCAG relative luminance of a packed `0xRRGGBB` color.
 pub fn relative_luminance(hex: u32) -> f64 {
     fn linearize(channel: u8) -> f64 {
@@ -56,6 +65,15 @@ mod tests {
     fn black_and_white_land_on_opposite_sides() {
         assert!(!prefers_dark_foreground(0x000000));
         assert!(prefers_dark_foreground(0xFFFFFF));
+    }
+
+    #[test]
+    fn explorer_accent_abgr_is_unpacked_to_rgb() {
+        // 0xAABBGGRR: Windows stores the accent as ABGR, so a gold accent
+        // (#867215) is written as 0xFF157286.
+        assert_eq!(abgr_to_rgb(0xFF15_7286), 0x0086_7215);
+        // Default Windows blue #0078D4 is stored as ABGR 0xFFD47800.
+        assert_eq!(abgr_to_rgb(0xFFD4_7800), 0x0000_78D4);
     }
 
     #[test]
