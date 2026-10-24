@@ -20,6 +20,10 @@
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
 };
+#[cfg(windows)]
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+};
 
 use gpui_kit::component::button::*;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -192,6 +196,17 @@ fn detect_material() -> Material {
 #[cfg(target_os = "macos")]
 fn detect_material() -> Material {
     sysvitals_core::backdrop::choose_macos_material(true)
+}
+
+/// Windows 11 ships Segoe UI Variable, whose default optical size is tuned
+/// for UI text and renders small sizes more crisply than the legacy Segoe UI.
+/// Older builds keep the system-resolved font; an unavailable family falls
+/// back through GPUI's default stack.
+#[cfg(windows)]
+fn panel_font_family() -> Option<&'static str> {
+    os_build_number()
+        .filter(|build| *build >= 22000)
+        .map(|_| "Segoe UI Variable")
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -398,14 +413,19 @@ fn apply_theme_and_accent(cx: &mut App) {
     apply_system_theme(cx);
     apply_accent(cx);
     apply_material(cx);
-    // Settings-page typography: the component library defaults to 16px,
-    // which reads larger than the host Settings app. 14px matches the system
-    // settings body; the focus ring is disabled because its 2px outer ring
-    // reads as a heavy border on these compact controls, and clicking outside
-    // a control is handled separately by blurring the window.
+    // Typography: keep the library's 16px rem base so its 0.875rem controls
+    // (buttons, inputs, selects, dropdown rows) land on 14px, matching the
+    // option labels on the left — the render root pins body text to that
+    // 14px size. The focus ring is disabled because its 2px outer ring reads
+    // as a heavy border on these compact controls, and clicking outside a
+    // control is handled separately by blurring the window.
     UiTheme::update(cx, |theme| {
-        theme.font_size = px(14.);
+        theme.font_size = px(16.);
         theme.focus_ring = false;
+        #[cfg(windows)]
+        if let Some(family) = panel_font_family() {
+            theme.font_family = family.into();
+        }
     });
 }
 
@@ -919,6 +939,7 @@ impl Render for SettingsView {
             .size_full()
             .p_4()
             .gap_2()
+            .text_size(px(14.))
             .overflow_y_scrollbar()
             // --- General ---
             .child(section_label(t(lang, "settings.general").to_string(), dim))
@@ -1149,6 +1170,14 @@ fn load_config_with_backup() -> Config {
 }
 
 fn main() {
+    // GPUI does not declare DPI awareness itself. Without this the process
+    // is treated as DPI-unaware and Windows bitmap-stretches the whole window
+    // on a scaled display, which is what makes the text look soft.
+    #[cfg(windows)]
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
     let cfg = load_config_with_backup();
 
     // macOS: run as a regular foreground app so opening the settings window
