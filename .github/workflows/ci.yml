@@ -38,91 +38,122 @@ jobs:
   # ---------------------------------------------------------------------------
   # Build gate + distribution packaging.
   #
-  # Each platform crate can only compile with its own OS toolchain (MSVC on
-  # windows-latest, Xcode on macos-latest), so these runners exist to prove the
-  # display layers still build and to produce the shippable archives. They do
-  # not repeat the quality checks: the logic they depend on is already covered
-  # by the quality job.
+  # Both platform jobs run an architecture matrix: Windows x64/arm64 and
+  # macOS arm64/x64. Each leg cross-compiles with an explicit Rust target, so
+  # the runner's host architecture never decides the package architecture.
+  # These jobs do not repeat the quality checks: the logic they depend on is
+  # already covered by the quality job.
   # ---------------------------------------------------------------------------
   build-windows:
-    name: Build & package (Windows)
+    name: Build & package (Windows ${{ matrix.arch }})
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-tags: true
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - name: Build Windows display layer
-        run: cargo build --locked --release -p app-win
+        run: cargo build --locked --release --target ${{ matrix.target }} -p app-win
       - name: Build GPUI settings window
-        run: cargo build --locked --release -p app-settings
+        run: cargo build --locked --release --target ${{ matrix.target }} -p app-settings
       - name: Build GPUI history chart
-        run: cargo build --locked --release -p app-history
-      # Portable (green) distribution: overlay exe plus the settings/history
-      # exes when present. Package name: SysVitals_Windows_x64_v{version}_{short-hash}_dev.zip
-      # (Windows ships x64 only); the version is read from the workspace
-      # Cargo.toml (single source of truth) and the commit stamp from
-      # `git rev-parse --short HEAD`, matching the build identifier shown in
-      # the settings window footer. The `_dev` suffix marks a
-      # development-phase build: these artifacts are not releases, and the
-      # suffix is dropped when the first tagged version is published.
+        run: cargo build --locked --release --target ${{ matrix.target }} -p app-history
+      # Portable (green) distribution: one SysVitals/ directory containing the
+      # overlay, settings and history executables plus LICENSE. Package name:
+      # SysVitals_Windows_{arch}_v{version}_{short-hash}_dev.zip. The version
+      # comes from the workspace Cargo.toml and the commit stamp from
+      # `git rev-parse --short HEAD`, matching the settings footer. The `_dev`
+      # suffix marks a development-phase build and is dropped at the first
+      # tagged release.
       - name: Package Windows portable zip
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           $commit = (git rev-parse --short HEAD)
-          $zip = "SysVitals_Windows_x64_v${version}_${commit}_dev.zip"
+          $arch = "${{ matrix.arch }}"
+          $target = "${{ matrix.target }}"
+          $zip = "SysVitals_Windows_${arch}_v${version}_${commit}_dev.zip"
+          $stage = "SysVitals"
+          Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $stage | Out-Null
           $files = @(
-            "target/release/SysVitals.exe",
-            "target/release/SysVitalsSettings.exe",
-            "target/release/SysVitalsHistory.exe"
+            "target/$target/release/SysVitals.exe",
+            "target/$target/release/SysVitalsSettings.exe",
+            "target/$target/release/SysVitalsHistory.exe",
+            "LICENSE"
           )
           foreach ($f in $files) {
             if (!(Test-Path $f)) { throw "missing build output: $f" }
+            Copy-Item -Path $f -Destination $stage
           }
-          Compress-Archive -Path $files -DestinationPath $zip
+          Compress-Archive -Path $stage -DestinationPath $zip -Force
           Write-Host "Packaged $zip"
       - name: Upload Windows portable package
         uses: actions/upload-artifact@v4
         with:
-          name: SysVitals-windows-x64
-          path: SysVitals_Windows_x64_*.zip
+          name: SysVitals-windows-${{ matrix.arch }}
+          path: SysVitals_Windows_${{ matrix.arch }}_*.zip
           if-no-files-found: error
 
   build-macos:
-    name: Build & package (macOS)
+    name: Build & package (macOS ${{ matrix.arch }})
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+          - arch: x64
+            target: x86_64-apple-darwin
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-tags: true
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      # Apple Silicon only: the explicit target pin keeps the package arm64
-      # no matter which arch the runner image happens to be.
+        with:
+          key: ${{ matrix.target }}
       - name: Build macOS display layer
-        run: cargo build --locked --release --target aarch64-apple-darwin -p app-mac
+        run: cargo build --locked --release --target ${{ matrix.target }} -p app-mac
       - name: Build GPUI settings window
-        run: cargo build --locked --release --target aarch64-apple-darwin -p app-settings
+        run: cargo build --locked --release --target ${{ matrix.target }} -p app-settings
       - name: Build GPUI history chart
-        run: cargo build --locked --release --target aarch64-apple-darwin -p app-history
+        run: cargo build --locked --release --target ${{ matrix.target }} -p app-history
       # One bundle, not three apps: the indicator is the declared
       # CFBundleExecutable, and the settings/history binaries are sibling
       # executables it launches from Contents/MacOS. Package name:
-      # SysVitals_macOS_arm64_v{version}_{short-hash}_dev.zip (macOS ships
-      # Apple Silicon only); the version is read from the workspace Cargo.toml
-      # and the commit stamp from `git rev-parse --short HEAD`, matching the
-      # Windows step. The `_dev` suffix marks a development-phase build and is
-      # dropped at the first tagged release.
+      # SysVitals_macOS_{arch}_v{version}_{short-hash}_dev.zip. The version is
+      # read from the workspace Cargo.toml and the commit stamp from
+      # `git rev-parse --short HEAD`, matching the Windows step. The bundle
+      # also carries LICENSE under Contents/Resources. The `_dev` suffix marks
+      # a development-phase build and is dropped at the first tagged release.
       - name: Package macOS app bundle
         run: |
           version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           commit=$(git rev-parse --short HEAD)
+          arch="${{ matrix.arch }}"
+          target="${{ matrix.target }}"
           app="SysVitals.app"
-          bin="target/aarch64-apple-darwin/release"
+          bin="target/$target/release"
+          rm -rf "$app"
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
           for f in sysvitals SysVitalsSettings SysVitalsHistory; do
             if [ ! -f "$bin/$f" ]; then
@@ -135,15 +166,18 @@ jobs:
           cp "$bin/SysVitalsHistory" "$app/Contents/MacOS/SysVitalsHistory"
           cp crates/app-mac/assets/Info.plist "$app/Contents/Info.plist"
           cp crates/app-mac/assets/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
+          cp LICENSE "$app/Contents/Resources/LICENSE"
           # The plist is a template; substitute the workspace version and a
           # numeric build number so Finder/Get Info never shows a stale 0.0.0.
+          # `github.run_number` is monotonic even on the default shallow clone;
+          # `git rev-list --count HEAD` would always be 1 there.
           plutil -replace CFBundleShortVersionString -string "$version" "$app/Contents/Info.plist"
-          plutil -replace CFBundleVersion -string "$(git rev-list --count HEAD)" "$app/Contents/Info.plist"
-          zip -qr "SysVitals_macOS_arm64_v${version}_${commit}_dev.zip" "$app"
-          echo "Packaged SysVitals_macOS_arm64_v${version}_${commit}_dev.zip"
+          plutil -replace CFBundleVersion -string "${{ github.run_number }}" "$app/Contents/Info.plist"
+          zip -qr "SysVitals_macOS_${arch}_v${version}_${commit}_dev.zip" "$app"
+          echo "Packaged SysVitals_macOS_${arch}_v${version}_${commit}_dev.zip"
       - name: Upload macOS app bundle
         uses: actions/upload-artifact@v4
         with:
-          name: SysVitals-macos-arm64
-          path: SysVitals_macOS_arm64_*.zip
+          name: SysVitals-macos-${{ matrix.arch }}
+          path: SysVitals_macOS_${{ matrix.arch }}_*.zip
           if-no-files-found: error
