@@ -275,10 +275,12 @@ fn apply_material(cx: &mut App) {
 /// The system accent color packed as `0x00RRGGBB`, or `None` when it should
 /// not be used at all.
 ///
-/// Windows exposes the accent picker's choice through
-/// `DwmGetColorizationColor`, which returns an ARGB DWORD. The opaque flag
-/// is ignored: even when translucency effects are on, the RGB channels are
-/// the same accent the Settings app paints with.
+/// Windows stores the accent the Settings app itself paints with in
+/// `Explorer\Accent\AccentColorMenu` (ABGR). That value changes as soon as
+/// the picker is confirmed. `DwmGetColorizationColor` is only a fallback: it
+/// reports the DWM colorization blend, which can lag behind the picker and
+/// is darkened by the transparency/color-prevalence mix, so it does not
+/// always match the accent Windows paints on its own controls.
 ///
 /// macOS follows only an *explicit* choice: `AppleAccentColor` in the
 /// standard defaults is present exactly when the user picked a specific
@@ -292,13 +294,17 @@ fn apply_material(cx: &mut App) {
 /// with light/dark, so no appearance resolution is needed.
 #[cfg(windows)]
 fn system_accent_hex() -> Option<u32> {
+    const ACCENT_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Accent";
+    if let Some(abgr) = hkcu_dword(ACCENT_KEY, "AccentColorMenu") {
+        return Some(sysvitals_core::color::abgr_to_rgb(abgr));
+    }
+    // Older or unusual configurations may not have the Explorer value; the
+    // DWM colorization color is still a usable approximation.
     use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
     let mut argb = 0u32;
-    // The opaque-blend flag is not read (the accent color is meaningful
-    // whether or not translucency effects are on). Written via
-    // `Default::default()` so the code does not name the `BOOL` type: in
-    // windows-core 0.62 that is a plain `pub type BOOL = i32` alias, and
-    // naming it as `BOOL(0)` would compile as a tuple-struct constructor
+    // Written via `Default::default()` so the code does not name the `BOOL`
+    // type: in windows-core 0.62 that is a plain `pub type BOOL = i32` alias,
+    // and naming it as `BOOL(0)` would compile as a tuple-struct constructor
     // (E0423). `Default` covers both aliases and newtypes.
     let opaque_result = unsafe { DwmGetColorizationColor(&mut argb, &mut Default::default()) };
     opaque_result.ok()?;
@@ -391,6 +397,16 @@ fn apply_accent(cx: &mut App) {
         theme.colors.primary_foreground = foreground;
         theme.colors.button_primary_foreground = foreground;
         theme.colors.ring = base;
+        // Keep the library's dropdown selection in the same accent family as
+        // the rest of the system controls. The stock palette paints the
+        // selected row blue no matter which accent the user picked.
+        theme.colors.list_active = Hsla {
+            a: if theme.mode.is_dark() { 0.26 } else { 0.16 },
+            ..base
+        };
+        theme.colors.list_active_border = base;
+        theme.colors.selection = Hsla { a: 0.30, ..base };
+        theme.colors.caret = base;
     });
 }
 
@@ -423,8 +439,27 @@ fn apply_theme_and_accent(cx: &mut App) {
         theme.font_size = px(16.);
         theme.focus_ring = false;
         #[cfg(windows)]
-        if let Some(family) = panel_font_family() {
-            theme.font_family = family.into();
+        {
+            if let Some(family) = panel_font_family() {
+                theme.font_family = family.into();
+            }
+            let dark = theme.mode.is_dark();
+            // WinUI control strokes and flyout surfaces. The library's
+            // neutral-200/neutral-950 pair is much flatter than the Windows
+            // Settings controls, which draw a visible stroke around a
+            // subtly-filled input and a lighter flyout than the page behind
+            // it.
+            theme.colors.input = if dark {
+                hsla(0., 0., 1., 0.30)
+            } else {
+                hsla(0., 0., 0., 0.26)
+            };
+            theme.colors.popover = if dark {
+                hsla(0., 0., 0.17, 1.)
+            } else {
+                hsla(0., 0., 0.976, 1.)
+            };
+            theme.colors.popover_foreground = theme.colors.foreground;
         }
     });
 }
@@ -772,14 +807,24 @@ impl SettingsView {
     }
 }
 
-/// A section heading: small, semibold, dimmed.
+/// A section heading: WinUI group headers are 12px semibold and muted.
 fn section_label(text: String, dim: Hsla) -> impl IntoElement {
-    div().text_sm().font_semibold().text_color(dim).child(text)
+    div().text_xs().font_semibold().text_color(dim).child(text)
 }
 
-/// A hairline separator between sections.
-fn divider(border: Hsla) -> impl IntoElement {
-    div().h(px(1.)).bg(border).my_1()
+/// A Windows Settings-style card surface: rounded, subtly filled, and only
+/// wide enough to group its rows. The fill lets the Mica backdrop show
+/// through while giving the rows the same "card" separation the OS uses.
+fn settings_card(bg: Hsla) -> Div {
+    v_flex().w_full().rounded(px(8.)).bg(bg).p_3().gap_1()
+}
+
+/// A section heading paired with its card at the tight 4px label gap.
+fn settings_section(title: String, card: impl IntoElement, dim: Hsla) -> impl IntoElement {
+    v_flex()
+        .gap_1()
+        .child(section_label(title, dim))
+        .child(card)
 }
 
 /// Blur the window when a mouse-down occurs outside `element`. Used around
@@ -790,13 +835,23 @@ fn blur_on_outside(element: Div) -> Div {
 }
 
 /// A labelled control row: title on the left, a wrapped tile group on the
-/// right.
+/// right. Centered vertically like a WinUI settings row.
 fn labeled_row(title: String, control: impl IntoElement) -> impl IntoElement {
     h_flex()
         .justify_between()
-        .items_start()
+        .items_center()
         .gap_4()
-        .py_1()
+        .py_2()
+        .child(title)
+        .child(control)
+}
+
+/// A labelled on/off row with the WinUI row height.
+fn switch_row(title: String, control: impl IntoElement) -> impl IntoElement {
+    h_flex()
+        .justify_between()
+        .items_center()
+        .py_2()
         .child(title)
         .child(control)
 }
@@ -846,7 +901,6 @@ impl Render for SettingsView {
         // the builder-chain argument positions).
         let dim = cx.theme().foreground.opacity(0.5);
         let faint = cx.theme().foreground.opacity(0.4);
-        let border = cx.theme().border;
 
         // --- Flattened (segmented) option rows for small choice sets: every
         // choice is a visible tile, the active one carries the primary style.
@@ -935,14 +989,58 @@ impl Render for SettingsView {
             );
         }
 
-        v_flex()
-            .size_full()
-            .p_4()
-            .gap_2()
-            .text_size(px(14.))
-            .overflow_y_scrollbar()
-            // --- General ---
-            .child(section_label(t(lang, "settings.general").to_string(), dim))
+        // Style the dropdown triggers/inputs like Windows Settings: a filled
+        // control brush, a visible 1px stroke and the WinUI 4px corner. The
+        // per-element overrides win over the component's internal appearance
+        // (its style refinement is applied last). Other hosts keep the
+        // library look.
+        let control: Option<(Hsla, Hsla, f32)> = {
+            #[cfg(windows)]
+            {
+                let dark = cx.theme().mode.is_dark();
+                let (bg, border) = if dark {
+                    (hsla(0., 0., 1., 0.06), hsla(0., 0., 1., 0.30))
+                } else {
+                    (hsla(0., 0., 1., 0.72), hsla(0., 0., 0., 0.26))
+                };
+                Some((bg, border, 4.0))
+            }
+            #[cfg(not(windows))]
+            {
+                None
+            }
+        };
+        let mut spacing_select = Select::new(&self.spacing_select);
+        let mut margin_select = Select::new(&self.margin_select);
+        let mut anchor_select = Select::new(&self.anchor_select);
+        if let Some((bg, border, radius)) = control {
+            spacing_select = spacing_select
+                .bg(bg)
+                .border_color(border)
+                .rounded(px(radius));
+            margin_select = margin_select
+                .bg(bg)
+                .border_color(border)
+                .rounded(px(radius));
+            anchor_select = anchor_select
+                .bg(bg)
+                .border_color(border)
+                .rounded(px(radius));
+        }
+
+        let dark = cx.theme().mode.is_dark();
+        // Shared card surface for both hosts. The library's `group_box` token
+        // is neutral-950 in dark mode — the same value as the page background
+        // — so using it would make the macOS cards disappear. A translucent
+        // neutral lift follows each platform's grouped-settings look while
+        // leaving the actual WinUI control chrome Windows-gated.
+        let card_bg = if dark {
+            hsla(0., 0., 1., 0.06)
+        } else {
+            hsla(0., 0., 1., 0.55)
+        };
+
+        let general_card = settings_card(card_bg)
             .child(labeled_row(
                 t(lang, "settings.language").to_string(),
                 lang_row,
@@ -954,112 +1052,76 @@ impl Render for SettingsView {
             .when(cfg!(not(target_os = "macos")), |this| {
                 // Offered only where the choice is actually honored. On
                 // macOS the indicator title is drawn by AppKit, which picks
-                // its own color from the menu-bar appearance; the `theme`
-                // field is read there by nothing but the startup log line, so
-                // the picker would be a dead control. The Windows overlay
-                // repaints pure white / pure black glyphs from it directly.
+                // its own color from the menu-bar appearance.
                 this.child(labeled_row(
                     t(lang, "settings.theme").to_string(),
                     theme_row,
                 ))
-            })
-            // --- Display ---
-            .child(divider(border))
-            .child(section_label(t(lang, "settings.display").to_string(), dim))
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .py_1()
-                    .child(t(lang, "settings.dual_row").to_string())
-                    .child(
-                        Switch::new("dual-row")
-                            .checked(self.dual_row)
-                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                this.dual_row = *checked;
-                                this.save(cx);
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .py_1()
-                    .child(t(lang, "settings.group_resources").to_string())
-                    .child(
-                        Switch::new("show-res")
-                            .checked(self.show_resources)
-                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                this.set_resources(*checked);
-                                this.save(cx);
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .py_1()
-                    .child(t(lang, "settings.group_network").to_string())
-                    .child(Switch::new("show-net").checked(self.show_network).on_click(
-                        cx.listener(|this, checked: &bool, _, cx| {
-                            this.set_network(*checked);
-                            this.save(cx);
-                            cx.notify();
-                        }),
-                    )),
-            )
+            });
+
+        let display_card = settings_card(card_bg)
+            .child(switch_row(
+                t(lang, "settings.dual_row").to_string(),
+                Switch::new("dual-row")
+                    .checked(self.dual_row)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.dual_row = *checked;
+                        this.save(cx);
+                        cx.notify();
+                    })),
+            ))
+            .child(switch_row(
+                t(lang, "settings.group_resources").to_string(),
+                Switch::new("show-res")
+                    .checked(self.show_resources)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.set_resources(*checked);
+                        this.save(cx);
+                        cx.notify();
+                    })),
+            ))
+            .child(switch_row(
+                t(lang, "settings.group_network").to_string(),
+                Switch::new("show-net")
+                    .checked(self.show_network)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.set_network(*checked);
+                        this.save(cx);
+                        cx.notify();
+                    })),
+            ))
             .child(labeled_row(
                 t(lang, "settings.item_spacing").to_string(),
-                blur_on_outside(div().w(px(160.))).child(Select::new(&self.spacing_select)),
-            ))
-            // --- Layout: only offered where the choice actually exists
-            // (Windows 11 with a centered taskbar AND a horizontal bar — the
-            // far-left anchor concept does not apply to a vertical bar).
-            // The margin row additionally appears when the far-left anchor is
-            // selected OR the taskbar is vertical (on a vertical bar the value
-            // offsets the indicator from the bar's top edge).
-            .when(self.layout_available && !self.vertical_taskbar, |this| {
-                this.child(divider(border))
-                    .child(section_label(t(lang, "settings.layout").to_string(), dim))
-                    .child(labeled_row(
-                        t(lang, "settings.anchor").to_string(),
-                        blur_on_outside(div().w(px(240.))).child(Select::new(&self.anchor_select)),
-                    ))
-            })
-            .when(
-                (self.layout_available && self.anchor_idx == 1 && !self.vertical_taskbar)
-                    || self.vertical_taskbar,
-                |this| {
-                    // The anchor section above is shown only when
-                    // `layout_available && !vertical_taskbar`. Whenever it is
-                    // hidden, the margin row stands alone and needs its own
-                    // divider to separate it from the display group.
-                    let standalone = !(self.layout_available && !self.vertical_taskbar);
-                    let mut this = this;
-                    if standalone {
-                        this = this.child(divider(border));
-                    }
-                    this.child(labeled_row(
-                        if self.vertical_taskbar {
-                            t(lang, "settings.top_margin").to_string()
-                        } else {
-                            t(lang, "settings.left_margin").to_string()
-                        },
-                        blur_on_outside(div().w(px(160.))).child(Select::new(&self.margin_select)),
-                    ))
+                blur_on_outside(div().w(px(160.))).child(spacing_select),
+            ));
+
+        // One layout card holds the anchor and margin rows together; either
+        // row may be hidden by the platform/taskbar shape, but they read as a
+        // single group when both apply.
+        let mut layout_card = settings_card(card_bg);
+        let mut show_layout = false;
+        if self.layout_available && !self.vertical_taskbar {
+            layout_card = layout_card.child(labeled_row(
+                t(lang, "settings.anchor").to_string(),
+                blur_on_outside(div().w(px(240.))).child(anchor_select),
+            ));
+            show_layout = true;
+        }
+        let show_margin = (self.layout_available && self.anchor_idx == 1 && !self.vertical_taskbar)
+            || self.vertical_taskbar;
+        if show_margin {
+            layout_card = layout_card.child(labeled_row(
+                if self.vertical_taskbar {
+                    t(lang, "settings.top_margin").to_string()
+                } else {
+                    t(lang, "settings.left_margin").to_string()
                 },
-            )
-            // --- Prefixes: a 2x2 grid (CPU / MEM on the first row, upload /
-            // download on the second). Each cell is a labelled field column:
-            // caption above, input below. Inputs flex to their column so the
-            // grid fills the window width; row/cell gaps keep it airy without
-            // wasting vertical space.
-            .child(divider(border))
-            .child(section_label(t(lang, "settings.prefixes").to_string(), dim))
+                blur_on_outside(div().w(px(160.))).child(margin_select),
+            ));
+            show_layout = true;
+        }
+
+        let prefix_card = settings_card(card_bg)
             .child(
                 v_flex()
                     .gap_3()
@@ -1070,11 +1132,13 @@ impl Render for SettingsView {
                                 t(lang, "settings.cpu").to_string(),
                                 &self.prefix_cpu,
                                 faint,
+                                control,
                             ))
                             .child(prefix_cell(
                                 t(lang, "settings.mem").to_string(),
                                 &self.prefix_mem,
                                 faint,
+                                control,
                             )),
                     )
                     .child(
@@ -1084,11 +1148,13 @@ impl Render for SettingsView {
                                 t(lang, "settings.upload").to_string(),
                                 &self.prefix_up,
                                 faint,
+                                control,
                             ))
                             .child(prefix_cell(
                                 t(lang, "settings.download").to_string(),
                                 &self.prefix_down,
                                 faint,
+                                control,
                             )),
                     ),
             )
@@ -1097,7 +1163,36 @@ impl Render for SettingsView {
                     .text_xs()
                     .text_color(faint)
                     .child(t(lang, "settings.prefix_hint").to_string()),
-            )
+            );
+
+        v_flex()
+            .size_full()
+            .p_4()
+            .gap_3()
+            .text_size(px(14.))
+            .overflow_y_scrollbar()
+            .child(settings_section(
+                t(lang, "settings.general").to_string(),
+                general_card,
+                dim,
+            ))
+            .child(settings_section(
+                t(lang, "settings.display").to_string(),
+                display_card,
+                dim,
+            ))
+            .when(show_layout, |this| {
+                this.child(settings_section(
+                    t(lang, "settings.layout").to_string(),
+                    layout_card,
+                    dim,
+                ))
+            })
+            .child(settings_section(
+                t(lang, "settings.prefixes").to_string(),
+                prefix_card,
+                dim,
+            ))
             .when(self.save_failed.get(), |this| {
                 this.child(
                     div()
@@ -1107,13 +1202,8 @@ impl Render for SettingsView {
                         .child(t(lang, "settings.save_failed").to_string()),
                 )
             })
-            // --- Version footer: pinned to the bottom of the scrollable
-            // column (mt_auto absorbs the leftover space when the content is
-            // shorter than the window). Built from `SV_BUILD_ID`, injected by
-            // this crate's build script as `v{semver}_{short-hash} (dev)` for
-            // a git checkout, or plain `v{semver}` once `git describe`
-            // resolves a tag (release builds). Dev shells built with
-            // SV_BUILD_ID unset show the bare crate version.
+            // Version footer: pinned to the bottom of the scrollable column
+            // and built from `SV_BUILD_ID` (see the const below).
             .child(
                 div()
                     .mt_auto()
@@ -1136,12 +1226,21 @@ const SV_BUILD_ID: &str = match option_env!("SV_BUILD_ID") {
 /// One prefix cell of the settings 2x2 grid: a dim caption above a flexible
 /// text input. Takes the entity by reference so the render borrow survives
 /// the child call.
-fn prefix_cell(label: String, input: &Entity<InputState>, faint: Hsla) -> impl IntoElement {
+fn prefix_cell(
+    label: String,
+    input: &Entity<InputState>,
+    faint: Hsla,
+    control: Option<(Hsla, Hsla, f32)>,
+) -> impl IntoElement {
+    let mut field = Input::new(input).w_full();
+    if let Some((bg, border, radius)) = control {
+        field = field.bg(bg).border_color(border).rounded(px(radius));
+    }
     v_flex()
         .flex_1()
         .gap_1()
         .child(div().text_xs().text_color(faint).child(label))
-        .child(blur_on_outside(div().w_full()).child(Input::new(input).w_full()))
+        .child(blur_on_outside(div().w_full()).child(field))
 }
 
 /// Load the config, backing up a malformed file before falling back to
