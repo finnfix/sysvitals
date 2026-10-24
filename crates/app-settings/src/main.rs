@@ -762,6 +762,14 @@ fn divider(border: Hsla) -> impl IntoElement {
     div().h(px(1.)).bg(border).my_1()
 }
 
+/// Blur the window when a mouse-down occurs outside `element`. Used around
+/// inputs/selects so their focus border disappears when the user clicks any
+/// other part of the settings page (GPUI keeps focus otherwise).
+fn blur_on_outside(mut element: Div) -> Div {
+    element.on_mouse_down_out(|_, window, cx| window.blur(cx));
+    element
+}
+
 /// A labelled control row: title on the left, a wrapped tile group on the
 /// right.
 fn labeled_row(title: String, control: impl IntoElement) -> impl IntoElement {
@@ -986,10 +994,7 @@ impl Render for SettingsView {
             )
             .child(labeled_row(
                 t(lang, "settings.item_spacing").to_string(),
-                div()
-                    .w(px(160.))
-                    .on_mouse_down_out(|_, window, cx| window.blur(cx))
-                    .child(Select::new(&self.spacing_select)),
+                blur_on_outside(div().w(px(160.))).child(Select::new(&self.spacing_select)),
             ))
             // --- Layout: only offered where the choice actually exists
             // (Windows 11 with a centered taskbar AND a horizontal bar — the
@@ -1002,10 +1007,7 @@ impl Render for SettingsView {
                     .child(section_label(t(lang, "settings.layout").to_string(), dim))
                     .child(labeled_row(
                         t(lang, "settings.anchor").to_string(),
-                        div()
-                            .w(px(240.))
-                            .on_mouse_down_out(|_, window, cx| window.blur(cx))
-                            .child(Select::new(&self.anchor_select)),
+                        blur_on_outside(div().w(px(240.))).child(Select::new(&self.anchor_select)),
                     ))
             })
             .when(
@@ -1027,10 +1029,7 @@ impl Render for SettingsView {
                         } else {
                             t(lang, "settings.left_margin").to_string()
                         },
-                        div()
-                            .w(px(160.))
-                            .on_mouse_down_out(|_, window, cx| window.blur(cx))
-                            .child(Select::new(&self.margin_select)),
+                        blur_on_outside(div().w(px(160.))).child(Select::new(&self.margin_select)),
                     ))
                 },
             )
@@ -1122,12 +1121,7 @@ fn prefix_cell(label: String, input: &Entity<InputState>, faint: Hsla) -> impl I
         .flex_1()
         .gap_1()
         .child(div().text_xs().text_color(faint).child(label))
-        .child(
-            div()
-                .w_full()
-                .on_mouse_down_out(|_, window, cx| window.blur(cx))
-                .child(Input::new(input).w_full()),
-        )
+        .child(blur_on_outside(div().w_full()).child(Input::new(input).w_full()))
 }
 
 /// Load the config, backing up a malformed file before falling back to
