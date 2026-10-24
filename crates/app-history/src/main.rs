@@ -16,6 +16,11 @@ use std::collections::HashSet;
 use std::env;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use windows::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
+
 use chrono::{DateTime, Local};
 use gpui_kit::component::button::*;
 use gpui_kit::component::chart::AreaChart;
@@ -1035,6 +1040,17 @@ fn os_build_number() -> Option<u32> {
     Some(info.dwBuildNumber)
 }
 
+/// Windows 11 ships Segoe UI Variable, whose default optical size is tuned
+/// for UI text and renders small sizes more crisply than the legacy Segoe UI.
+/// Older builds keep the system-resolved font; an unavailable family falls
+/// back through GPUI's default stack.
+#[cfg(windows)]
+fn panel_font_family() -> Option<&'static str> {
+    os_build_number()
+        .filter(|build| *build >= 22000)
+        .map(|_| "Segoe UI Variable")
+}
+
 /// The backdrop this Windows host supports, honoring the transparency-effects
 /// preference. Same rule as app-settings, fed by the same probes; the pure
 /// threshold decision lives in core.
@@ -1135,9 +1151,25 @@ fn apply_theme_and_accent(cx: &mut App) {
     apply_system_theme(cx);
     apply_accent(cx);
     apply_material(cx);
+    // Win11's Segoe UI Variable has an optical-size axis tuned for UI text;
+    // the palette reload above may reset the family, so re-apply it here.
+    #[cfg(windows)]
+    UiTheme::update(cx, |theme| {
+        if let Some(family) = panel_font_family() {
+            theme.font_family = family.into();
+        }
+    });
 }
 
 fn main() {
+    // GPUI does not declare DPI awareness itself. Without this the process
+    // is treated as DPI-unaware and Windows bitmap-stretches the whole window
+    // on a scaled display, which is what makes the text look soft.
+    #[cfg(windows)]
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
     let cfg = match config_path().and_then(|p| Config::load(&p).map(|(c, _)| c)) {
         Ok(cfg) => cfg,
         Err(e) => {
