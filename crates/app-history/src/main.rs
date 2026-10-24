@@ -1227,13 +1227,13 @@ fn main() {
             None
         } else {
             Some(TitlebarOptions {
-                title: Some(window_title.clone()),
+                title: Some(window_title.clone().into()),
                 ..Default::default()
             })
         };
         #[cfg(not(target_os = "macos"))]
         let titlebar = Some(TitlebarOptions {
-            title: Some(window_title.clone()),
+            title: Some(window_title.clone().into()),
             appears_transparent: anchored,
             ..Default::default()
         });
