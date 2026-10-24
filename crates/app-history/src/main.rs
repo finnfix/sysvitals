@@ -14,8 +14,14 @@
 
 use std::collections::HashSet;
 use std::env;
+#[cfg(windows)]
+use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+#[cfg(windows)]
+use windows::Win32::System::Threading::{OpenEventW, WaitForSingleObject, EVENT_ALL_ACCESS};
 #[cfg(windows)]
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -81,29 +87,80 @@ fn anchor_work_area(anchor: &AnchorRect, cx: &App) -> Bounds<Pixels> {
     );
     cx.displays()
         .into_iter()
-        .find(|display| display.visible_bounds().contains(&probe))
+        // The indicator lies inside the taskbar/menu bar, i.e. outside the
+        // *work* area. Match against the full monitor bounds first, then use
+        // that monitor's work area for placement; otherwise a secondary
+        // taskbar would fall back to the primary display.
+        .find(|display| display.bounds().contains(&probe))
+        .or_else(|| {
+            cx.displays()
+                .into_iter()
+                .find(|display| display.visible_bounds().contains(&probe))
+        })
         .or_else(|| cx.primary_display())
         .map(|display| display.visible_bounds())
         .unwrap_or_else(|| Bounds::new(point(px(0.), px(0.)), size(px(1280.), px(720.))))
 }
 
-/// Origin for the popup, anchored to the indicator rect: horizontally
-/// centered on it, vertically preferred below and flipped above when it
-/// would not fit, finally clamped into the work area.
+/// Origin for the popup. The indicator sits inside the taskbar/menu bar,
+/// which is *outside* the work area, so anchoring to `anchor.top - gap`
+/// leaves almost no visual gap to the bar. Place the popup relative to the
+/// work-area edge instead, with the same breathing room the shell's own
+/// tray flyouts use. The bar side is inferred from the anchor being outside
+/// the work area on that edge.
 fn anchor_origin(
     anchor: &AnchorRect,
     size_w: f32,
     size_h: f32,
     work: &Bounds<Pixels>,
 ) -> Point<Pixels> {
-    let gap = 6.0f32;
+    /// Logical gap between the popup and the taskbar/menu-bar edge.
+    const TRAY_POPUP_GAP: f32 = 8.0;
+
     let work_left = f32::from(work.origin.x);
     let work_right = work_left + f32::from(work.size.width);
     let work_top = f32::from(work.origin.y);
     let work_bottom = work_top + f32::from(work.size.height);
+    let clamp_x = |x: f32| x.max(work_left).min((work_right - size_w).max(work_left));
+    let clamp_y = |y: f32| y.max(work_top).min((work_bottom - size_h).max(work_top));
+    let center_x = (anchor.left + anchor.right) * 0.5;
+    let center_y = (anchor.top + anchor.bottom) * 0.5;
 
-    let below = anchor.bottom + gap;
-    let above = anchor.top - gap - size_h;
+    // The bar is below/above/left/right of the work area when the indicator
+    // rect lies beyond that edge.
+    let bar_below = anchor.top >= work_bottom - 1.0 && anchor.bottom > work_bottom;
+    let bar_above = anchor.bottom <= work_top + 1.0 && anchor.top < work_top;
+    let bar_left = anchor.right <= work_left + 1.0;
+    let bar_right = anchor.left >= work_right - 1.0;
+
+    if bar_below {
+        return point(
+            px(clamp_x(center_x - size_w * 0.5)),
+            px((work_bottom - TRAY_POPUP_GAP - size_h).max(work_top)),
+        );
+    }
+    if bar_above {
+        return point(
+            px(clamp_x(center_x - size_w * 0.5)),
+            px((work_top + TRAY_POPUP_GAP).min((work_bottom - size_h).max(work_top))),
+        );
+    }
+    if bar_left {
+        return point(
+            px((work_left + TRAY_POPUP_GAP).min(work_right - size_w)),
+            px(clamp_y(center_y - size_h * 0.5)),
+        );
+    }
+    if bar_right {
+        return point(
+            px((work_right - TRAY_POPUP_GAP - size_w).max(work_left)),
+            px(clamp_y(center_y - size_h * 0.5)),
+        );
+    }
+
+    // Fallback for a free-floating indicator: prefer below, then above.
+    let below = anchor.bottom + TRAY_POPUP_GAP;
+    let above = anchor.top - TRAY_POPUP_GAP - size_h;
     let y = if below + size_h <= work_bottom {
         below
     } else if above >= work_top {
@@ -111,15 +168,7 @@ fn anchor_origin(
     } else {
         (work_bottom - size_h).max(work_top)
     };
-
-    let mut x = (anchor.left + anchor.right) * 0.5 - size_w * 0.5;
-    if x + size_w > work_right {
-        x = work_right - size_w;
-    }
-    if x < work_left {
-        x = work_left;
-    }
-    point(px(x), px(y))
+    point(px(clamp_x(center_x - size_w * 0.5)), px(y))
 }
 
 /// Time range options for the chart.
@@ -241,6 +290,10 @@ fn transparent_color() -> Hsla {
 
 struct HistoryView {
     lang: Language,
+    /// Created hidden by the hover pre-warm; do not claim activation on the
+    /// first (offscreen) frame. The show signal activates it later.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    prewarm: bool,
     range: TimeRange,
     buckets: Vec<Bucket>,
     csv_scope: CsvScope,
@@ -279,9 +332,10 @@ struct HistoryView {
 }
 
 impl HistoryView {
-    fn new(lang: Language, csv_scope: CsvScope, cx: &mut Context<Self>) -> Self {
+    fn new(lang: Language, csv_scope: CsvScope, prewarm: bool, cx: &mut Context<Self>) -> Self {
         let mut view = Self {
             lang,
+            prewarm,
             range: TimeRange::Hour1,
             buckets: Vec::new(),
             csv_scope,
@@ -401,7 +455,7 @@ impl HistoryView {
         // key-window lifecycle, unverified at runtime, and the bug was only
         // ever reproduced on Windows.
         #[cfg(windows)]
-        if !self.ever_active {
+        if !self.ever_active && !self.prewarm {
             window.activate_window();
             // If activation completed synchronously, the observer below will
             // not see an edge; seed the guard from the post-activation state.
@@ -785,14 +839,14 @@ impl Render for HistoryView {
         let header = h_flex()
             .justify_between()
             .items_center()
-            .mb_2()
             .child(
                 div()
-                    .text_base()
+                    .text_sm()
                     .font_semibold()
                     .child(t(lang, "chart.title").to_string()),
             )
             .child(h_flex().gap_2().child(range_buttons).child(copy_btn));
+        let header_divider = div().h(px(1.)).bg(cx.theme().border.opacity(0.6));
 
         // One merged chart for both series. AreaChart accumulates one entry
         // per `y`/`stroke`/`fill`/`name` call in order, so two of each give
@@ -857,7 +911,7 @@ impl Render for HistoryView {
                     .child(div().w(px(8.)).h(px(8.)).rounded(px(4.)).bg(cpu_color()))
                     .child(
                         div()
-                            .text_sm()
+                            .text_xs()
                             .text_color(cx.theme().foreground.opacity(0.7))
                             .child(t(lang, "chart.cpu").to_string()),
                     ),
@@ -869,7 +923,7 @@ impl Render for HistoryView {
                     .child(div().w(px(8.)).h(px(8.)).rounded(px(4.)).bg(mem_color()))
                     .child(
                         div()
-                            .text_sm()
+                            .text_xs()
                             .text_color(cx.theme().foreground.opacity(0.7))
                             .child(t(lang, "chart.mem").to_string()),
                     ),
@@ -878,8 +932,9 @@ impl Render for HistoryView {
         v_flex()
             .size_full()
             .p_4()
-            .gap_3()
+            .gap_2()
             .child(header)
+            .child(header_divider)
             .child(legend)
             .child(merged_chart)
     }
@@ -891,19 +946,26 @@ impl Render for HistoryView {
 // ---------------------------------------------------------------------------
 
 /// The system accent color packed as `0x00RRGGBB`, or `None` when it should
-/// not be used at all. Windows reads `DwmGetColorizationColor` (the ARGB
-/// DWORD; opaque flag ignored — the RGB channels are the same accent the
-/// Settings app paints with). macOS follows only an *explicit* choice:
-/// `AppleAccentColor` in the standard defaults is present exactly when the
-/// user picked a specific accent (Graphite included) and absent under the
-/// default "multicolor / auto" mode, where AppKit derives the accent from
-/// the wallpaper. Staying absent under auto keeps the library look; the
-/// check is presence-only on purpose so a future key-reshuffle degrades to
-/// the safe path, not to a wrong color. When present,
-/// `NSColor.controlAccentColor` reflects the user's pick without any
+/// not be used at all. Windows reads the Explorer `AccentColorMenu` value
+/// (ABGR) — the accent the Settings app itself paints with, updated as soon
+/// as the picker is confirmed — and only falls back to
+/// `DwmGetColorizationColor` when that value is absent. The DWM colorization
+/// blend can lag and can be darkened by the transparency/color-prevalence
+/// mix, so it does not always match the system accent. macOS follows only an
+/// *explicit* choice: `AppleAccentColor` in the standard defaults is present
+/// exactly when the user picked a specific accent (Graphite included) and
+/// absent under the default "multicolor / auto" mode, where AppKit derives
+/// the accent from the wallpaper. Staying absent under auto keeps the
+/// library look; the check is presence-only on purpose so a future
+/// key-reshuffle degrades to the safe path, not to a wrong color. When
+/// present, `NSColor.controlAccentColor` reflects the user's pick without any
 /// light/dark resolution. See app-settings for the same shape.
 #[cfg(windows)]
 fn system_accent_hex() -> Option<u32> {
+    const ACCENT_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Accent";
+    if let Some(abgr) = hkcu_dword(ACCENT_KEY, "AccentColorMenu") {
+        return Some(sysvitals_core::color::abgr_to_rgb(abgr));
+    }
     use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
     let mut argb = 0u32;
     // `Default::default()` avoids naming the `BOOL` type: in windows-core
@@ -972,6 +1034,15 @@ fn apply_accent(cx: &mut App) {
         theme.colors.primary_foreground = foreground;
         theme.colors.button_primary_foreground = foreground;
         theme.colors.ring = base;
+        // Match the accent used by the active dropdown row / text selection
+        // instead of the palette's fixed blue.
+        theme.colors.list_active = Hsla {
+            a: if theme.mode.is_dark() { 0.26 } else { 0.16 },
+            ..base
+        };
+        theme.colors.list_active_border = base;
+        theme.colors.selection = Hsla { a: 0.30, ..base };
+        theme.colors.caret = base;
     });
 }
 
@@ -1181,6 +1252,9 @@ fn main() {
     let lang = cfg.display.language;
     let csv_scope = cfg.history.csv_scope;
     let window_title = format!("SysVitals {}", t(lang, "chart.title"));
+    // Windows pre-warm: the overlay starts this process on indicator hover
+    // and reveals it through a named event when the user clicks.
+    let prewarm = cfg!(windows) && env::args().any(|arg| arg == "--prewarm");
 
     // Register the bundled icon asset source before the run loop starts.
     // Without this the GPUI default asset source (`()`) returns `Ok(None)`
@@ -1287,7 +1361,8 @@ fn main() {
             // purely a compositor attribute — it does not change the window's
             // activation edges, so the blur-close contract is untouched.
             window_background: backdrop_for(detect_material()),
-            focus: true,
+            show: !prewarm,
+            focus: !prewarm,
             ..Default::default()
         };
 
@@ -1295,9 +1370,61 @@ fn main() {
         // first render pass (both idempotent); Esc is handled by an
         // app-level keystroke observer set up in `HistoryView::new`. The
         // build closure only needs to create the view.
-        gpui_kit::open_window(window_options, cx, move |_window, cx| {
-            cx.new(|cx| HistoryView::new(lang, csv_scope, cx))
-        })
-        .expect("Failed to open history window");
+        let (window_handle, _view) =
+            gpui_kit::open_window(window_options, cx, move |_window, cx| {
+                cx.new(|cx| HistoryView::new(lang, csv_scope, prewarm, cx))
+            })
+            .expect("Failed to open history window");
+
+        #[cfg(windows)]
+        if prewarm {
+            cx.spawn(async move |cx| {
+                let name: Vec<u16> = sysvitals_core::HISTORY_PREWARM_EVENT
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let event = unsafe {
+                    OpenEventW(
+                        EVENT_ALL_ACCESS,
+                        false,
+                        windows::core::PCWSTR(name.as_ptr()),
+                    )
+                };
+                let Ok(event) = event else {
+                    // No launcher to wait for: never leave an invisible
+                    // process behind.
+                    let _ = cx.update(|app| {
+                        window_handle.update(app, |_, window, _| window.remove_window())
+                    });
+                    return;
+                };
+                let started = Instant::now();
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(15))
+                        .await;
+                    if unsafe { WaitForSingleObject(event, 0) } == WAIT_OBJECT_0 {
+                        let _ = cx.update(|app| {
+                            window_handle.update(app, |_, window, _| {
+                                window.activate_window();
+                            })
+                        });
+                        break;
+                    }
+                    if started.elapsed() > Duration::from_secs(20) {
+                        // Nobody clicked: closing the hidden window exits the
+                        // process through LastWindowClosed.
+                        let _ = cx.update(|app| {
+                            window_handle.update(app, |_, window, _| window.remove_window())
+                        });
+                        break;
+                    }
+                }
+                let _ = unsafe { CloseHandle(event) };
+            })
+            .detach();
+        }
+        #[cfg(not(windows))]
+        let _ = window_handle;
     });
 }

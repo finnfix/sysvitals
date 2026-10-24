@@ -21,6 +21,11 @@ pub mod model;
 pub mod sampler;
 pub mod store;
 
+/// Named auto-reset event the Windows overlay sets to reveal a history popup
+/// that was pre-warmed on indicator hover. Both processes must use this
+/// exact session-local name.
+pub const HISTORY_PREWARM_EVENT: &str = "Local\\SysVitalsHistoryShow";
+
 pub use config::Config;
 pub use format::{format_frame, format_frame_vertical, FormattedRow, Line};
 pub use i18n::{t, Language};
