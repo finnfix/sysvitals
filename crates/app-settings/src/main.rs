@@ -765,9 +765,8 @@ fn divider(border: Hsla) -> impl IntoElement {
 /// Blur the window when a mouse-down occurs outside `element`. Used around
 /// inputs/selects so their focus border disappears when the user clicks any
 /// other part of the settings page (GPUI keeps focus otherwise).
-fn blur_on_outside(mut element: Div) -> Div {
-    element.on_mouse_down_out(|_, window, cx| window.blur(cx));
-    element
+fn blur_on_outside(element: Div) -> Div {
+    element.on_mouse_down_out(|_, window, cx| window.blur(cx))
 }
 
 /// A labelled control row: title on the left, a wrapped tile group on the
@@ -1197,7 +1196,7 @@ fn main() {
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(420.), px(640.)), cx)),
             titlebar: Some(TitlebarOptions {
-                title: Some(t(cfg.display.language, "settings.title").to_string()),
+                title: Some(t(cfg.display.language, "settings.title").to_string().into()),
                 ..Default::default()
             }),
             // System backdrop material (Win11 Mica / Win10-era acrylic blur /
