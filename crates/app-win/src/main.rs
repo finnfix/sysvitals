@@ -2413,10 +2413,9 @@ mod win {
                 } else if key == VK_RETURN.0 {
                     let choice = MENU_STATE.with(|slot| {
                         let slot = slot.borrow();
-                        slot.as_ref()
-                            .and_then(|state| state.hover)
-                            .and_then(|index| state.entries.get(index))
-                            .map(|entry| entry.id)
+                        let state = slot.as_ref()?;
+                        let index = state.hover?;
+                        state.entries.get(index).map(|entry| entry.id)
                     });
                     if let Some(id) = choice {
                         if id != 0 {
@@ -2476,6 +2475,20 @@ mod win {
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+
+    /// Message proc for the layered content child. The child is click-through
+    /// and paints only through `UpdateLayeredWindow`, so all messages can go
+    /// straight to the default handler. A wrapper is required because the
+    /// windows crate exposes `DefWindowProcW` as a Rust-ABI function, which is
+    /// not itself the `extern "system"` proc-pointer type `WNDCLASS` wants.
+    unsafe extern "system" fn menu_content_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
     }
 
     /// A DWM-material popup menu. Returns `None` only when the window could
@@ -3075,7 +3088,7 @@ mod win {
             let content_class_name = utf16("SysVitalsMenuContent");
             let content_wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                lpfnWndProc: Some(DefWindowProcW),
+                lpfnWndProc: Some(menu_content_wndproc),
                 hInstance: hmodule.into(),
                 lpszClassName: windows::core::PCWSTR(content_class_name.as_ptr()),
                 ..Default::default()
