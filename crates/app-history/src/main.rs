@@ -289,7 +289,6 @@ impl HistoryView {
             _escape: None,
             last_accent: None,
         };
-        view.load_data();
         view.start_refresh_loop(cx);
         view.start_escape_observer(cx);
         view.start_accent_watch(cx);
@@ -451,8 +450,13 @@ impl HistoryView {
     }
 
     fn start_refresh_loop(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(REFRESH_INTERVAL).await;
+        cx.spawn(async move |this, cx| {
+            // Let the window paint its first frame before touching SQLite:
+            // opening the database and aggregating buckets used to run inside
+            // `HistoryView::new`, delaying the first visible paint.
+            cx.background_executor()
+                .timer(Duration::from_millis(16))
+                .await;
             if this
                 .update(cx, |view: &mut HistoryView, cx| {
                     view.reload_config();
@@ -461,7 +465,20 @@ impl HistoryView {
                 })
                 .is_err()
             {
-                break;
+                return;
+            }
+            loop {
+                cx.background_executor().timer(REFRESH_INTERVAL).await;
+                if this
+                    .update(cx, |view: &mut HistoryView, cx| {
+                        view.reload_config();
+                        view.load_data();
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
@@ -1058,14 +1075,15 @@ fn backdrop_for(material: Material) -> WindowBackgroundAppearance {
 /// opaque fallback as a no-op. Same replay-after-theme-change contract as the
 /// accent; see the matching function in app-settings.
 fn apply_material(cx: &mut App) {
-    use sysvitals_core::backdrop::{should_tint, MATERIAL_TINT_ALPHA};
+    use sysvitals_core::backdrop::{material_tint_alpha, should_tint};
     let material = detect_material();
     if !should_tint(material) {
         return;
     }
     UiTheme::update(cx, |theme| {
+        let alpha = material_tint_alpha(theme.mode.is_dark());
         let opaque = |c: Hsla| Hsla { a: 1.0, ..c };
-        theme.colors.background = opaque(theme.colors.background).opacity(MATERIAL_TINT_ALPHA);
+        theme.colors.background = opaque(theme.colors.background).opacity(alpha);
     });
 }
 
