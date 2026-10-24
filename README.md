@@ -54,7 +54,10 @@ indicator groups on, default 1 s sampling, no popup open):
 - macOS 27 (Apple Silicon) menu-bar indicator: **~18 MB** resident
 
 The settings window and history chart are separate processes and are only
-alive while their windows are open; closing them returns that memory.
+alive while their windows are open; closing them returns that memory. On
+Windows the history process is pre-warmed while the pointer is over the
+indicator so the chart opens without waiting for process startup; it exits
+when the pointer leaves, or after 20 seconds if unused.
 
 ### Building the core
 
@@ -131,7 +134,7 @@ DPI 自适应，点击状态栏项可弹出 CPU / 内存历史走势图。目标
 - Windows 11 任务栏指示器：常驻内存 **约 8 MB**
 - macOS 27（Apple Silicon）菜单栏指示器：常驻内存 **约 18 MB**
 
-设置窗口与走势图是独立进程，只在窗口打开期间存活，关闭即释放对应内存。
+设置窗口与走势图是独立进程，只在窗口打开期间存活，关闭即释放对应内存。Windows 下鼠标悬停指示器时会预热走势图进程，使点击后无需再等进程启动；移开指针即退出，未点击则 20 秒后自动退出。
 
 ### 构建核心层
 
